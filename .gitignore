@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Configuration files with sensitive data
+config.json
+
+# Generated files
+filtered_feed.xml
+web/feed.json
+web/translations.json
+web/interactions.json
+web/journals.hash
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local test files
+debug_*.py

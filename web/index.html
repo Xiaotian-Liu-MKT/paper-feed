@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Feed</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero__bg"></div>
+      <div class="hero__content">
+        <div class="hero__actions" style="position: absolute; top: 20px; right: 20px; display: flex; gap: 10px;">
+          <button id="btnSettings" class="btn btn--secondary" type="button">⚙️ 设置</button>
+          <button id="btnRefresh" class="btn btn--primary" type="button">🔄 立即更新</button>
+        </div>
+        <p class="eyebrow">Paper Feed</p>
+        <h1>你的论文订阅，一页看完</h1>
+        <p class="subhead">筛选、搜索、排序，专注你真正想读的内容。</p>
+      </div>
+    </header>
+
+    <div class="filters">
+      <button class="filter-btn active" data-filter="all">全部文章</button>
+      <button class="filter-btn" data-filter="favorites">❤️ 我的收藏</button>
+    </div>
+
+    <main id="feed-container">
+
+      <section class="panel">
+        <div class="controls">
+          <label class="control">
+            <span>搜索</span>
+            <input id="searchInput" type="search" placeholder="关键词 / 期刊 / 摘要" />
+          </label>
+
+          <label class="control">
+            <span>期刊</span>
+            <select id="journalSelect">
+              <option value="">全部期刊</option>
+            </select>
+          </label>
+
+          <label class="control">
+            <span>起始日期</span>
+            <input id="fromDate" type="date" />
+          </label>
+
+          <label class="control">
+            <span>截止日期</span>
+            <input id="toDate" type="date" />
+          </label>
+
+          <label class="control">
+            <span>排序</span>
+            <select id="sortSelect">
+              <option value="desc">最新优先</option>
+              <option value="asc">最早优先</option>
+            </select>
+          </label>
+
+          <label class="control control--toggle">
+            <input id="summaryToggle" type="checkbox" checked />
+            <span>显示摘要</span>
+          </label>
+        </div>
+
+        <div class="status">
+          <span id="countLabel">加载中...</span>
+          <span id="generatedAt"></span>
+        </div>
+      </section>
+
+      <section>
+        <div id="list" class="grid"></div>
+      </section>
+    </main>
+
+    <template id="cardTemplate">
+      <article class="card">
+        <div class="card__meta"></div>
+        <a class="card__title" target="_blank" rel="noreferrer"></a>
+        <div class="card__title_zh"></div>
+        <div class="card__fields"></div>
+        <p class="card__summary"></p>
+        <button class="card__toggle" type="button"></button>
+      </article>
+    </template>
+
+    <!-- Fixed Undo Bar Container -->
+    <div id="undoContainer" class="undo-container"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
