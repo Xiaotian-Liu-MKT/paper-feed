@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>期刊管理 - Paper Feed</title>
+    <link rel="stylesheet" href="styles.css?v=2.1" />
+  </head>
+  <body class="journals-page">
+    <header class="hero">
+      <div class="hero__bg"></div>
+      <div class="hero__actions">
+        <a class="btn btn--secondary" href="index.html">🏠 返回主页</a>
+        <a class="btn btn--secondary" href="stats.html">📊 统计</a>
+      </div>
+      <div class="hero__content">
+        <p class="eyebrow">Paper Feed</p>
+        <h1>期刊订阅管理</h1>
+        <p class="subhead">集中维护跟踪列表，支持批量导入、导出和去重。</p>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="panel">
+        <div class="controls">
+          <label class="control">
+            <span>搜索</span>
+            <input id="searchInput" type="search" placeholder="按 URL / 学科 / 名称筛选" />
+          </label>
+          <div class="control control--stat">
+            <span>当前数量</span>
+            <div id="countLabel" class="stat-pill">0</div>
+          </div>
+        </div>
+        <div class="group-block">
+          <h3 class="panel-title">期刊分组（按学科）</h3>
+          <div id="groupList" class="group-list group-list--inline"></div>
+        </div>
+        <div class="panel-actions">
+          <button id="btnReload" class="btn btn--secondary" type="button">重新加载</button>
+          <button id="btnImportOpen" class="btn btn--secondary" type="button">导入 / 批量操作</button>
+          <button id="btnExport" class="btn btn--secondary" type="button">导出文件</button>
+          <button id="btnSave" class="btn btn--primary" type="button">保存更新</button>
+        </div>
+        <p class="panel-hint">保存会覆盖 `journals.dat`，导入会自动去重并清理空行。</p>
+      </section>
+
+      <section class="journal-layout">
+        <div class="panel">
+          <div class="panel-title-row">
+            <h3 class="panel-title">已跟踪期刊</h3>
+            <button id="btnAdd" class="btn btn--secondary" type="button">+ 添加一行</button>
+          </div>
+          <div id="journalList" class="journal-list"></div>
+          <p class="panel-hint">直接编辑期刊名称、URL 与学科，删除会立即从列表移除。</p>
+        </div>
+      </section>
+
+      <section class="status-banner">
+        <span id="statusText">等待加载列表...</span>
+        <span id="validationText"></span>
+      </section>
+    </main>
+
+    <dialog id="importModal" class="modal modal--wide">
+      <h3>导入 / 批量操作</h3>
+      <p class="modal__desc">支持批量粘贴、文件导入、合并或替换当前列表。</p>
+      <label class="control">
+        <span>批量粘贴（每行：URL + Tab + 学科 + Tab + 期刊名）</span>
+        <textarea id="importText" class="journal-textarea" rows="10" placeholder="https://example.com/rss"></textarea>
+      </label>
+      <div class="panel-actions">
+        <button id="btnMerge" class="btn btn--secondary" type="button">合并导入</button>
+        <button id="btnReplace" class="btn btn--secondary" type="button">替换导入</button>
+      </div>
+      <label class="control">
+        <span>从文件导入 (.dat / .txt)</span>
+        <input id="fileInput" type="file" accept=".dat,.txt" />
+      </label>
+      <div class="panel-actions">
+        <button id="btnCopy" class="btn btn--secondary" type="button">复制当前列表</button>
+        <button id="btnImportClose" class="btn btn--primary" type="button">完成</button>
+      </div>
+    </dialog>
+
+    <script src="journals.js?v=1.0"></script>
+  </body>
+</html>

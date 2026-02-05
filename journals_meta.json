@@ -1,0 +1,230 @@
+{
+  "https://www.pnas.org/action/showfeed?tagCode=demo&taxonomyCode=topic&type=searchTopic&utm_source=chatgpt.com": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "PNAS – Demography"
+  },
+  "https://www.pnas.org/action/showfeed?tagCode=pol-sci&taxonomyCode=topic&type=searchTopic&utm_source=chatgpt.com": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "PNAS – Political Science"
+  },
+  "https://www.pnas.org/action/showfeed?tagCode=econ-sci&taxonomyCode=topic&type=searchTopic&utm_source=chatgpt.com": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "PNAS – Economic Sciences"
+  },
+  "https://www.nature.com/subjects/decision-making.rss": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Nature Decision Making"
+  },
+  "https://www.nature.com/nrpsychol.rss": {
+    "subject": "社会心理学与判断决策",
+    "name": "Nature Reviews Psychology"
+  },
+  "https://www.nature.com/palcomms.rss": {
+    "subject": "社会心理学与判断决策",
+    "name": "Humanities and Social Sciences Communications"
+  },
+  "https://www.nature.com/nathumbehav.rss": {
+    "subject": "市场营销与消费者行为",
+    "name": "Nature Human Behaviour"
+  },
+  "https://academic.oup.com/rss/site_5397/advanceAccess_3258.xml": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Consumer Research"
+  },
+  "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=jmxa&type=etoc&feed=rss": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Marketing"
+  },
+  "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=mrja&type=axatoc&feed=rss": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Marketing Research"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mksc": {
+    "subject": "市场营销与消费者行为",
+    "name": "Marketing Science"
+  },
+  "https://myscp.onlinelibrary.wiley.com/action/showFeed?type=etoc&feed=rss&jc=15327663": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Consumer Psychology"
+  },
+  "https://link.springer.com/search.rss?facet-content-type=Article&facet-journal-id=11747&sortOrder=newestFirst": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of the Academy of Marketing Science"
+  },
+  "https://rss.sciencedirect.com/publication/science/01678116": {
+    "subject": "市场营销与消费者行为",
+    "name": "International Journal of Research in Marketing"
+  },
+  "https://rss.sciencedirect.com/publication/science/00224359": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Retailing"
+  },
+  "https://www.tandfonline.com/feed/rss/ujoa20": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Advertising"
+  },
+  "https://rss.sciencedirect.com/publication/science/10949968": {
+    "subject": "市场营销与消费者行为",
+    "name": "Journal of Interactive Marketing"
+  },
+  "https://psycnet.apa.org/journals/apl.rss": {
+    "subject": "社会心理学与判断决策",
+    "name": "Journal of Applied Psychology"
+  },
+  "https://rss.sciencedirect.com/publication/science/07495978": {
+    "subject": "社会心理学与判断决策",
+    "name": "Organizational Behavior and Human Decision Processes"
+  },
+  "https://psycnet.apa.org/journals/xge.rss": {
+    "subject": "社会心理学与判断决策",
+    "name": "Journal of Experimental Psychology: General"
+  },
+  "https://psycnet.apa.org/journals/psp.rss": {
+    "subject": "社会心理学与判断决策",
+    "name": "Journal of Personality and Social Psychology"
+  },
+  "https://rss.sciencedirect.com/publication/science/00221031": {
+    "subject": "社会心理学与判断决策",
+    "name": "Journal of Experimental Social Psychology"
+  },
+  "https://onlinelibrary.wiley.com/feed/15405915/most-recent": {
+    "subject": "社会心理学与判断决策",
+    "name": "Decision Sciences"
+  },
+  "https://onlinelibrary.wiley.com/feed/10990771/most-recent": {
+    "subject": "社会心理学与判断决策",
+    "name": "Journal of Behavioral Decision Making"
+  },
+  "https://journals.aom.org/action/showFeed?type=etoc&feed=rss&jc=amj": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Academy of Management Journal"
+  },
+  "https://journals.aom.org/action/showFeed?type=etoc&feed=rss&jc=amr": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Academy of Management Review"
+  },
+  "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=asqa&type=etoc&feed=rss": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Administrative Science Quarterly"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=orsc": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Organization Science"
+  },
+  "https://onlinelibrary.wiley.com/feed/10970266/most-recent": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Strategic Management Journal"
+  },
+  "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=joma&type=etoc&feed=rss": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Journal of Management"
+  },
+  "https://rss.sciencedirect.com/publication/science/00487333": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Research Policy"
+  },
+  "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=huma&type=etoc&feed=rss": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Human Relations"
+  },
+  "https://onlinelibrary.wiley.com/feed/14676486/most-recent": {
+    "subject": "管理学、组织行为与战略创业",
+    "name": "Journal of Management Studies"
+  },
+  "https://onlinelibrary.wiley.com/feed/18731317/most-recent": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Journal of Operations Management"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mnsc": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Management Science"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=opre": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Operations Research"
+  },
+  "https://onlinelibrary.wiley.com/feed/19375956/most-recent": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Production and Operations Management"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=msom": {
+    "subject": "决策科学、运筹与运营管理",
+    "name": "Manufacturing and Service Operations Management"
+  },
+  "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=isre": {
+    "subject": "信息管理与信息系统",
+    "name": "Information Systems Research"
+  },
+  "http://aisel.aisnet.org/misq/recent.rss": {
+    "subject": "信息管理与信息系统",
+    "name": "MIS Quarterly"
+  },
+  "https://www.jmis-web.org/jmis.xml": {
+    "subject": "信息管理与信息系统",
+    "name": "Journal of Management Information Systems"
+  },
+  "https://aisel.aisnet.org/jais/recent.rss": {
+    "subject": "信息管理与信息系统",
+    "name": "Journal of the Association for Information Systems"
+  },
+  "https://onlinelibrary.wiley.com/feed/13652575/most-recent": {
+    "subject": "信息管理与信息系统",
+    "name": "Information Systems Journal"
+  },
+  "https://rss.sciencedirect.com/publication/science/01679236": {
+    "subject": "信息管理与信息系统",
+    "name": "Decision Support Systems"
+  },
+  "https://rss.sciencedirect.com/publication/science/03787206": {
+    "subject": "信息管理与信息系统",
+    "name": "Information & Management"
+  },
+  "https://rss.sciencedirect.com/publication/science/02684012": {
+    "subject": "信息管理与信息系统",
+    "name": "International Journal of Information Management"
+  },
+  "https://onlinelibrary.wiley.com/feed/14680262/most-recent": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Econometrica"
+  },
+  "https://www.journals.uchicago.edu/action/showFeed?type=etoc&feed=rss&jc=jpe": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Journal of Political Economy"
+  },
+  "https://academic.oup.com/rss/site_5504/advanceAccess_3365.xml": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Quarterly Journal of Economics"
+  },
+  "https://academic.oup.com/rss/site_5508/advanceAccess_3369.xml": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Review of Economic Studies"
+  },
+  "https://rss.sciencedirect.com/publication/science/08998256": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Games and Economic Behavior"
+  },
+  "https://rss.sciencedirect.com/publication/science/01672681": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Journal of Economic Behavior and Organization"
+  },
+  "https://rss.sciencedirect.com/publication/science/00472727": {
+    "subject": "经济学与行为/实验经济学",
+    "name": "Journal of Public Economics"
+  },
+  "https://rss.sciencedirect.com/publication/science/01607383": {
+    "subject": "旅游与酒店管理",
+    "name": "Annals of Tourism Research"
+  },
+  "https://rss.sciencedirect.com/publication/science/02615177": {
+    "subject": "旅游与酒店管理",
+    "name": "Tourism Management"
+  },
+  "https://rss.sciencedirect.com/publication/science/02784319": {
+    "subject": "旅游与酒店管理",
+    "name": "International Journal of Hospitality Management"
+  },
+  "https://www.tandfonline.com/feed/rss/rsus20": {
+    "subject": "旅游与酒店管理",
+    "name": "Journal of Sustainable Tourism"
+  }
+}

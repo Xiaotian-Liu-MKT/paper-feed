@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Feed · 统计</title>
+    <link rel="stylesheet" href="styles.css?v=2.0" />
+  </head>
+  <body class="stats-page">
+    <header class="hero">
+      <div class="hero__bg"></div>
+      <div class="hero__actions">
+        <a class="btn btn--secondary" href="index.html">🏠 返回主页</a>
+      </div>
+      <div class="hero__content">
+        <p class="eyebrow">Paper Feed</p>
+        <h1>期刊统计看板</h1>
+        <p class="subhead">查看单一期刊的发刊频率与我喜欢/不喜欢的占比。</p>
+      </div>
+    </header>
+
+    <main class="shell">
+      <div class="tab-bar" role="tablist" aria-label="统计视图">
+        <button class="tab-btn is-active" type="button" data-tab="overview" role="tab" aria-selected="true">
+          全部期刊一览
+        </button>
+        <button class="tab-btn" type="button" data-tab="detail" role="tab" aria-selected="false">
+          筛选具体期刊
+        </button>
+        <button class="tab-btn" type="button" data-tab="fit" role="tab" aria-selected="false">
+          期刊匹配画像
+        </button>
+        <button class="tab-btn" type="button" data-tab="match" role="tab" aria-selected="false">
+          研究摘要匹配
+        </button>
+      </div>
+
+      <div class="tab-panel is-active" data-tab-panel="overview" role="tabpanel">
+        <section class="panel">
+        <div class="panel-title-row">
+          <h3 class="panel-title">全部期刊一览</h3>
+          <div class="panel-tools">
+            <label class="panel-select">
+              <span>排序</span>
+              <select id="overviewSort">
+                <option value="total_desc">总篇数（高→低）</option>
+                <option value="like_desc">喜欢占比（高→低）</option>
+                <option value="dislike_desc">不喜欢占比（高→低）</option>
+                <option value="last_desc">最近发布（最新→最旧）</option>
+                <option value="name_asc">期刊名称（A→Z）</option>
+              </select>
+            </label>
+            <span class="panel-note" id="overviewCount"></span>
+          </div>
+        </div>
+        <p class="panel-hint">点击期刊名称可快速查看下方详情。</p>
+        <div class="overview-table-wrap">
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>期刊</th>
+                <th class="overview-spacer"></th>
+                <th>总篇数</th>
+                <th>喜欢</th>
+                <th>不喜欢</th>
+                <th>未反馈</th>
+                <th>占比</th>
+                <th>最近发布</th>
+              </tr>
+            </thead>
+            <tbody id="overviewBody"></tbody>
+          </table>
+        </div>
+      </section>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="detail" role="tabpanel">
+        <section class="panel">
+          <div class="controls">
+            <label class="control">
+              <span>期刊</span>
+              <select id="statsJournal">
+                <option value="">请选择期刊</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span>起始日期</span>
+              <input id="statsFromDate" type="date" />
+            </label>
+
+            <label class="control">
+              <span>截止日期</span>
+              <input id="statsToDate" type="date" />
+            </label>
+          </div>
+
+          <div class="status">
+            <span id="statsStatus">加载中...</span>
+            <span id="statsGeneratedAt"></span>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">总篇数</div>
+              <div class="stat-value" id="statTotal">-</div>
+              <div class="stat-note" id="statSpan">-</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">平均每周</div>
+              <div class="stat-value" id="statPerWeek">-</div>
+              <div class="stat-note" id="statWeekNote">-</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">平均每月</div>
+              <div class="stat-value" id="statPerMonth">-</div>
+              <div class="stat-note" id="statMonthNote">-</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">最近发布</div>
+              <div class="stat-value" id="statLastDate">-</div>
+              <div class="stat-note" id="statLastNote">-</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">我喜欢/不喜欢占比</h3>
+          <div class="ratio-bar" aria-hidden="true">
+            <div id="ratioLikeBar" class="ratio-fill ratio-fill--like"></div>
+            <div id="ratioDislikeBar" class="ratio-fill ratio-fill--dislike"></div>
+            <div id="ratioNeutralBar" class="ratio-fill ratio-fill--neutral"></div>
+          </div>
+          <div class="ratio-grid">
+            <div class="ratio-item">
+              <span class="ratio-dot ratio-dot--like"></span>
+              <div>
+                <div class="ratio-label">喜欢</div>
+                <div class="ratio-value" id="ratioLikeText">-</div>
+              </div>
+            </div>
+            <div class="ratio-item">
+              <span class="ratio-dot ratio-dot--dislike"></span>
+              <div>
+                <div class="ratio-label">不喜欢</div>
+                <div class="ratio-value" id="ratioDislikeText">-</div>
+              </div>
+            </div>
+            <div class="ratio-item">
+              <span class="ratio-dot ratio-dot--neutral"></span>
+              <div>
+                <div class="ratio-label">未反馈</div>
+                <div class="ratio-value" id="ratioNeutralText">-</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">近 12 个月发刊频率</h3>
+          <div id="monthChart" class="bar-chart"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">主题分布</h3>
+          <div id="topicDistribution" class="topic-distribution"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">主题趋势</h3>
+          <div id="topicTrend" class="trend-chart"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">主题关联</h3>
+          <div id="topicNetwork" class="topic-network"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">收藏/归档偏好雷达</h3>
+          <div id="topicRadar" class="radar-chart"></div>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="fit" role="tabpanel">
+        <section class="panel" id="fitBehaviorPanel">
+          <div class="panel-title-row">
+            <h3 class="panel-title">期刊匹配一览</h3>
+            <div class="panel-tools">
+              <label class="panel-select">
+                <span>排序</span>
+                <select id="fitSort">
+                  <option value="fit_desc">匹配度（高→低）</option>
+                  <option value="structure_desc">结构匹配（高→低）</option>
+                  <option value="confidence_desc">置信度（高→低）</option>
+                  <option value="total_desc">样本量（多→少）</option>
+                  <option value="name_asc">期刊名称（A→Z）</option>
+                </select>
+              </label>
+              <span class="panel-note" id="fitOverviewCount"></span>
+            </div>
+          </div>
+          <p class="panel-hint">基于收藏/归档/隐藏/未操作计算匹配度与置信度，可对照下方基准画像理解结构差异。</p>
+          <div class="fit-journal-list" id="fitJournalList"></div>
+        </section>
+
+        <section class="panel" id="fitStructurePanel">
+          <div class="panel-title-row">
+            <h3 class="panel-title">对比基准画像</h3>
+          </div>
+          <div class="controls">
+            <label class="control">
+              <span>对比基准</span>
+              <select id="fitCompareMode">
+                <option value="favorites">对比我的收藏/归档</option>
+                <option value="journal">对比另一本文献期刊</option>
+              </select>
+            </label>
+            <label class="control" id="fitCompareJournalWrap">
+              <span>对比期刊</span>
+              <select id="fitCompareJournal">
+                <option value="">请选择期刊</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="fit-compare-grid">
+            <div class="fit-block">
+              <h4 class="fit-block__title">Topic 分布</h4>
+              <div class="fit-bar-group">
+                <div class="fit-bar-row" data-series="baseline">
+                  <div class="fit-bar-label" id="fitTopicBaselineLabel">对比基准</div>
+                  <div class="fit-bar-track" id="fitTopicBaseline"></div>
+                </div>
+              </div>
+              <div class="fit-top-list" id="fitTopicTopList"></div>
+            </div>
+
+            <div class="fit-block">
+              <h4 class="fit-block__title">Method 分布</h4>
+              <div class="fit-bar-group">
+                <div class="fit-bar-row" data-series="baseline">
+                  <div class="fit-bar-label" id="fitMethodBaselineLabel">对比基准</div>
+                  <div class="fit-bar-track" id="fitMethodBaseline"></div>
+                </div>
+              </div>
+              <div class="fit-top-list" id="fitMethodTopList"></div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <div class="tab-panel" data-tab-panel="match" role="tabpanel">
+        <section class="panel" id="fitMatcherPanel">
+          <div class="panel-title-row">
+            <h3 class="panel-title">研究摘要反向匹配期刊</h3>
+            <span class="panel-note" id="fitMatchStatus"></span>
+          </div>
+          <textarea
+            id="fitAbstractInput"
+            class="fit-input"
+            placeholder="粘贴研究项目摘要、研究问题或关键摘要段落，系统会基于 Topic/Method 找到最匹配的期刊。"
+          ></textarea>
+          <div class="panel-actions">
+            <button class="btn btn--primary" id="fitMatchBtn" type="button">匹配期刊</button>
+          </div>
+          <div class="fit-match-results" id="fitMatchResults"></div>
+        </section>
+      </div>
+    </main>
+
+    <script src="stats.js?v=1.0"></script>
+  </body>
+</html>

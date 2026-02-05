@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Debug - Classification Check</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .stats { margin: 20px 0; padding: 10px; background: #f9f9f9; }
+    </style>
+</head>
+<body>
+    <h1>Classification Debug Report</h1>
+    <div id="stats" class="stats"></div>
+    <table id="table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Title</th>
+                <th>Method</th>
+                <th>Topic</th>
+            </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+    </table>
+
+    <script>
+        async function debug() {
+            const response = await fetch('feed.json?nocache=' + Date.now());
+            const data = await response.json();
+            const items = data.items;
+
+            // Count classifications
+            const methodCount = {};
+            const topicCount = {};
+
+            items.forEach(item => {
+                const m = item.method || 'EMPTY';
+                const t = item.topic || 'EMPTY';
+                methodCount[m] = (methodCount[m] || 0) + 1;
+                topicCount[t] = (topicCount[t] || 0) + 1;
+            });
+
+            // Display stats
+            const statsDiv = document.getElementById('stats');
+            statsDiv.innerHTML = `
+                <h3>Total Items: ${items.length}</h3>
+                <h4>Method Distribution:</h4>
+                <pre>${JSON.stringify(methodCount, null, 2)}</pre>
+                <h4>Topic Distribution:</h4>
+                <pre>${JSON.stringify(topicCount, null, 2)}</pre>
+            `;
+
+            // Display first 20 items
+            const tbody = document.getElementById('tbody');
+            items.slice(0, 20).forEach((item, i) => {
+                const row = tbody.insertRow();
+                row.insertCell(0).textContent = i + 1;
+                row.insertCell(1).textContent = item.title.substring(0, 60) + '...';
+                row.insertCell(2).textContent = item.method || 'EMPTY';
+                row.insertCell(3).textContent = item.topic || 'EMPTY';
+
+                // Highlight if using defaults
+                if (item.method === 'Qualitative') row.cells[2].style.backgroundColor = '#ffffcc';
+                if (item.topic === 'Other Marketing') row.cells[3].style.backgroundColor = '#ffffcc';
+            });
+
+            console.log('Raw data sample:', items.slice(0, 3));
+        }
+
+        debug();
+    </script>
+</body>
+</html>

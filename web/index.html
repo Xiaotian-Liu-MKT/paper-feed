@@ -4,16 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=2.0" />
   </head>
   <body>
     <header class="hero">
       <div class="hero__bg"></div>
-      <div class="hero__content">
-        <div class="hero__actions" style="position: absolute; top: 20px; right: 20px; display: flex; gap: 10px;">
+        <div class="hero__actions">
+          <a class="btn btn--secondary" href="stats.html">📊 统计</a>
+          <a class="btn btn--secondary" href="report.html">🧭 偏好报告</a>
+          <a class="btn btn--secondary" href="journals.html">📚 期刊管理</a>
+          <button id="btnCategories" class="btn btn--secondary" type="button">🏷️ 分类管理</button>
+          <button id="btnReanalyze" class="btn btn--secondary" type="button" title="强制重新分析所有文章分类">🧠 AI 分析</button>
           <button id="btnSettings" class="btn btn--secondary" type="button">⚙️ 设置</button>
           <button id="btnRefresh" class="btn btn--primary" type="button">🔄 立即更新</button>
         </div>
+      <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
         <h1>你的论文订阅，一页看完</h1>
         <p class="subhead">筛选、搜索、排序，专注你真正想读的内容。</p>
@@ -21,8 +26,10 @@
     </header>
 
     <div class="filters">
-      <button class="filter-btn active" data-filter="all">全部文章</button>
-      <button class="filter-btn" data-filter="favorites">❤️ 我的收藏</button>
+      <button class="filter-btn active" data-filter="all">待筛选 <span id="countInbox" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
+      <button class="filter-btn" data-filter="favorites">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
+      <button class="filter-btn" data-filter="archived">已归档 <span id="countArchived" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
+      <button id="btnSummarizeFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">✨ 生成 AI 总结</button>
     </div>
 
     <main id="feed-container">
@@ -38,6 +45,48 @@
             <span>期刊</span>
             <select id="journalSelect">
               <option value="">全部期刊</option>
+            </select>
+          </label>
+
+          <label class="control">
+            <span>研究方法</span>
+            <select id="filterMethod" class="select--compact-multi" multiple size="1">
+              <option value="">全部方法</option>
+            </select>
+          </label>
+          
+          <label class="control">
+            <span>研究主题</span>
+            <select id="filterTopic" class="select--compact-multi" multiple size="1">
+              <option value="">全部主题</option>
+            </select>
+          </label>
+
+          
+
+          <label class="control">
+            <span>方法逻辑</span>
+            <select id="filterMethodMode">
+              <option value="any">包含任一</option>
+              <option value="all">同时包含</option>
+            </select>
+          </label>
+
+          <label class="control">
+            <span>主题逻辑</span>
+            <select id="filterTopicMode">
+              <option value="any">包含任一</option>
+              <option value="all">同时包含</option>
+            </select>
+          </label>
+
+          <label class="control">
+            <span>智能预设</span>
+            <select id="filterPreset">
+              <option value="">无预设</option>
+              <option value="my_focus">我的研究方向</option>
+              <option value="cross">跨学科研究</option>
+              <option value="recent_hot">近期热点</option>
             </select>
           </label>
 
@@ -69,6 +118,10 @@
           <span id="countLabel">加载中...</span>
           <span id="generatedAt"></span>
         </div>
+        <div id="topicCloudWrap" class="topic-cloud-wrap is-hidden">
+          <div class="topic-cloud__title">主题云</div>
+          <div id="topicCloud" class="topic-cloud"></div>
+        </div>
       </section>
 
       <section>
@@ -82,6 +135,14 @@
         <a class="card__title" target="_blank" rel="noreferrer"></a>
         <div class="card__title_zh"></div>
         <div class="card__fields"></div>
+        <div class="card__abstract"></div>
+        <div class="card__edit-area" style="display:none; margin-top:10px;">
+            <textarea style="width:100%; height:150px; padding:8px; border:1px solid #ddd; border-radius:4px; font-family:inherit;" placeholder="在此粘贴或输入摘要..."></textarea>
+            <div style="margin-top:8px; display:flex; gap:8px;">
+                <button type="button" class="btn btn--primary btn--small btn-save-abstract">保存</button>
+                <button type="button" class="btn btn--secondary btn--small btn-cancel-abstract">取消</button>
+            </div>
+        </div>
         <p class="card__summary"></p>
         <button class="card__toggle" type="button"></button>
       </article>
@@ -90,6 +151,131 @@
     <!-- Fixed Undo Bar Container -->
     <div id="undoContainer" class="undo-container"></div>
 
-    <script src="app.js"></script>
+    <dialog id="settingsModal" class="modal">
+      <form id="settingsForm" method="dialog">
+        <h3>⚙️ 设置 API</h3>
+        <p class="modal__desc">配置 OpenAI / DeepSeek 接口以启用翻译和摘要生成。</p>
+        
+        <label class="control">
+          <span>API Key</span>
+          <input name="OPENAI_API_KEY" type="password" placeholder="sk-..." autocomplete="off">
+        </label>
+        
+        <label class="control">
+          <span>Base URL (可选)</span>
+          <input name="OPENAI_BASE_URL" type="text" placeholder="https://api.openai.com/v1">
+        </label>
+        
+        <label class="control">
+          <span>Proxy (可选)</span>
+          <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890">
+        </label>
+
+        <div class="modal__actions">
+          <button id="btnCancel" class="btn btn--secondary" type="button">取消</button>
+          <button class="btn btn--primary" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+
+    <dialog id="categoriesModal" class="modal modal--wide">
+      <form id="categoriesForm" method="dialog">
+        <h3>分类管理</h3>
+        <p class="modal__desc">管理方法/主题/标签定义，保存后将用于后续 AI 分类。</p>
+        <div class="category-editor">
+          <div class="category-section">
+            <div class="category-header">
+              <h4>研究方法</h4>
+              <button type="button" class="btn btn--secondary btn--small" id="btnAddMethod">新增方法</button>
+            </div>
+            <div id="methodEditor" class="category-list"></div>
+          </div>
+          <div class="category-section">
+            <div class="category-header">
+              <h4>研究主题</h4>
+              <button type="button" class="btn btn--secondary btn--small" id="btnAddTopic">新增主题</button>
+            </div>
+            <div id="topicEditor" class="category-list"></div>
+          </div>
+        </div>
+        <div class="category-section">
+          <h4>理论/情境/对象</h4>
+          <div class="category-inline">
+            <label class="control control--inline">
+              <span>理论标签</span>
+              <input id="theoryEditor" type="text" placeholder="以逗号分隔" />
+            </label>
+            <label class="control control--inline">
+              <span>研究情境</span>
+              <input id="contextEditor" type="text" placeholder="以逗号分隔" />
+            </label>
+            <label class="control control--inline">
+              <span>研究对象</span>
+              <input id="subjectEditor" type="text" placeholder="以逗号分隔" />
+            </label>
+          </div>
+        </div>
+        <div class="modal__actions">
+          <button class="btn btn--secondary" type="button" id="btnCancelCategories">取消</button>
+          <button class="btn btn--primary" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="classificationModal" class="modal modal--wide">
+      <form id="classificationForm" method="dialog">
+        <h3>编辑分类</h3>
+        <p class="modal__desc" id="classificationTitle"></p>
+        <div class="classify-grid">
+          <div>
+            <div class="classify-title">研究方法</div>
+            <div id="classificationMethods" class="chip-grid"></div>
+          </div>
+          <div>
+            <div class="classify-title">研究主题</div>
+            <div id="classificationTopics" class="chip-grid"></div>
+          </div>
+        </div>
+        <div class="classify-grid">
+          <div>
+            <div class="classify-title">理论框架</div>
+            <div id="classificationTheories" class="chip-grid"></div>
+          </div>
+          <div>
+            <div class="classify-title">研究情境</div>
+            <div id="classificationContexts" class="chip-grid"></div>
+          </div>
+        </div>
+        <div class="classify-grid">
+          <div>
+            <div class="classify-title">研究对象</div>
+            <div id="classificationSubjects" class="chip-grid"></div>
+          </div>
+          <div>
+            <div class="classify-title">新颖性评分</div>
+            <select id="classificationNovelty">
+              <option value="">未设置</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+        </div>
+        <label class="control">
+          <span>自定义标签 (逗号分隔)</span>
+          <input id="classificationCustom" type="text" placeholder="可补充额外理论或情境标签" />
+        </label>
+        <div class="modal__actions">
+          <button class="btn btn--secondary" type="button" id="btnCancelClassification">取消</button>
+          <button class="btn btn--primary" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="app.js?v=2.1"></script>
   </body>
 </html>
+

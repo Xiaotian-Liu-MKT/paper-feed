@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Feed · 偏好报告</title>
+    <link rel="stylesheet" href="styles.css?v=2.0" />
+  </head>
+  <body class="report-page">
+    <header class="hero">
+      <div class="hero__bg"></div>
+      <div class="hero__actions">
+        <a class="btn btn--secondary" href="index.html">← 返回主页</a>
+      </div>
+      <div class="hero__content">
+        <p class="eyebrow">Paper Feed</p>
+        <h1>偏好报告</h1>
+        <p class="subhead">基于标题推断你更偏好的研究方向与措辞线索。</p>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="panel">
+        <div class="panel-title-row">
+          <h3 class="panel-title">报告控制台</h3>
+          <div class="panel-tools">
+            <button id="btnGenerateReport" class="btn btn--primary" type="button">生成报告</button>
+            <button id="btnReloadReport" class="btn btn--secondary" type="button">刷新</button>
+          </div>
+        </div>
+        <p class="panel-hint">根据收藏/归档/不喜欢记录，从标题中推断偏好特征，不使用摘要内容。</p>
+        <div class="status">
+          <span id="reportStatus">加载中...</span>
+          <span id="reportGeneratedAt"></span>
+        </div>
+        <div id="reportWarnings" class="report-warnings"></div>
+      </section>
+
+      <section class="panel panel--highlight">
+        <h3 class="panel-title">💡 智能洞察</h3>
+        <p class="panel-hint">基于您的收藏/归档和隐藏行为，自动生成的研究偏好总结</p>
+        <div id="insightsSummary" class="insights-container"></div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">样本概览</h3>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">收藏/归档样本</div>
+            <div class="stat-value" id="reportFavCount">-</div>
+            <div class="stat-note">参与偏好计算</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">不喜欢样本</div>
+            <div class="stat-value" id="reportHiddenCount">-</div>
+            <div class="stat-note">用于排除特征</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">收藏/归档缺失</div>
+            <div class="stat-value" id="reportMissingFav">-</div>
+            <div class="stat-note">当前 feed 未命中</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">不喜欢缺失</div>
+            <div class="stat-value" id="reportMissingHidden">-</div>
+            <div class="stat-note">可能已下线</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">偏好画像</h3>
+        <div class="report-grid">
+          <div class="report-card">
+            <h4>主题画像</h4>
+            <p class="report-summary">从标题词推断你更关注的研究主题与不偏好的话题。</p>
+            <ul id="reportTopicInsights" class="report-insights"></ul>
+          </div>
+          <div class="report-card">
+            <h4>方法画像</h4>
+            <p class="report-summary">从标题线索估计你更偏好的研究方法风格。</p>
+            <ul id="reportMethodInsights" class="report-insights"></ul>
+          </div>
+          <div class="report-card">
+            <h4>语气画像</h4>
+            <p class="report-summary">从措辞判断你更偏好的表达与研究语气。</p>
+            <ul id="reportToneInsights" class="report-insights"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">研究方法与主题偏好</h3>
+        <div class="report-grid">
+          <div class="report-card">
+            <h4>研究方法分布</h4>
+            <div class="ratio-bar" aria-hidden="true">
+              <div id="methodFavBar" class="ratio-fill ratio-fill--like"></div>
+              <div id="methodHidBar" class="ratio-fill ratio-fill--dislike"></div>
+            </div>
+            <div id="methodStats" class="method-stats"></div>
+            <details class="report-details">
+              <summary>查看详细列表</summary>
+              <div id="methodTable" class="report-table"></div>
+            </details>
+          </div>
+          <div class="report-card">
+            <h4>研究主题分布</h4>
+            <div class="ratio-bar" aria-hidden="true">
+              <div id="topicFavBar" class="ratio-fill ratio-fill--like"></div>
+              <div id="topicHidBar" class="ratio-fill ratio-fill--dislike"></div>
+            </div>
+            <div id="topicStats" class="topic-stats"></div>
+            <details class="report-details">
+              <summary>查看详细列表</summary>
+              <div id="topicTable" class="report-table"></div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">📈 偏好时间趋势（近12个月）</h3>
+        <p class="panel-hint">展示您的收藏/归档行为随时间的变化模式</p>
+        <div id="trendChart" class="trend-chart"></div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">详细词表（可展开）</h3>
+        <details class="report-details">
+          <summary>查看高频词与偏好列表</summary>
+          <div class="report-grid report-details-grid">
+            <div class="report-card">
+              <h4>收藏/归档高频词</h4>
+              <p id="reportTopFavSummary" class="report-summary"></p>
+              <div id="reportTopFavTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>不喜欢高频词</h4>
+              <p id="reportTopHiddenSummary" class="report-summary"></p>
+              <div id="reportTopHiddenTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能喜欢</h4>
+              <p id="reportPreferredSummary" class="report-summary"></p>
+              <div id="reportPreferredTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能避开</h4>
+              <p id="reportAvoidedSummary" class="report-summary"></p>
+              <div id="reportAvoidedTerms" class="report-table"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">偏好短语（双词组合）</h3>
+        <details class="report-details">
+          <summary>查看双词组合列表</summary>
+          <div class="report-grid report-details-grid">
+            <div class="report-card">
+              <h4>更可能喜欢</h4>
+              <p id="reportPreferredBigramsSummary" class="report-summary"></p>
+              <div id="reportPreferredBigrams" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能避开</h4>
+              <p id="reportAvoidedBigramsSummary" class="report-summary"></p>
+              <div id="reportAvoidedBigrams" class="report-table"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">来源/期刊偏好</h3>
+        <p id="reportSourceJournalCoverage" class="panel-hint"></p>
+        <details class="report-details">
+          <summary>查看来源与期刊偏好</summary>
+          <div class="report-grid report-details-grid">
+            <div class="report-card">
+              <h4>收藏/归档高频期刊</h4>
+              <p id="reportJournalTopFavSummary" class="report-summary"></p>
+              <div id="reportJournalTopFavTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>不喜欢高频期刊</h4>
+              <p id="reportJournalTopHiddenSummary" class="report-summary"></p>
+              <div id="reportJournalTopHiddenTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能喜欢的期刊</h4>
+              <p id="reportJournalPreferredSummary" class="report-summary"></p>
+              <div id="reportJournalPreferredTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能避开的期刊</h4>
+              <p id="reportJournalAvoidedSummary" class="report-summary"></p>
+              <div id="reportJournalAvoidedTerms" class="report-table"></div>
+            </div>
+          </div>
+          <div class="report-grid report-details-grid" style="margin-top: 16px;">
+            <div class="report-card">
+              <h4>收藏/归档高频来源</h4>
+              <p id="reportSourceTopFavSummary" class="report-summary"></p>
+              <div id="reportSourceTopFavTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>不喜欢高频来源</h4>
+              <p id="reportSourceTopHiddenSummary" class="report-summary"></p>
+              <div id="reportSourceTopHiddenTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能喜欢的来源</h4>
+              <p id="reportSourcePreferredSummary" class="report-summary"></p>
+              <div id="reportSourcePreferredTerms" class="report-table"></div>
+            </div>
+            <div class="report-card">
+              <h4>更可能避开的来源</h4>
+              <p id="reportSourceAvoidedSummary" class="report-summary"></p>
+              <div id="reportSourceAvoidedTerms" class="report-table"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">未匹配链接样本</h3>
+        <div class="report-grid">
+          <div class="report-card">
+            <h4>收藏/归档但不在当前 feed 中</h4>
+            <ul id="reportMissingFavLinks" class="report-links"></ul>
+          </div>
+          <div class="report-card">
+            <h4>隐藏但不在当前 feed 中</h4>
+            <ul id="reportMissingHiddenLinks" class="report-links"></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="report.js?v=1.0"></script>
+  </body>
+</html>

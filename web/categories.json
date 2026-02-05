@@ -1,0 +1,174 @@
+{
+  "version": "v2",
+  "methods": [
+    {
+      "name": "Experiment",
+      "label": "实验",
+      "keywords": ["experiment", "field study", "lab study", "rct", "a/b test", "causal"],
+      "color": "#dbeafe",
+      "text": "#1e40af"
+    },
+    {
+      "name": "Archival",
+      "label": "实证/档案",
+      "keywords": ["archival", "panel data", "econometrics", "secondary data", "dataset", "regression"],
+      "color": "#f3e8ff",
+      "text": "#6b21a8"
+    },
+    {
+      "name": "Theoretical",
+      "label": "理论模型",
+      "keywords": ["theoretical", "model", "game theory", "analytical", "framework"],
+      "color": "#ffedd5",
+      "text": "#9a3412"
+    },
+    {
+      "name": "Review",
+      "label": "综述/Meta",
+      "keywords": ["review", "meta-analysis", "systematic review", "bibliometric"],
+      "color": "#d1fae5",
+      "text": "#065f46"
+    },
+    {
+      "name": "Qualitative",
+      "label": "定性",
+      "keywords": ["qualitative", "interview", "case study", "ethnography", "focus group"],
+      "color": "#fce7f3",
+      "text": "#9d174d"
+    }
+  ],
+  "topics": [
+    {
+      "name": "消费者行为与决策",
+      "keywords": ["consumer", "decision", "choice", "attention", "preference", "bias"],
+      "level": 1,
+      "parent": null,
+      "color": "#e0f2fe",
+      "text": "#0c4a6e"
+    },
+    {
+      "name": "品牌管理与资产",
+      "keywords": ["brand", "branding", "brand equity", "brand love", "brand loyalty"],
+      "level": 1,
+      "parent": null,
+      "color": "#fee2e2",
+      "text": "#991b1b"
+    },
+    {
+      "name": "定价与促销",
+      "keywords": ["pricing", "price", "promotion", "discount", "coupon", "deal"],
+      "level": 1,
+      "parent": null,
+      "color": "#fef3c7",
+      "text": "#92400e"
+    },
+    {
+      "name": "数字营销与平台",
+      "keywords": ["digital", "platform", "social media", "online", "e-commerce", "influencer"],
+      "level": 1,
+      "parent": null,
+      "color": "#e0e7ff",
+      "text": "#3730a3"
+    },
+    {
+      "name": "AI与营销技术",
+      "keywords": ["ai", "algorithm", "automation", "robot", "chatbot", "genai"],
+      "level": 1,
+      "parent": null,
+      "color": "#f1f5f9",
+      "text": "#0f172a"
+    },
+    {
+      "name": "可持续发展与CSR",
+      "keywords": ["sustainability", "csr", "green", "ethical", "prosocial", "climate"],
+      "level": 1,
+      "parent": null,
+      "color": "#ecfccb",
+      "text": "#3f6212"
+    },
+    {
+      "name": "社会影响与情感",
+      "keywords": ["emotion", "social", "identity", "trust", "guilt", "pride", "shame"],
+      "level": 1,
+      "parent": null,
+      "color": "#ffe4e6",
+      "text": "#9f1239"
+    },
+    {
+      "name": "渠道与零售",
+      "keywords": ["channel", "retail", "omnichannel", "store", "distribution"],
+      "level": 1,
+      "parent": null,
+      "color": "#f0fdf4",
+      "text": "#166534"
+    },
+    {
+      "name": "新产品开发与创新",
+      "keywords": ["innovation", "new product", "launch", "r&d", "development"],
+      "level": 1,
+      "parent": null,
+      "color": "#fdf4ff",
+      "text": "#7e22ce"
+    },
+    {
+      "name": "B2B营销",
+      "keywords": ["b2b", "business-to-business", "industrial", "supply chain", "procurement"],
+      "level": 1,
+      "parent": null,
+      "color": "#e2e8f0",
+      "text": "#334155"
+    },
+    {
+      "name": "服务营销",
+      "keywords": ["service", "service quality", "experience", "customer service", "hospitality"],
+      "level": 1,
+      "parent": null,
+      "color": "#e0f2f1",
+      "text": "#0f766e"
+    },
+    {
+      "name": "国际营销",
+      "keywords": ["international", "global", "cross-cultural", "emerging market"],
+      "level": 1,
+      "parent": null,
+      "color": "#f3e8ff",
+      "text": "#6b21a8"
+    },
+    {
+      "name": "Other Marketing",
+      "keywords": ["marketing", "advertising", "promotion", "sales"],
+      "level": 1,
+      "parent": null,
+      "color": "#f3f4f6",
+      "text": "#6b7280"
+    }
+  ],
+  "theories": [
+    "Social Identity Theory",
+    "Resource-Based View",
+    "Signaling Theory",
+    "Prospect Theory",
+    "Self-Determination Theory",
+    "Theory of Planned Behavior",
+    "Technology Acceptance Model",
+    "Elaboration Likelihood Model"
+  ],
+  "subjects": [
+    "消费者个体",
+    "企业/品牌",
+    "市场/行业",
+    "平台/中介"
+  ],
+  "contexts": [
+    "B2C",
+    "B2B",
+    "C2C",
+    "线上",
+    "线下",
+    "全渠道",
+    "发达市场",
+    "新兴市场",
+    "高参与度",
+    "低参与度"
+  ]
+}

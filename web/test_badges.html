@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Badge Test</title>
+    <style>
+        .meta-badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+        .test-card {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Badge Display Test</h1>
+    <div id="output"></div>
+
+    <script>
+        function getBadgeColor(type, value) {
+            const map = {
+                method: {
+                    'Experiment': '#dbeafe|#1e40af',
+                    'Archival': '#f3e8ff|#6b21a8',
+                    'Theoretical': '#ffedd5|#9a3412',
+                    'Review': '#d1fae5|#065f46',
+                    'Qualitative': '#fce7f3|#9d174d'
+                },
+                topic: {
+                    'AI & Tech': '#f1f5f9|#0f172a',
+                    'CSR & Sustainability': '#ecfccb|#3f6212',
+                    'Emotion & Social': '#fee2e2|#991b1b',
+                    'Other Marketing': '#f3f4f6|#6b7280'
+                }
+            };
+
+            if (map[type] && map[type][value]) {
+                const [bg, color] = map[type][value].split('|');
+                return `background-color: ${bg}; color: ${color};`;
+            }
+            return 'background-color: #f3f4f6; color: #4b5563;';
+        }
+
+        function appendBadge(container, type, value) {
+            console.log(`appendBadge called: type=${type}, value=${value}`);
+            if (!value || value === "Other") {
+                console.log(`  -> Filtered out (empty or "Other")`);
+                return;
+            }
+            const span = document.createElement("span");
+            span.className = "meta-badge";
+            span.textContent = value;
+            span.style.cssText = getBadgeColor(type, value);
+            container.appendChild(span);
+            console.log(`  -> Badge created successfully`);
+        }
+
+        async function test() {
+            try {
+                const response = await fetch("feed.json");
+                const payload = await response.json();
+                const items = payload.items.slice(0, 10); // Test first 10
+
+                const output = document.getElementById('output');
+
+                console.log(`Loaded ${items.length} test items`);
+
+                items.forEach((item, i) => {
+                    const card = document.createElement('div');
+                    card.className = 'test-card';
+
+                    const title = document.createElement('div');
+                    title.textContent = `${i+1}. ${item.title.substring(0, 80)}...`;
+                    card.appendChild(title);
+
+                    const meta = document.createElement('div');
+                    meta.style.marginTop = '8px';
+
+                    const info = document.createElement('span');
+                    info.textContent = `Method: ${item.method || 'N/A'} | Topic: ${item.topic || 'N/A'} `;
+                    meta.appendChild(info);
+
+                    console.log(`\nProcessing item ${i+1}:`);
+                    console.log(`  method: ${item.method}`);
+                    console.log(`  topic: ${item.topic}`);
+
+                    appendBadge(meta, 'method', item.method);
+                    appendBadge(meta, 'topic', item.topic);
+
+                    card.appendChild(meta);
+                    output.appendChild(card);
+                });
+
+                console.log('\nTest complete!');
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('output').innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+            }
+        }
+
+        window.onload = test;
+    </script>
+</body>
+</html>

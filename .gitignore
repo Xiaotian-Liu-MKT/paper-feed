@@ -13,12 +13,17 @@ ENV/
 # Configuration files with sensitive data
 config.json
 
+# Local tooling / assistant data
+.claude/
+
 # Generated files
 filtered_feed.xml
 web/feed.json
 web/translations.json
 web/interactions.json
 web/journals.hash
+web/preference_report.json
+web/preference_report.json.backup
 
 # IDE
 .vscode/
@@ -30,6 +35,10 @@ web/journals.hash
 # OS
 .DS_Store
 Thumbs.db
+
+# Windows special/invalid filenames
+nul
+web/nul
 
 # Logs
 *.log
