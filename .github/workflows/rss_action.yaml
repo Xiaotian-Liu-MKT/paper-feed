@@ -35,7 +35,7 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add filtered_feed.xml
+        git add -f filtered_feed.xml
         # 只有当有新文件生成或文件变动时才提交
         git commit -m "Auto-update RSS feed" || echo "No changes to commit"
         git push
