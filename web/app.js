@@ -3,6 +3,7 @@ const state = {
   filtered: [],
   keywords: [],
   interactions: { favorites: [], archived: [], hidden: [] },
+  zoteroExports: {},
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
   preset: "",
   focusTopics: [],
@@ -30,6 +31,7 @@ const elements = {
   toDate: document.getElementById("toDate"),
   sortSelect: document.getElementById("sortSelect"),
   summaryToggle: document.getElementById("summaryToggle"),
+  btnExportFavorites: document.getElementById("btnExportFavorites"),
   cardTemplate: document.getElementById("cardTemplate"),
   topicCloud: document.getElementById("topicCloud"),
   topicCloudWrap: document.getElementById("topicCloudWrap")
@@ -82,6 +84,20 @@ async function loadInteractions() {
     }
   } catch (e) {
     console.warn("Failed to load interactions", e);
+  }
+}
+
+async function loadZoteroExports() {
+  try {
+    const res = await fetch("/api/zotero_exports?t=" + Date.now(), {
+      cache: "no-store"
+    });
+    if (res.ok) {
+      const payload = await res.json();
+      state.zoteroExports = payload && typeof payload === "object" ? payload : {};
+    }
+  } catch (e) {
+    console.warn("Failed to load Zotero exports", e);
   }
 }
 
@@ -619,6 +635,9 @@ function renderList() {
     }
     if (item.user_corrected) {
       appendTagBadge(metaInfo, "用户修正");
+    }
+    if (state.zoteroExports[item.link]?.item_key) {
+      appendTagBadge(metaInfo, "已导出 Zotero");
     }
     // ----------------------------------
 
@@ -1593,6 +1612,45 @@ const classificationForm = document.getElementById("classificationForm");
 const btnCancelClassification = document.getElementById("btnCancelClassification");
 
 const btnSummarizeFavorites = document.getElementById("btnSummarizeFavorites");
+const btnExportFavorites = document.getElementById("btnExportFavorites");
+
+if (btnExportFavorites) {
+  btnExportFavorites.addEventListener("click", async () => {
+    if (state.interactions.favorites.length === 0) {
+      alert("还没有收藏任何文章。");
+      return;
+    }
+
+    if (!confirm(`确定要把 ${state.interactions.favorites.length} 篇收藏文章导出到 Zotero 吗？`)) {
+      return;
+    }
+
+    try {
+      btnExportFavorites.disabled = true;
+      btnExportFavorites.textContent = "导出中...";
+      setStatus("正在导出收藏夹到 Zotero...");
+
+      const res = await fetch("/api/export_favorites_to_zotero", { method: "POST" });
+      const result = await res.json();
+
+      if (!res.ok) {
+        throw new Error(result.message || "Unknown error");
+      }
+
+      await loadZoteroExports();
+      renderList();
+      updateFilterCounts();
+      setStatus("Zotero 导出完成");
+      alert(result.message);
+    } catch (e) {
+      alert("导出失败: " + e.message);
+      setStatus("Zotero 导出失败");
+    } finally {
+      btnExportFavorites.disabled = false;
+      btnExportFavorites.textContent = "📚 导出到 Zotero";
+    }
+  });
+}
 
 if (btnSummarizeFavorites) {
   btnSummarizeFavorites.addEventListener("click", async () => {
@@ -1671,6 +1729,9 @@ if (btnSettings && modal) {
         form.OPENAI_API_KEY.value = config.OPENAI_API_KEY || "";
         form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
         form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
+        form.ZOTERO_API_KEY.value = config.ZOTERO_API_KEY || "";
+        form.ZOTERO_LIBRARY_ID.value = config.ZOTERO_LIBRARY_ID || "";
+        form.ZOTERO_LIBRARY_TYPE.value = config.ZOTERO_LIBRARY_TYPE || "users";
       }
     } catch (e) {
       console.warn("Failed to load config", e);
@@ -1725,7 +1786,10 @@ if (form && modal) {
     const data = {
       OPENAI_API_KEY: form.OPENAI_API_KEY.value.trim(),
       OPENAI_BASE_URL: form.OPENAI_BASE_URL.value.trim(),
-      OPENAI_PROXY: form.OPENAI_PROXY.value.trim()
+      OPENAI_PROXY: form.OPENAI_PROXY.value.trim(),
+      ZOTERO_API_KEY: form.ZOTERO_API_KEY.value.trim(),
+      ZOTERO_LIBRARY_ID: form.ZOTERO_LIBRARY_ID.value.trim(),
+      ZOTERO_LIBRARY_TYPE: form.ZOTERO_LIBRARY_TYPE.value.trim() || "users"
     };
     
     try {
@@ -1853,6 +1917,9 @@ function setupFilters() {
       if (btnSummarizeFavorites) {
         btnSummarizeFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
       }
+      if (btnExportFavorites) {
+        btnExportFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
+      }
 
       applyFilters();
     });
@@ -1862,6 +1929,7 @@ function setupFilters() {
 async function init() {
   setupFilters();
   await loadInteractions();
+  await loadZoteroExports();
   await loadCategories();
   await loadFeed();
 }
