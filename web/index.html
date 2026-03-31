@@ -4,11 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.0" />
+    <link rel="stylesheet" href="styles.css?v=2.2" />
   </head>
   <body>
     <header class="hero">
       <div class="hero__bg"></div>
+      <div class="hero__grid"></div>
         <div class="hero__actions">
           <a class="btn btn--secondary" href="stats.html">📊 统计</a>
           <a class="btn btn--secondary" href="report.html">🧭 偏好报告</a>
@@ -20,23 +21,56 @@
         </div>
       <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
-        <h1>你的论文订阅，一页看完</h1>
-        <p class="subhead">筛选、搜索、排序，专注你真正想读的内容。</p>
+        <h1>每天先清收件箱，再留真正值得读的论文</h1>
+        <p class="subhead">标题翻译、摘要、方法和主题都在一张卡片里，先快速筛，再把收藏导出为 RIS。</p>
+      </div>
+      <div class="hero__dashboard">
+        <article class="hero-stat">
+          <span class="hero-stat__label">待筛选</span>
+          <strong id="heroInboxCount" class="hero-stat__value">0</strong>
+          <span class="hero-stat__note">今天还没处理的论文</span>
+        </article>
+        <article class="hero-stat">
+          <span class="hero-stat__label">我的收藏</span>
+          <strong id="heroFavoritesCount" class="hero-stat__value">0</strong>
+          <span class="hero-stat__note">可继续导出到 RIS</span>
+        </article>
+        <article class="hero-stat">
+          <span class="hero-stat__label">已归档</span>
+          <strong id="heroArchivedCount" class="hero-stat__value">0</strong>
+          <span class="hero-stat__note">已筛过但暂不处理</span>
+        </article>
+        <article class="hero-stat hero-stat--accent">
+          <span class="hero-stat__label">当前结果</span>
+          <strong id="heroVisibleCount" class="hero-stat__value">0</strong>
+          <span id="heroVisibleNote" class="hero-stat__note">根据当前筛选显示</span>
+        </article>
       </div>
     </header>
 
-    <div class="filters">
-      <button class="filter-btn active" data-filter="all">待筛选 <span id="countInbox" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button class="filter-btn" data-filter="favorites">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button class="filter-btn" data-filter="archived">已归档 <span id="countArchived" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button id="btnExportFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">📄 导出 RIS</button>
-      <button id="btnSummarizeFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">✨ 生成 AI 总结</button>
-    </div>
-
     <main id="feed-container">
+      <section class="workflow-panel">
+        <div class="filters">
+          <button class="filter-btn active" data-filter="all">待筛选 <span id="countInbox" class="badge badge--muted badge--counter"></span></button>
+          <button class="filter-btn" data-filter="favorites">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted badge--counter"></span></button>
+          <button class="filter-btn" data-filter="archived">已归档 <span id="countArchived" class="badge badge--muted badge--counter"></span></button>
+        </div>
+        <div class="workflow-panel__body">
+          <div class="workflow-panel__copy">
+            <p id="modeEyebrow" class="workflow-panel__eyebrow">今日模式</p>
+            <h2 id="modeTitle" class="workflow-panel__title">待筛选收件箱</h2>
+            <p id="modeDescription" class="workflow-panel__desc">优先处理新论文，看到有意思的先收藏，剩下的快速跳过。</p>
+          </div>
+          <div class="workflow-panel__actions">
+            <button id="btnExportFavorites" class="btn btn--secondary btn--feature" style="display:none;">📄 导出 RIS</button>
+            <button id="btnSummarizeFavorites" class="btn btn--secondary btn--feature" style="display:none;">✨ 生成 AI 总结</button>
+          </div>
+        </div>
+        <div id="insightChips" class="insight-chips"></div>
+      </section>
 
       <section class="panel">
-        <div class="controls">
+        <div class="controls controls--primary">
           <label class="control">
             <span>搜索</span>
             <input id="searchInput" type="search" placeholder="关键词 / 期刊 / 摘要" />
@@ -63,44 +97,6 @@
             </select>
           </label>
 
-          
-
-          <label class="control">
-            <span>方法逻辑</span>
-            <select id="filterMethodMode">
-              <option value="any">包含任一</option>
-              <option value="all">同时包含</option>
-            </select>
-          </label>
-
-          <label class="control">
-            <span>主题逻辑</span>
-            <select id="filterTopicMode">
-              <option value="any">包含任一</option>
-              <option value="all">同时包含</option>
-            </select>
-          </label>
-
-          <label class="control">
-            <span>智能预设</span>
-            <select id="filterPreset">
-              <option value="">无预设</option>
-              <option value="my_focus">我的研究方向</option>
-              <option value="cross">跨学科研究</option>
-              <option value="recent_hot">近期热点</option>
-            </select>
-          </label>
-
-          <label class="control">
-            <span>起始日期</span>
-            <input id="fromDate" type="date" />
-          </label>
-
-          <label class="control">
-            <span>截止日期</span>
-            <input id="toDate" type="date" />
-          </label>
-
           <label class="control">
             <span>排序</span>
             <select id="sortSelect">
@@ -114,6 +110,46 @@
             <span>显示摘要</span>
           </label>
         </div>
+        <details class="advanced-controls">
+          <summary>更多筛选选项</summary>
+          <div class="controls controls--advanced">
+            <label class="control">
+              <span>方法逻辑</span>
+              <select id="filterMethodMode">
+                <option value="any">包含任一</option>
+                <option value="all">同时包含</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span>主题逻辑</span>
+              <select id="filterTopicMode">
+                <option value="any">包含任一</option>
+                <option value="all">同时包含</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span>智能预设</span>
+              <select id="filterPreset">
+                <option value="">无预设</option>
+                <option value="my_focus">我的研究方向</option>
+                <option value="cross">跨学科研究</option>
+                <option value="recent_hot">近期热点</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span>起始日期</span>
+              <input id="fromDate" type="date" />
+            </label>
+
+            <label class="control">
+              <span>截止日期</span>
+              <input id="toDate" type="date" />
+            </label>
+          </div>
+        </details>
 
         <div class="status">
           <span id="countLabel">加载中...</span>
@@ -276,7 +312,7 @@
       </form>
     </dialog>
 
-    <script src="app.js?v=2.1"></script>
+    <script src="app.js?v=2.2"></script>
   </body>
 </html>
 

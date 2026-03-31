@@ -19,6 +19,15 @@ const elements = {
   list: document.getElementById("list"),
   countLabel: document.getElementById("countLabel"),
   generatedAt: document.getElementById("generatedAt"),
+  modeEyebrow: document.getElementById("modeEyebrow"),
+  modeTitle: document.getElementById("modeTitle"),
+  modeDescription: document.getElementById("modeDescription"),
+  insightChips: document.getElementById("insightChips"),
+  heroInboxCount: document.getElementById("heroInboxCount"),
+  heroFavoritesCount: document.getElementById("heroFavoritesCount"),
+  heroArchivedCount: document.getElementById("heroArchivedCount"),
+  heroVisibleCount: document.getElementById("heroVisibleCount"),
+  heroVisibleNote: document.getElementById("heroVisibleNote"),
   searchInput: document.getElementById("searchInput"),
   journalSelect: document.getElementById("journalSelect"),
   filterMethod: document.getElementById("filterMethod"),
@@ -534,28 +543,160 @@ function appendTagBadge(container, label) {
 }
 
 function updateFilterCounts() {
-  const favorites = new Set(state.interactions.favorites);
-  const archived = new Set(state.interactions.archived);
-  const hidden = new Set(state.interactions.hidden);
-
-  let inboxCount = 0;
-  // Inbox is items NOT in favorites, archived, hidden
-  state.items.forEach(item => {
-    if (!favorites.has(item.link) && !archived.has(item.link) && !hidden.has(item.link)) {
-      inboxCount++;
-    }
-  });
-  
-  const favCount = favorites.size;
-  const archCount = archived.size;
+  const counts = getCollectionCounts();
 
   const elInbox = document.getElementById("countInbox");
   const elFav = document.getElementById("countFavorites");
   const elArch = document.getElementById("countArchived");
 
-  if (elInbox) elInbox.textContent = inboxCount > 0 ? inboxCount : "";
-  if (elFav) elFav.textContent = favCount > 0 ? favCount : "";
-  if (elArch) elArch.textContent = archCount > 0 ? archCount : "";
+  if (elInbox) elInbox.textContent = counts.inbox > 0 ? counts.inbox : "";
+  if (elFav) elFav.textContent = counts.favorites > 0 ? counts.favorites : "";
+  if (elArch) elArch.textContent = counts.archived > 0 ? counts.archived : "";
+
+  renderWorkflowSummary();
+}
+
+function getCollectionCounts() {
+  const favorites = new Set(state.interactions.favorites);
+  const archived = new Set(state.interactions.archived);
+  const hidden = new Set(state.interactions.hidden);
+
+  let inboxCount = 0;
+  state.items.forEach((item) => {
+    if (!favorites.has(item.link) && !archived.has(item.link) && !hidden.has(item.link)) {
+      inboxCount++;
+    }
+  });
+
+  return {
+    inbox: inboxCount,
+    favorites: favorites.size,
+    archived: archived.size,
+    hidden: hidden.size
+  };
+}
+
+function collectTopLabels(items, key, limit = 3) {
+  const counts = new Map();
+  items.forEach((item) => {
+    const values = Array.isArray(item[key]) ? item[key] : [];
+    values.forEach((value) => {
+      if (!value) return;
+      counts.set(value, (counts.get(value) || 0) + 1);
+    });
+  });
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([label]) => label);
+}
+
+function renderInsightChips(chips) {
+  if (!elements.insightChips) return;
+  elements.insightChips.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  chips.forEach((chip) => {
+    const node = document.createElement("span");
+    node.className = `insight-chip insight-chip--${chip.tone || "muted"}`;
+    node.textContent = chip.text;
+    fragment.appendChild(node);
+  });
+  elements.insightChips.appendChild(fragment);
+}
+
+function setModeActionVisibility() {
+  const isFavorites = state.filterMode === "favorites";
+  if (btnSummarizeFavorites) {
+    btnSummarizeFavorites.style.display = isFavorites ? "inline-flex" : "none";
+  }
+  if (btnExportFavorites) {
+    btnExportFavorites.style.display = isFavorites ? "inline-flex" : "none";
+  }
+}
+
+function renderWorkflowSummary() {
+  const counts = getCollectionCounts();
+  const visibleCount = state.filtered.length;
+  const topTopics = collectTopLabels(state.filtered, "topicLabels", 3);
+  const topMethods = collectTopLabels(state.filtered, "methodLabels", 2);
+
+  if (elements.heroInboxCount) elements.heroInboxCount.textContent = counts.inbox;
+  if (elements.heroFavoritesCount) elements.heroFavoritesCount.textContent = counts.favorites;
+  if (elements.heroArchivedCount) elements.heroArchivedCount.textContent = counts.archived;
+  if (elements.heroVisibleCount) elements.heroVisibleCount.textContent = visibleCount;
+
+  let eyebrow = "今日模式";
+  let title = "待筛选收件箱";
+  let description = "优先处理新论文，看到有意思的先收藏，剩下的快速跳过。";
+  let visibleNote = "根据当前筛选显示";
+  const chips = [];
+
+  if (state.filterMode === "favorites") {
+    eyebrow = "收藏工作台";
+    title = "把值得追踪的论文留在这里";
+    description = "收藏夹适合二次筛选、生成 AI 总结，并在准备好后导出为 RIS。";
+    visibleNote = "收藏夹当前结果";
+    chips.push({ tone: "accent", text: `已收藏 ${counts.favorites} 篇` });
+    chips.push({ tone: "muted", text: "下一步：导出 RIS 或继续生成 AI 总结" });
+  } else if (state.filterMode === "archived") {
+    eyebrow = "归档回看";
+    title = "这些论文暂时离开主视野";
+    description = "归档区适合回头复查边界案例，不会干扰你的日常收件箱。";
+    visibleNote = "归档区当前结果";
+    chips.push({ tone: "accent", text: `已归档 ${counts.archived} 篇` });
+    chips.push({ tone: "muted", text: "可随时恢复到收藏夹或收件箱" });
+  } else {
+    chips.push({ tone: "accent", text: `待处理 ${counts.inbox} 篇` });
+    chips.push({ tone: "muted", text: "操作建议：❤️ 收藏，❌ 跳过" });
+  }
+
+  if (topTopics.length) {
+    chips.push({ tone: "muted", text: `高频主题：${topTopics.join(" / ")}` });
+  }
+  if (topMethods.length && state.filterMode !== "favorites") {
+    chips.push({ tone: "muted", text: `方法集中在：${topMethods.join(" / ")}` });
+  }
+
+  if (elements.modeEyebrow) elements.modeEyebrow.textContent = eyebrow;
+  if (elements.modeTitle) elements.modeTitle.textContent = title;
+  if (elements.modeDescription) elements.modeDescription.textContent = description;
+  if (elements.heroVisibleNote) elements.heroVisibleNote.textContent = visibleNote;
+
+  renderInsightChips(chips);
+  setModeActionVisibility();
+}
+
+function renderAbstractBlock(container, item, highlightTerms) {
+  const sourceBadge = {
+    crossref: { emoji: "📚", text: "Crossref", color: "#2563eb" },
+    semantic_scholar: { emoji: "🔬", text: "Semantic Scholar", color: "#7c3aed" },
+    gpt_generated: { emoji: "🤖", text: "AI 生成", color: "#ea580c" },
+    gpt_summarized: { emoji: "✨", text: "AI 总结", color: "#d97706" },
+    user_provided: { emoji: "✏️", text: "用户补充", color: "#059669" }
+  };
+
+  const source = sourceBadge[item.abstract_source] || { emoji: "📄", text: "摘要", color: "#64748b" };
+  const head = document.createElement("div");
+  head.className = "card__abstract-head";
+
+  const badge = document.createElement("span");
+  badge.className = "card__abstract-badge";
+  badge.style.backgroundColor = source.color;
+  badge.textContent = `${source.emoji} ${source.text}`;
+
+  const caption = document.createElement("span");
+  caption.className = "card__abstract-caption";
+  caption.textContent = item.abstract_source === "gpt_generated" ? "基于标题预测的方向感摘要" : "便于快速判断是否值得继续读";
+
+  const copy = document.createElement("div");
+  copy.className = "card__abstract-copy";
+  copy.style.borderLeftColor = source.color;
+  copy.innerHTML = highlightText(item.abstract, highlightTerms);
+
+  head.appendChild(badge);
+  head.appendChild(caption);
+  container.replaceChildren(head, copy);
+  container.style.display = "block";
 }
 
 function renderList() {
@@ -566,13 +707,24 @@ function renderList() {
   if (state.filtered.length === 0) {
     const empty = document.createElement("div");
     empty.className = "card";
+    const heading = document.createElement("strong");
+    heading.style.display = "block";
+    heading.style.marginBottom = "6px";
+    heading.style.fontSize = "1.1rem";
+    const description = document.createElement("div");
+    description.style.color = "#64748b";
     if (state.filterMode === "favorites") {
-      empty.textContent = "还没有收藏任何文章。";
+      heading.textContent = "还没有收藏任何文章。";
+      description.textContent = "在收件箱里看到值得追的论文时，点一下 ❤️ 它就会进到这里。";
     } else if (state.filterMode === "archived") {
-      empty.textContent = "暂无已归档文章。";
+      heading.textContent = "暂无已归档文章。";
+      description.textContent = "归档区适合存放已经看过、但暂时不准备继续处理的论文。";
     } else {
-      empty.textContent = "暂时没有新的文献了...";
+      heading.textContent = "暂时没有新的文献了。";
+      description.textContent = "可以稍后刷新，或者切换到收藏夹继续处理之前留住的论文。";
     }
+    empty.appendChild(heading);
+    empty.appendChild(description);
     elements.list.appendChild(empty);
     return;
   }
@@ -605,6 +757,8 @@ function renderList() {
     const metaText = document.createElement('span');
     metaText.textContent = `${item.journal || "Unknown"} · ${formatDate(item.date)}`;
     metaText.style.marginRight = "12px";
+    metaText.style.fontWeight = "700";
+    metaText.style.color = "#334155";
     metaInfo.appendChild(metaText);
     
     // 2. Append Badges (Method & Topic)
@@ -637,6 +791,7 @@ function renderList() {
     appendField(fields, "作者", item.authors, highlightTerms);
     appendField(fields, "来源", item.source, highlightTerms);
     appendField(fields, "出版时间", item.publicationDate, highlightTerms);
+    appendField(fields, "DOI", item.doi, highlightTerms);
     appendField(fields, "理论", item.theoriesText, highlightTerms);
     appendField(fields, "情境", item.contextText, highlightTerms);
     appendField(fields, "对象", item.subjectsText, highlightTerms);
@@ -646,30 +801,7 @@ function renderList() {
 
     // Display abstract if available
     if (showSummary && item.abstract) {
-      abstractDiv.className = "card__abstract";
-
-      // Add source badge
-      const sourceBadge = {
-        'crossref': { emoji: '📚', text: 'Crossref', color: '#2196F3' },
-        'semantic_scholar': { emoji: '🔬', text: 'Semantic Scholar', color: '#9C27B0' },
-        'gpt_generated': { emoji: '🤖', text: 'AI 生成', color: '#FF9800' },
-        'gpt_summarized': { emoji: '🤖', text: 'AI 总结', color: '#FF9800' },
-        'user_provided': { emoji: '✏️', text: '用户补充', color: '#4CAF50' }
-      };
-
-      const source = sourceBadge[item.abstract_source] || { emoji: '📄', text: '摘要', color: '#757575' };
-
-      abstractDiv.innerHTML = `
-        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-          <span style="background: ${source.color}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;">
-            ${source.emoji} ${source.text}
-          </span>
-        </div>
-        <div style="background: #f8f9fa; padding: 12px; border-radius: 8px; border-left: 3px solid ${source.color}; margin-bottom: 12px; line-height: 1.6; color: #444;">
-          ${highlightText(item.abstract, highlightTerms)}
-        </div>
-      `;
-      abstractDiv.style.display = "block";
+      renderAbstractBlock(abstractDiv, item, highlightTerms);
     } else {
       abstractDiv.style.display = "none";
     }
@@ -927,7 +1059,14 @@ function applyFilters() {
   filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
 
   state.filtered = filtered;
-  setStatus(`共 ${filtered.length} 篇`);
+  const counts = getCollectionCounts();
+  if (state.filterMode === "favorites") {
+    setStatus(`收藏夹中显示 ${filtered.length} 篇，共收藏 ${counts.favorites} 篇`);
+  } else if (state.filterMode === "archived") {
+    setStatus(`归档区中显示 ${filtered.length} 篇，共归档 ${counts.archived} 篇`);
+  } else {
+    setStatus(`收件箱中显示 ${filtered.length} 篇，待处理总数 ${counts.inbox} 篇`);
+  }
   renderList();
   updateTopicCloudVisibility();
   if (state.filterMode === "favorites") {
@@ -1922,14 +2061,6 @@ function setupFilters() {
       
       // Update filter
       state.filterMode = btn.dataset.filter;
-      
-      // Toggle summarize button visibility
-      if (btnSummarizeFavorites) {
-        btnSummarizeFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
-      }
-      if (btnExportFavorites) {
-        btnExportFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
-      }
 
       applyFilters();
     });
