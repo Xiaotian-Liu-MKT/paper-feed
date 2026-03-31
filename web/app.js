@@ -131,12 +131,14 @@ function toggleLike(id, btnElement) {
   if (btnElement) {
     if (isLiked) {
       btnElement.classList.remove('liked');
-      btnElement.innerHTML = '🤍';
       btnElement.title = "收藏";
+      btnElement.setAttribute("aria-label", "收藏");
+      setActionButtonContent(btnElement, "🤍", "收藏");
     } else {
       btnElement.classList.add('liked');
-      btnElement.innerHTML = '❤️';
       btnElement.title = "取消收藏";
+      btnElement.setAttribute("aria-label", "取消收藏");
+      setActionButtonContent(btnElement, "❤️", "取消收藏");
     }
   }
 
@@ -542,8 +544,28 @@ function appendTagBadge(container, label) {
   container.appendChild(span);
 }
 
-function updateFilterCounts() {
+function getVisibleRenderedCount() {
+  if (!elements.list) return state.filtered.length;
+  const cards = Array.from(elements.list.querySelectorAll(".card"));
+  if (!cards.length) return state.filtered.length;
+  return cards.filter((card) => !card.classList.contains("hidden")).length;
+}
+
+function updateStatusLabel(counts, visibleCount) {
+  if (state.filterMode === "favorites") {
+    setStatus(`收藏夹中显示 ${visibleCount} 篇，共收藏 ${counts.favorites} 篇`);
+  } else if (state.filterMode === "archived") {
+    setStatus(`归档区中显示 ${visibleCount} 篇，共归档 ${counts.archived} 篇`);
+  } else {
+    setStatus(`收件箱中显示 ${visibleCount} 篇，待处理总数 ${counts.inbox} 篇`);
+  }
+}
+
+function updateFilterCounts(visibleCountOverride = null) {
   const counts = getCollectionCounts();
+  const visibleCount = Number.isFinite(visibleCountOverride)
+    ? visibleCountOverride
+    : getVisibleRenderedCount();
 
   const elInbox = document.getElementById("countInbox");
   const elFav = document.getElementById("countFavorites");
@@ -553,7 +575,8 @@ function updateFilterCounts() {
   if (elFav) elFav.textContent = counts.favorites > 0 ? counts.favorites : "";
   if (elArch) elArch.textContent = counts.archived > 0 ? counts.archived : "";
 
-  renderWorkflowSummary();
+  updateStatusLabel(counts, visibleCount);
+  renderWorkflowSummary(visibleCount);
 }
 
 function getCollectionCounts() {
@@ -604,6 +627,39 @@ function renderInsightChips(chips) {
   elements.insightChips.appendChild(fragment);
 }
 
+function setActionButtonContent(button, icon, label) {
+  button.replaceChildren();
+
+  const iconNode = document.createElement("span");
+  iconNode.className = "action-btn__icon";
+  iconNode.textContent = icon;
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "action-btn__label";
+  labelNode.textContent = label;
+
+  button.appendChild(iconNode);
+  button.appendChild(labelNode);
+}
+
+function configureActionButton(button, options) {
+  const {
+    icon,
+    label,
+    title,
+    variant = "",
+    isActive = false
+  } = options;
+
+  button.type = "button";
+  button.className = ["action-btn", variant, isActive ? "liked" : ""]
+    .filter(Boolean)
+    .join(" ");
+  button.title = title || label;
+  button.setAttribute("aria-label", title || label);
+  setActionButtonContent(button, icon, label);
+}
+
 function setModeActionVisibility() {
   const isFavorites = state.filterMode === "favorites";
   if (btnSummarizeFavorites) {
@@ -614,9 +670,11 @@ function setModeActionVisibility() {
   }
 }
 
-function renderWorkflowSummary() {
+function renderWorkflowSummary(visibleCountOverride = null) {
   const counts = getCollectionCounts();
-  const visibleCount = state.filtered.length;
+  const visibleCount = Number.isFinite(visibleCountOverride)
+    ? visibleCountOverride
+    : state.filtered.length;
   const topTopics = collectTopLabels(state.filtered, "topicLabels", 3);
   const topMethods = collectTopLabels(state.filtered, "methodLabels", 2);
 
@@ -838,28 +896,40 @@ function renderList() {
     const isArchived = state.interactions.archived.includes(item.link);
     
     const btnLike = document.createElement("button");
-    btnLike.className = `action-btn ${isLiked ? 'liked' : ''}`;
-    btnLike.innerHTML = isLiked ? '❤️' : '🤍';
-    btnLike.title = isLiked ? "取消收藏" : "收藏";
+    configureActionButton(btnLike, {
+      icon: isLiked ? "❤️" : "🤍",
+      label: isLiked ? "取消收藏" : "收藏",
+      title: isLiked ? "取消收藏" : "收藏",
+      variant: "action-btn--accent",
+      isActive: isLiked
+    });
     btnLike.onclick = function(e) { e.preventDefault(); toggleLike(item.link, this); };
 
     const btnArchive = document.createElement("button");
-    btnArchive.className = "action-btn";
-    // If in favorites (not archived), show box (archive). If in archived, show upload (unarchive).
-    btnArchive.innerHTML = isArchived ? "📤" : "📦"; 
-    btnArchive.title = isArchived ? "取消归档 (回到收件箱)" : "归档 (移出收藏)";
+    configureActionButton(btnArchive, {
+      icon: isArchived ? "📥" : "📦",
+      label: isArchived ? "回到收件箱" : "归档",
+      title: isArchived ? "取消归档 (回到收件箱)" : "归档 (移出收藏)",
+      variant: "action-btn--neutral"
+    });
     btnArchive.onclick = function(e) { e.preventDefault(); toggleArchive(item.link, this); };
 
     const btnRestore = document.createElement("button");
-    btnRestore.className = "action-btn";
-    btnRestore.innerHTML = "↩️";
-    btnRestore.title = "恢复到收藏";
+    configureActionButton(btnRestore, {
+      icon: "↩️",
+      label: "恢复收藏",
+      title: "恢复到收藏",
+      variant: "action-btn--neutral"
+    });
     btnRestore.onclick = function(e) { e.preventDefault(); restoreFromArchive(item.link, this); };
 
     const btnClassify = document.createElement("button");
-    btnClassify.className = "action-btn";
-    btnClassify.innerHTML = '🏷️';
-    btnClassify.title = "编辑分类";
+    configureActionButton(btnClassify, {
+      icon: "🏷️",
+      label: "分类",
+      title: "编辑分类",
+      variant: "action-btn--utility"
+    });
     btnClassify.onclick = function(e) {
       e.preventDefault();
       openClassificationModal(item);
@@ -867,9 +937,12 @@ function renderList() {
 
     // Edit Abstract Button
     const btnEdit = document.createElement("button");
-    btnEdit.className = "action-btn";
-    btnEdit.innerHTML = '✏️';
-    btnEdit.title = "补充/编辑摘要";
+    configureActionButton(btnEdit, {
+      icon: "✏️",
+      label: "摘要",
+      title: "补充/编辑摘要",
+      variant: "action-btn--utility"
+    });
     
     // Edit Area Elements
     const editArea = node.querySelector(".card__edit-area");
@@ -945,9 +1018,12 @@ function renderList() {
     };
     
     const btnHide = document.createElement("button");
-    btnHide.className = "action-btn";
-    btnHide.innerHTML = '❌';
-    btnHide.title = "不感兴趣";
+    configureActionButton(btnHide, {
+      icon: "❌",
+      label: "跳过",
+      title: "不感兴趣",
+      variant: "action-btn--danger"
+    });
     btnHide.onclick = function(e) { 
       e.preventDefault(); 
       toggleHide(item.link, this); 
@@ -1059,15 +1135,8 @@ function applyFilters() {
   filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
 
   state.filtered = filtered;
-  const counts = getCollectionCounts();
-  if (state.filterMode === "favorites") {
-    setStatus(`收藏夹中显示 ${filtered.length} 篇，共收藏 ${counts.favorites} 篇`);
-  } else if (state.filterMode === "archived") {
-    setStatus(`归档区中显示 ${filtered.length} 篇，共归档 ${counts.archived} 篇`);
-  } else {
-    setStatus(`收件箱中显示 ${filtered.length} 篇，待处理总数 ${counts.inbox} 篇`);
-  }
   renderList();
+  updateFilterCounts(filtered.length);
   updateTopicCloudVisibility();
   if (state.filterMode === "favorites") {
     renderTopicCloud(filtered);
@@ -1630,7 +1699,6 @@ async function loadFeed() {
       : "";
     attachHandlers();
     applyFilters();
-    updateFilterCounts();
   } catch (error) {
     setStatus("无法加载 feed.json，请先运行 get_RSS.py 并用本地服务器打开页面。");
   }
