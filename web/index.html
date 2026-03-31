@@ -29,7 +29,7 @@
       <button class="filter-btn active" data-filter="all">待筛选 <span id="countInbox" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
       <button class="filter-btn" data-filter="favorites">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
       <button class="filter-btn" data-filter="archived">已归档 <span id="countArchived" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button id="btnExportFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">📚 导出到 Zotero</button>
+      <button id="btnExportFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">📄 导出 RIS</button>
       <button id="btnSummarizeFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">✨ 生成 AI 总结</button>
     </div>
 
@@ -170,24 +170,6 @@
         <label class="control">
           <span>Proxy (可选)</span>
           <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890">
-        </label>
-
-        <label class="control">
-          <span>Zotero API Key</span>
-          <input name="ZOTERO_API_KEY" type="password" placeholder="zotero-api-key" autocomplete="off">
-        </label>
-
-        <label class="control">
-          <span>Zotero Library ID</span>
-          <input name="ZOTERO_LIBRARY_ID" type="text" placeholder="123456">
-        </label>
-
-        <label class="control">
-          <span>Zotero Library Type</span>
-          <select name="ZOTERO_LIBRARY_TYPE">
-            <option value="users">users</option>
-            <option value="groups">groups</option>
-          </select>
         </label>
 
         <div class="modal__actions">

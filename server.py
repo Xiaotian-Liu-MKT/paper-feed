@@ -10,7 +10,6 @@ from functools import partial
 from urllib.parse import urlsplit
 
 from paper_feed.identity import build_paper_id, normalize_url
-from paper_feed.zotero_api import ZoteroClient, ZoteroApiError, build_item_payload
 
 # 导入 RSS 抓取逻辑
 # 确保 get_RSS.py 在同一目录下
@@ -28,7 +27,6 @@ FEED_FILE = os.path.join(WEB_DIR, "feed.json")
 REPORT_FILE = os.path.join(WEB_DIR, "preference_report.json")
 CATEGORIES_FILE = os.path.join(WEB_DIR, "categories.json")
 USER_CORRECTIONS_FILE = os.path.join(WEB_DIR, "user_corrections.json")
-ZOTERO_EXPORTS_FILE = os.path.join(WEB_DIR, "zotero_exports.json")
 JOURNALS_FILE = "journals.dat"
 JOURNALS_META_FILE = "journals_meta.json"
 RSS_LIST_FILE = "RSS list.md"
@@ -175,23 +173,14 @@ def extract_source_host(link):
     return host
 
 
-def load_zotero_exports():
-    if not os.path.exists(ZOTERO_EXPORTS_FILE):
-        return {}
-    try:
-        with open(ZOTERO_EXPORTS_FILE, 'r', encoding='utf-8') as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
+def get_trusted_abstract(item):
+    abstract_note = (item.get("raw_abstract") or "").strip()
+    if not abstract_note and item.get("abstract_source") in {"crossref", "semantic_scholar", "user_provided"}:
+        abstract_note = (item.get("abstract") or "").strip()
+    return abstract_note
 
 
-def save_zotero_exports(payload):
-    with open(ZOTERO_EXPORTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def build_browser_export_payload(item):
+def build_browser_export_metadata(item):
     link = item.get("link", "")
     journal = clean_journal_name(item.get("journal", ""))
     published_at = str(item.get("pub_date", "") or "")
@@ -213,60 +202,105 @@ def build_browser_export_payload(item):
             topics.append(entry.strip())
     if not topics and item.get("topic"):
         topics.append(str(item["topic"]).strip())
-
-    payload = build_item_payload(
-        title=item.get("title", "") or "Untitled",
-        creators=creators,
-        publication_title=journal,
-        published_at=published_at,
-        url=link,
-        doi=item.get("doi", ""),
-        paper_id=paper_id,
-        source=extract_source_host(link),
-        method=item.get("method", ""),
-        topics=topics,
-    )
-
-    extra_lines = [line for line in (payload.get("extra", "") or "").splitlines() if line.strip()]
-    if item.get("title_zh"):
-        extra_lines.append(f"Chinese Title: {item['title_zh']}")
-    if item.get("id"):
-        extra_lines.append(f"Feed Source ID: {item['id']}")
-    if extra_lines:
-        payload["extra"] = "\n".join(extra_lines)
-
-    abstract_note = (item.get("raw_abstract") or "").strip()
-    if not abstract_note and item.get("abstract_source") in {"crossref", "semantic_scholar", "user_provided"}:
-        abstract_note = (item.get("abstract") or "").strip()
-    if abstract_note:
-        payload["abstractNote"] = abstract_note
-
-    return payload, paper_id
-
-
-def build_zotero_export_record(item, *, item_key, paper_id, exported_at):
     return {
-        "item_key": item_key,
         "paper_id": paper_id,
-        "title": item.get("title", ""),
+        "title": item.get("title", "") or "Untitled",
         "title_zh": item.get("title_zh", ""),
-        "link": item.get("link", ""),
-        "exported_at": exported_at,
+        "journal": journal,
+        "published_at": published_at,
+        "doi": item.get("doi", ""),
+        "url": link,
+        "source_host": extract_source_host(link),
+        "method": item.get("method", ""),
+        "topics": topics,
+        "creators": creators,
+        "abstract": get_trusted_abstract(item),
+        "feed_source_id": item.get("id", ""),
     }
 
 
-def export_favorites_to_zotero(feed_items, favorite_links, export_cache, zotero_client):
+def _ris_clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _ris_author_name(creator):
+    family_name = _ris_clean(creator.get("family_name", ""))
+    given_name = _ris_clean(creator.get("given_name", ""))
+    full_name = _ris_clean(creator.get("full_name", ""))
+    if family_name and given_name:
+        return f"{family_name}, {given_name}"
+    if family_name:
+        return family_name
+    return full_name
+
+
+def _ris_date_parts(value):
+    raw = _ris_clean(value)
+    if not raw:
+        return "", ""
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.datetime.fromisoformat(normalized)
+        return parsed.strftime("%Y"), parsed.strftime("%Y/%m/%d")
+    except Exception:
+        match = re.match(r"^(\d{4})", raw)
+        if match:
+            return match.group(1), match.group(1)
+    return "", ""
+
+
+def build_browser_ris_entry(item):
+    metadata = build_browser_export_metadata(item)
+    lines = ["TY  - JOUR"]
+    lines.append(f"TI  - {_ris_clean(metadata['title'])}")
+
+    if metadata["journal"]:
+        clean_journal = _ris_clean(metadata["journal"])
+        lines.append(f"JO  - {clean_journal}")
+        lines.append(f"T2  - {clean_journal}")
+
+    for creator in metadata["creators"]:
+        author_name = _ris_author_name(creator)
+        if author_name:
+            lines.append(f"AU  - {author_name}")
+
+    year, date_value = _ris_date_parts(metadata["published_at"])
+    if year:
+        lines.append(f"PY  - {year}")
+    if date_value:
+        lines.append(f"DA  - {date_value}")
+
+    if metadata["doi"]:
+        lines.append(f"DO  - {_ris_clean(metadata['doi'])}")
+    if metadata["url"]:
+        lines.append(f"UR  - {_ris_clean(metadata['url'])}")
+    if metadata["abstract"]:
+        lines.append(f"AB  - {_ris_clean(metadata['abstract'])}")
+    if metadata["method"]:
+        lines.append(f"KW  - {_ris_clean(metadata['method'])}")
+    for topic in metadata["topics"]:
+        if topic:
+            lines.append(f"KW  - {_ris_clean(topic)}")
+
+    notes = [f"Paper Feed ID: {metadata['paper_id']}"]
+    if metadata["title_zh"]:
+        notes.append(f"Chinese Title: {metadata['title_zh']}")
+    if metadata["feed_source_id"]:
+        notes.append(f"Feed Source ID: {metadata['feed_source_id']}")
+    if metadata["source_host"]:
+        notes.append(f"Source Host: {metadata['source_host']}")
+    for note in notes:
+        lines.append(f"N1  - {_ris_clean(note)}")
+
+    lines.append("ER  - ")
+    return "\n".join(lines)
+
+
+def build_favorites_ris(feed_items, favorite_links):
     by_link = {item.get("link"): item for item in feed_items if item.get("link")}
-    cache = dict(export_cache or {})
-    summary = {
-        "requested": 0,
-        "created": 0,
-        "reconciled": 0,
-        "skipped": 0,
-        "missing": 0,
-        "failed": 0,
-    }
-    failures = []
+    entries = []
+    summary = {"requested": 0, "exported": 0, "missing": 0}
+    missing = []
     seen = set()
 
     for link in favorite_links:
@@ -277,53 +311,15 @@ def export_favorites_to_zotero(feed_items, favorite_links, export_cache, zotero_
         item = by_link.get(link)
         if not item:
             summary["missing"] += 1
-            failures.append({"link": link, "message": "Item not found in current feed.json"})
+            missing.append(link)
             continue
+        entries.append(build_browser_ris_entry(item))
+        summary["exported"] += 1
 
-        try:
-            payload, paper_id = build_browser_export_payload(item)
-            existing = cache.get(link) or {}
-            cached_item_key = existing.get("item_key", "")
-            if cached_item_key:
-                try:
-                    zotero_client.retrieve_item(cached_item_key)
-                except ZoteroApiError as error:
-                    if error.status_code != 404:
-                        raise
-                else:
-                    summary["skipped"] += 1
-                    continue
-
-            matched = zotero_client.find_item_by_tag(f"pf:id:{paper_id}")
-            if matched:
-                item_key = matched.get("key", "") or matched.get("data", {}).get("key", "")
-                if not item_key:
-                    raise ZoteroApiError("Matched Zotero item is missing key")
-                cache[link] = build_zotero_export_record(
-                    item,
-                    item_key=item_key,
-                    paper_id=paper_id,
-                    exported_at=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
-                )
-                summary["reconciled"] += 1
-                continue
-
-            response = zotero_client.create_item(payload)
-            item_key = ((response.get("successful") or {}).get("0") or {}).get("key", "")
-            if not item_key:
-                raise ZoteroApiError(f"Unexpected Zotero create response: {response}")
-            cache[link] = build_zotero_export_record(
-                item,
-                item_key=item_key,
-                paper_id=paper_id,
-                exported_at=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
-            )
-            summary["created"] += 1
-        except Exception as error:
-            summary["failed"] += 1
-            failures.append({"link": link, "message": str(error)[:400]})
-
-    return {"summary": summary, "exports": cache, "failures": failures}
+    ris_text = ""
+    if entries:
+        ris_text = "\n\n".join(entries) + "\n"
+    return {"summary": summary, "missing_links": missing, "ris": ris_text}
 
 def generate_data_quality_warnings(favorites_count, hidden_count):
     """生成数据质量警告"""
@@ -957,16 +953,6 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(b'{"favorites": [], "archived": [], "hidden": []}')
             return
 
-        if path == '/api/zotero_exports':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Expires', '0')
-            self.end_headers()
-            self.wfile.write(json.dumps(load_zotero_exports(), ensure_ascii=False).encode('utf-8'))
-            return
-
         if path == '/api/preference_report':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -1118,20 +1104,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
             return
 
-        if self.path == '/api/export_favorites_to_zotero':
-            print("Received export favorites to Zotero request...")
+        if self.path == '/api/export_favorites_ris':
+            print("Received export favorites RIS request...")
             try:
-                config = get_config()
-                zotero_api_key = (config.get("ZOTERO_API_KEY") or "").strip()
-                zotero_library_id = str(config.get("ZOTERO_LIBRARY_ID") or "").strip()
-                zotero_library_type = (config.get("ZOTERO_LIBRARY_TYPE") or "users").strip() or "users"
-                zotero_api_version = (config.get("ZOTERO_API_VERSION") or "3").strip() or "3"
-
-                if not zotero_api_key:
-                    raise ValueError("ZOTERO_API_KEY 未配置，请先在设置中填写。")
-                if not zotero_library_id:
-                    raise ValueError("ZOTERO_LIBRARY_ID 未配置，请先在设置中填写。")
-
                 favorites = []
                 if os.path.exists(INTERACTIONS_FILE):
                     with open(INTERACTIONS_FILE, 'r', encoding='utf-8') as f:
@@ -1143,7 +1118,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_header('Content-type', 'application/json')
                     self.end_headers()
                     self.wfile.write(
-                        json.dumps({"status": "ok", "message": "当前没有收藏文章可导出。"}).encode('utf-8')
+                        json.dumps({"status": "ok", "message": "当前没有收藏文章可导出。"}, ensure_ascii=False).encode('utf-8')
                     )
                     return
 
@@ -1154,36 +1129,18 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     payload = json.load(f)
                 feed_items = payload.get("items", [])
 
-                export_cache = load_zotero_exports()
-                zotero_client = ZoteroClient(
-                    zotero_api_key,
-                    zotero_library_type,
-                    zotero_library_id,
-                    api_version=zotero_api_version,
-                )
-                zotero_client.validate_access()
-                result = export_favorites_to_zotero(feed_items, favorites, export_cache, zotero_client)
-                save_zotero_exports(result["exports"])
-
+                result = build_favorites_ris(feed_items, favorites)
                 summary = result["summary"]
-                message = (
-                    f"Zotero 导出完成：新增 {summary['created']}，"
-                    f"已存在并回填 {summary['reconciled']}，"
-                    f"已跳过 {summary['skipped']}，"
-                    f"失败 {summary['failed']}。"
-                )
-                response = {
-                    "status": "ok",
-                    "message": message,
-                    "summary": summary,
-                    "failures": result["failures"][:10],
-                }
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
                 self.send_response(200)
-                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-type', 'application/x-research-info-systems; charset=utf-8')
+                self.send_header('Content-Disposition', f'attachment; filename=\"paper-feed-favorites-{timestamp}.ris\"')
+                self.send_header('X-Paper-Feed-Exported', str(summary["exported"]))
+                self.send_header('X-Paper-Feed-Missing', str(summary["missing"]))
                 self.end_headers()
-                self.wfile.write(json.dumps(response, ensure_ascii=False).encode('utf-8'))
+                self.wfile.write(result["ris"].encode('utf-8'))
             except Exception as e:
-                print(f"Zotero export error: {e}")
+                print(f"RIS export error: {e}")
                 self.send_response(500)
                 self.end_headers()
                 self.wfile.write(

@@ -3,7 +3,6 @@ const state = {
   filtered: [],
   keywords: [],
   interactions: { favorites: [], archived: [], hidden: [] },
-  zoteroExports: {},
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
   preset: "",
   focusTopics: [],
@@ -84,20 +83,6 @@ async function loadInteractions() {
     }
   } catch (e) {
     console.warn("Failed to load interactions", e);
-  }
-}
-
-async function loadZoteroExports() {
-  try {
-    const res = await fetch("/api/zotero_exports?t=" + Date.now(), {
-      cache: "no-store"
-    });
-    if (res.ok) {
-      const payload = await res.json();
-      state.zoteroExports = payload && typeof payload === "object" ? payload : {};
-    }
-  } catch (e) {
-    console.warn("Failed to load Zotero exports", e);
   }
 }
 
@@ -635,9 +620,6 @@ function renderList() {
     }
     if (item.user_corrected) {
       appendTagBadge(metaInfo, "用户修正");
-    }
-    if (state.zoteroExports[item.link]?.item_key) {
-      appendTagBadge(metaInfo, "已导出 Zotero");
     }
     // ----------------------------------
 
@@ -1614,6 +1596,34 @@ const btnCancelClassification = document.getElementById("btnCancelClassification
 const btnSummarizeFavorites = document.getElementById("btnSummarizeFavorites");
 const btnExportFavorites = document.getElementById("btnExportFavorites");
 
+function parseDownloadFilename(headerValue, fallbackName) {
+  if (!headerValue) return fallbackName;
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch (e) {
+      return utf8Match[1];
+    }
+  }
+  const plainMatch = headerValue.match(/filename="?([^";]+)"?/i);
+  if (plainMatch) {
+    return plainMatch[1];
+  }
+  return fallbackName;
+}
+
+function triggerDownload(blob, filename) {
+  const blobUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
 if (btnExportFavorites) {
   btnExportFavorites.addEventListener("click", async () => {
     if (state.interactions.favorites.length === 0) {
@@ -1621,33 +1631,39 @@ if (btnExportFavorites) {
       return;
     }
 
-    if (!confirm(`确定要把 ${state.interactions.favorites.length} 篇收藏文章导出到 Zotero 吗？`)) {
+    if (!confirm(`确定要把 ${state.interactions.favorites.length} 篇收藏文章导出为 RIS 文件吗？`)) {
       return;
     }
 
     try {
       btnExportFavorites.disabled = true;
       btnExportFavorites.textContent = "导出中...";
-      setStatus("正在导出收藏夹到 Zotero...");
+      setStatus("正在生成 RIS 文件...");
 
-      const res = await fetch("/api/export_favorites_to_zotero", { method: "POST" });
-      const result = await res.json();
-
+      const res = await fetch("/api/export_favorites_ris", { method: "POST" });
       if (!res.ok) {
+        const result = await res.json();
         throw new Error(result.message || "Unknown error");
       }
 
-      await loadZoteroExports();
-      renderList();
-      updateFilterCounts();
-      setStatus("Zotero 导出完成");
-      alert(result.message);
+      const exportedCount = Number(res.headers.get("X-Paper-Feed-Exported") || "0");
+      const missingCount = Number(res.headers.get("X-Paper-Feed-Missing") || "0");
+      const disposition = res.headers.get("Content-Disposition");
+      const filename = parseDownloadFilename(
+        disposition,
+        `paper-feed-favorites-${new Date().toISOString().slice(0, 10)}.ris`
+      );
+      const blob = await res.blob();
+      triggerDownload(blob, filename);
+
+      setStatus("RIS 导出完成");
+      alert(`RIS 已下载：导出 ${exportedCount} 篇，缺失 ${missingCount} 篇。`);
     } catch (e) {
       alert("导出失败: " + e.message);
-      setStatus("Zotero 导出失败");
+      setStatus("RIS 导出失败");
     } finally {
       btnExportFavorites.disabled = false;
-      btnExportFavorites.textContent = "📚 导出到 Zotero";
+      btnExportFavorites.textContent = "📄 导出 RIS";
     }
   });
 }
@@ -1729,9 +1745,6 @@ if (btnSettings && modal) {
         form.OPENAI_API_KEY.value = config.OPENAI_API_KEY || "";
         form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
         form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
-        form.ZOTERO_API_KEY.value = config.ZOTERO_API_KEY || "";
-        form.ZOTERO_LIBRARY_ID.value = config.ZOTERO_LIBRARY_ID || "";
-        form.ZOTERO_LIBRARY_TYPE.value = config.ZOTERO_LIBRARY_TYPE || "users";
       }
     } catch (e) {
       console.warn("Failed to load config", e);
@@ -1786,10 +1799,7 @@ if (form && modal) {
     const data = {
       OPENAI_API_KEY: form.OPENAI_API_KEY.value.trim(),
       OPENAI_BASE_URL: form.OPENAI_BASE_URL.value.trim(),
-      OPENAI_PROXY: form.OPENAI_PROXY.value.trim(),
-      ZOTERO_API_KEY: form.ZOTERO_API_KEY.value.trim(),
-      ZOTERO_LIBRARY_ID: form.ZOTERO_LIBRARY_ID.value.trim(),
-      ZOTERO_LIBRARY_TYPE: form.ZOTERO_LIBRARY_TYPE.value.trim() || "users"
+      OPENAI_PROXY: form.OPENAI_PROXY.value.trim()
     };
     
     try {
@@ -1929,7 +1939,6 @@ function setupFilters() {
 async function init() {
   setupFilters();
   await loadInteractions();
-  await loadZoteroExports();
   await loadCategories();
   await loadFeed();
 }
