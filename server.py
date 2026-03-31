@@ -27,6 +27,7 @@ USER_CORRECTIONS_FILE = os.path.join(WEB_DIR, "user_corrections.json")
 JOURNALS_FILE = "journals.dat"
 JOURNALS_META_FILE = "journals_meta.json"
 RSS_LIST_FILE = "RSS list.md"
+LEGACY_INTERACTIONS_HEADER = ("X-Paper-Feed-State-Mode", "legacy-local")
 
 TITLE_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
@@ -741,6 +742,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         if path == '/api/interactions':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
+            self.send_header(LEGACY_INTERACTIONS_HEADER[0], LEGACY_INTERACTIONS_HEADER[1])
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.send_header('Pragma', 'no-cache')
             self.send_header('Expires', '0')
@@ -804,6 +806,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             try:
+                # Phase 1 compatibility path. Notion will replace this as the workflow source of truth later.
                 req_data = json.loads(post_data.decode('utf-8'))
                 
                 # Load existing
@@ -866,6 +869,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
+                self.send_header(LEGACY_INTERACTIONS_HEADER[0], LEGACY_INTERACTIONS_HEADER[1])
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode('utf-8'))
             except Exception as e:

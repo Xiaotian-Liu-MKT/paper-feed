@@ -33,6 +33,12 @@ pip install -r requirements.txt
 - `rfeed`: RSS feed 生成
 - `openai`: OpenAI API 客户端（可选，用于标题翻译）
 
+如果你要跑当前的重构测试或新的集成脚本，还需要：
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## 配置
 
 ### 1. 配置 RSS 源 (`journals.dat`)
@@ -101,6 +107,40 @@ python get_RSS.py
 3. 生成 `filtered_feed.xml` 文件
 4. 生成 `web/feed.json` 文件供 Web 界面使用
 
+### 方式一补充：Notion-first 重构脚本
+
+当前仓库已经开始接入新的 Notion-first 批处理路径，现阶段可用的命令包括 bootstrap、ingest、export 和 registry recovery：
+
+```bash
+python scripts/bootstrap_notion_papers.py
+python scripts/ingest_to_notion.py --dry-run --limit 50
+python scripts/ingest_to_notion.py --apply --limit 100 --registry-path automation-state/state/registry.json
+python scripts/export_to_zotero.py --dry-run --limit 20
+python scripts/export_to_zotero.py --apply --limit 100 --registry-path automation-state/state/registry.json
+python scripts/rebuild_registry.py --dry-run
+```
+
+- `bootstrap_notion_papers.py`
+  - 默认只输出机器可读的 schema/bootstrap 计划
+  - `--apply` 需要显式配置 `NOTION_TOKEN`、`NOTION_PARENT_PAGE_ID`
+  - 没有 `NOTION_PAPERS_DATABASE_ID` 时，必须额外传 `--create-if-missing`
+- `ingest_to_notion.py --dry-run`
+  - 只读取现有 `filtered_feed.xml`、`translations.json`、`abstracts.json` 等本地数据
+  - 不会写入 Notion，也不会改动当前 `web/feed.json`、`interactions.json` 或其他本地产物
+- `ingest_to_notion.py --apply`
+  - 需要显式配置 `NOTION_TOKEN`、`NOTION_PAPERS_DATABASE_ID`
+  - 如果批量回填时 Notion API 偶发超时，可额外设 `NOTION_TIMEOUT_SECONDS`
+  - 推荐同时传 `--registry-path automation-state/state/registry.json`
+  - 会把 canonical records upsert 到 Notion，并同步 `SYSTEM_RAW_ABSTRACT` / `SYSTEM_METADATA_JSON` page body anchors
+- `export_to_zotero.py`
+  - `--dry-run` 预览待导出候选，不会写远端
+  - `--apply` 需要 `NOTION_TOKEN`、`NOTION_PAPERS_DATABASE_ID`、`ZOTERO_API_KEY`、`ZOTERO_LIBRARY_ID`
+  - 成功导出后会回写 Notion `Zotero 状态`，并把 machine state 写入 registry
+- `rebuild_registry.py`
+  - 这是 operator-only 的恢复脚本
+  - 它会从 Notion `paper_id` 和 Zotero `pf:id:<paper_id>` 机器标签重建完整 `state/registry.json`
+  - 如果发现 Notion 或 Zotero 侧存在重复 reachable records，会 fail fast，不会覆写 registry
+
 ### 方式二：启动 Web 服务器
 
 启动本地 Web 服务器：
@@ -153,6 +193,12 @@ paper-feed/
 │   └── translations.json  # 翻译缓存
 └── README.md              # 本文件
 ```
+
+说明：
+- `web/interactions.json` 目前仍然被本地 Web UI 使用，但它已经处于过渡期的 legacy-local 状态。
+- Notion-first cutover 完成后，本地交互状态将不再作为工作流真相源。
+- `automation-state/state/registry.json` 是新的机器状态真相源；正式工作流不会把它长期留在默认分支。
+- `automation-state/state/duplicate_audit/` 保存 ingest exact-match duplicate 的机器审计报告。
 
 ## 工作原理
 
@@ -223,6 +269,24 @@ jobs:
           git commit -m "Auto-update RSS feed" || exit 0
           git push
 ```
+
+当前 refactor 分支还额外提供了手动 dry-run 的入口：
+
+- `python scripts/ingest_to_notion.py --dry-run --limit 50`
+- 用于预览 canonical records 进入 Notion 前的默认状态，不会写入任何远端系统
+- `python scripts/export_to_zotero.py --dry-run --limit 20`
+- `python scripts/rebuild_registry.py --dry-run`
+
+GitHub Actions 侧当前已经拆成几条独立工作流：
+
+- `ingest-to-notion`
+  - 刷新 RSS projections，并把 canonical records upsert 到 Notion
+- `export-zotero`
+  - 轮询 `状态=收藏` 且 `Zotero 状态=待导出/导出中(stale)` 的页面并执行导出/恢复
+- `keepalive-state`
+  - 只更新 `automation-state` 的 `state/heartbeat.json`，避免低活跃仓库定时任务静默失活
+- `rebuild-registry`
+  - 只在 operator 手动触发时运行，用于从 Notion + Zotero 重建 registry
 
 ## 许可证
 

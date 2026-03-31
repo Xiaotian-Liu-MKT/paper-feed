@@ -1,41 +1,131 @@
-name: Auto RSS Fetch
+name: ingest-to-notion
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时运行一次
-  workflow_dispatch:      # 允许手动触发
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      paper_id_filter:
+        description: "Optional newline-delimited canonical paper_id values"
+        required: false
+        default: ""
+        type: string
+      force_metadata_repair:
+        description: "Rebuild metadata blocks for the filtered pages only"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ingest-to-notion
+  cancel-in-progress: false
 
 jobs:
-  build:
+  ingest:
     runs-on: ubuntu-latest
-    
-    # 这一步非常重要：赋予脚本写入仓库的权限
     permissions:
       contents: write
-
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      NOTION_API_VERSION: "2022-06-28"
+      NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
+      NOTION_PAPERS_DATABASE_ID: ${{ secrets.NOTION_PAPERS_DATABASE_ID }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      RSS_KEYWORDS: ${{ secrets.RSS_KEYWORDS }}
+      PAPER_ID_FILTER: ${{ github.event.inputs.paper_id_filter || '' }}
+      FORCE_METADATA_REPAIR: ${{ github.event.inputs.force_metadata_repair || 'false' }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
+      - name: Checkout automation-state workspace
+        uses: actions/checkout@v4
+        with:
+          path: automation-state
+          fetch-depth: 0
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Run RSS Script
-      env: 
-        RSS_KEYWORDS: ${{ secrets.RSS_KEYWORDS }}
-      run: python get_RSS.py
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-    - name: Commit and Push changes
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add -f filtered_feed.xml
-        # 只有当有新文件生成或文件变动时才提交
-        git commit -m "Auto-update RSS feed" || echo "No changes to commit"
-        git push
+      - name: Prepare automation-state branch
+        run: |
+          git -C automation-state fetch origin automation-state || true
+          if git -C automation-state show-ref --verify --quiet refs/remotes/origin/automation-state; then
+            git -C automation-state checkout -B automation-state refs/remotes/origin/automation-state
+          else
+            git -C automation-state checkout --orphan automation-state
+            git -C automation-state rm -rf . || true
+          fi
+
+      - name: Bootstrap automation-state layout
+        run: python scripts/bootstrap_automation_state.py --root automation-state
+
+      - name: Validate or repair Notion Papers database
+        run: |
+          python scripts/bootstrap_notion_papers.py --apply --create-if-missing > bootstrap-result.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path("bootstrap-result.json").read_text(encoding="utf-8"))
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"NOTION_PAPERS_DATABASE_ID={payload['database_id']}\n")
+          PY
+
+      - name: Refresh RSS projections
+        run: python get_RSS.py
+
+      - name: Ingest canonical records into Notion
+        run: |
+          if [ "${FORCE_METADATA_REPAIR}" = "true" ]; then
+            python scripts/ingest_to_notion.py --apply --limit 100 --registry-path automation-state/state/registry.json --paper-id-filter "${PAPER_ID_FILTER}" --force-metadata-repair
+          elif [ -n "${PAPER_ID_FILTER}" ]; then
+            python scripts/ingest_to_notion.py --apply --limit 100 --registry-path automation-state/state/registry.json --paper-id-filter "${PAPER_ID_FILTER}"
+          else
+            python scripts/ingest_to_notion.py --apply --limit 100 --registry-path automation-state/state/registry.json
+          fi
+
+      - name: Snapshot local ingest registry
+        run: cp automation-state/state/registry.json .local-ingest-registry.json
+
+      - name: Commit updated projections
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f filtered_feed.xml
+          git commit -m "chore: refresh feed projections" || echo "No changes to commit"
+          git push
+
+      - name: Publish ingest namespace to automation-state
+        run: |
+          git -C automation-state config user.name "github-actions[bot]"
+          git -C automation-state config user.email "github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git -C automation-state fetch origin automation-state || true
+            if git -C automation-state show-ref --verify --quiet refs/remotes/origin/automation-state; then
+              git -C automation-state checkout -B automation-state refs/remotes/origin/automation-state
+            else
+              git -C automation-state checkout --orphan automation-state
+              git -C automation-state rm -rf . || true
+            fi
+            python scripts/bootstrap_automation_state.py --root automation-state
+            if git -C automation-state show-ref --verify --quiet refs/remotes/origin/automation-state; then
+              git -C automation-state show refs/remotes/origin/automation-state:state/registry.json > automation-state/.remote-registry.json || cp automation-state/state/registry.json automation-state/.remote-registry.json
+            else
+              cp automation-state/state/registry.json automation-state/.remote-registry.json
+            fi
+            python scripts/merge_state_registry.py --remote automation-state/.remote-registry.json --local .local-ingest-registry.json --namespace ingest --output automation-state/state/registry.json
+            git -C automation-state add state/registry.json state/legacy_unresolved.json state/legacy_unresolved.csv state/duplicate_audit
+            git -C automation-state commit -m "chore: refresh ingest automation-state registry" || echo "No state changes to commit"
+            if git -C automation-state push origin automation-state; then
+              exit 0
+            fi
+          done
+          echo "Failed to publish automation-state after 3 attempts"
+          exit 1

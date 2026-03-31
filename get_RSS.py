@@ -10,6 +10,8 @@ from rfeed import Item, Feed, Guid
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, unquote
 
+from paper_feed.canonical import build_canonical_record
+
 # --- 配置区域 ---
 OUTPUT_FILE = "filtered_feed.xml"
 WEB_DIR = "web"
@@ -417,7 +419,7 @@ Example:
                 methods = normalize_label_entries(data.get("methods", data.get("method", "")), valid_methods)
                 topics = normalize_label_entries(data.get("topics", data.get("topic", "")), valid_topics)
                 if not methods:
-                    methods = [{"name": "Qualitative", "confidence": 0.4}]
+                    methods = [{"name": "Unclassified", "confidence": 0.4}]
                 if not topics:
                     topics = [{"name": "Other Marketing", "confidence": 0.4}]
                 analysis_results[original_title] = {
@@ -614,16 +616,16 @@ def get_existing_items():
         for entry in feed.entries:
             pub_struct = entry.get('published_parsed')
             pub_date = convert_struct_time_to_datetime(pub_struct)
-            
-        entries.append({
-            'title': entry.get('title', ''),
-            'link': entry.get('link', ''),
-            'pub_date': pub_date,
-            'summary': entry.get('summary', ''),
-            'journal': entry.get('author', ''),
-            'id': entry.get('id', entry.get('link', '')),
-            'is_old': True
-        })
+
+            entries.append({
+                'title': entry.get('title', ''),
+                'link': entry.get('link', ''),
+                'pub_date': pub_date,
+                'summary': entry.get('summary', ''),
+                'journal': entry.get('author', ''),
+                'id': entry.get('id', entry.get('link', '')),
+                'is_old': True
+            })
         return entries
     except Exception as e:
         print(f"Error reading existing file: {e}")
@@ -749,18 +751,10 @@ def write_feed_json(items, queries):
     data = []
     for item in items:
         raw_title = item['title']
-        raw_journal = item['journal']
-        clean_journal = normalize_journal_title(raw_journal)
-        clean_title = normalize_paper_title(raw_title, raw_journal)
-
-        display_title = clean_title
 
         # 获取缓存的摘要
         item_id = item['id']
         abstract_info = abstract_cache.get(item_id, {})
-        abstract_text = abstract_info.get('abstract', '')
-        raw_abstract_text = abstract_info.get('raw_abstract', '')
-        abstract_source = abstract_info.get('source', '')
 
         # Get cached analysis data (support both old string format and new dict format)
         cache_data = translation_cache.get(raw_title, "")
@@ -807,17 +801,33 @@ def write_feed_json(items, queries):
             classification_source = "user"
             user_corrected = True
 
-        primary_method = pick_primary(methods, "Qualitative")
+        primary_method = pick_primary(methods, "Unclassified")
         primary_topic = pick_primary(topics, "Other Marketing")
+        normalized_summary = strip_tags(remove_illegal_xml_chars(extract_metadata_summary(item.get('summary', ''))))
+
+        record = build_canonical_record(
+            item,
+            {
+                "zh": title_zh,
+                "methods": methods,
+                "topics": topics,
+                "classification_version": classification_version,
+            },
+            abstract_info,
+        )
+        record.method = primary_method
+        record.topic = primary_topic
+        record.summary = normalized_summary
 
         data.append({
-            "id": item['id'],
-            "title": strip_tags(remove_illegal_xml_chars(display_title)),
-            "title_zh": strip_tags(title_zh),
-            "method": primary_method,
-            "topic": primary_topic,
-            "methods": methods,
-            "topics": topics,
+            "id": record.source_id,
+            "paper_id": record.paper_id,
+            "title": strip_tags(remove_illegal_xml_chars(record.title)),
+            "title_zh": strip_tags(record.title_zh),
+            "method": record.method,
+            "topic": record.topic,
+            "methods": record.methods,
+            "topics": record.topics,
             "theories": theories,
             "context": context,
             "subjects": subjects,
@@ -825,13 +835,13 @@ def write_feed_json(items, queries):
             "classification_source": classification_source,
             "classification_version": classification_version,
             "user_corrected": user_corrected,
-            "link": item['link'],
-            "summary": strip_tags(remove_illegal_xml_chars(extract_metadata_summary(item.get('summary', '')))),
-            "abstract": remove_illegal_xml_chars(abstract_text),
-            "raw_abstract": remove_illegal_xml_chars(raw_abstract_text),
-            "abstract_source": abstract_source,
-            "journal": remove_illegal_xml_chars(clean_journal),
-            "pub_date": item['pub_date'].isoformat()
+            "link": record.link,
+            "summary": record.summary,
+            "abstract": remove_illegal_xml_chars(record.abstract),
+            "raw_abstract": remove_illegal_xml_chars(record.raw_abstract),
+            "abstract_source": record.abstract_source,
+            "journal": remove_illegal_xml_chars(record.journal),
+            "pub_date": record.published_at
         })
 
     keywords = []
@@ -899,6 +909,7 @@ def run_rss_flow():
 
     print(f"Added {new_count} new entries.")
     generate_rss_xml(all_entries, queries)
+    return all_entries
 
 def run_reanalysis_flow():
     """只运行 AI 分析，不抓取 RSS"""

@@ -1,0 +1,81 @@
+name: rebuild-registry
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rebuild-registry
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      NOTION_API_VERSION: "2022-06-28"
+      NOTION_PAPERS_DATABASE_ID: ${{ secrets.NOTION_PAPERS_DATABASE_ID }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      ZOTERO_API_VERSION: "3"
+      ZOTERO_API_KEY: ${{ secrets.ZOTERO_API_KEY }}
+      ZOTERO_LIBRARY_ID: ${{ secrets.ZOTERO_LIBRARY_ID }}
+      ZOTERO_LIBRARY_TYPE: ${{ secrets.ZOTERO_LIBRARY_TYPE || 'users' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout automation-state workspace
+        uses: actions/checkout@v4
+        with:
+          path: automation-state
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Prepare automation-state branch
+        run: |
+          git -C automation-state fetch origin automation-state || true
+          if git -C automation-state show-ref --verify --quiet refs/remotes/origin/automation-state; then
+            git -C automation-state checkout -B automation-state refs/remotes/origin/automation-state
+          else
+            git -C automation-state checkout --orphan automation-state
+            git -C automation-state rm -rf . || true
+          fi
+
+      - name: Bootstrap automation-state layout
+        run: python scripts/bootstrap_automation_state.py --root automation-state
+
+      - name: Rebuild registry from Notion and Zotero
+        run: python scripts/rebuild_registry.py --apply --registry-path automation-state/state/registry.json
+
+      - name: Snapshot rebuilt registry
+        run: cp automation-state/state/registry.json .rebuilt-registry.json
+
+      - name: Publish rebuilt registry
+        run: |
+          git -C automation-state config user.name "github-actions[bot]"
+          git -C automation-state config user.email "github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git -C automation-state fetch origin automation-state || true
+            if git -C automation-state show-ref --verify --quiet refs/remotes/origin/automation-state; then
+              git -C automation-state checkout -B automation-state refs/remotes/origin/automation-state
+            else
+              git -C automation-state checkout --orphan automation-state
+              git -C automation-state rm -rf . || true
+            fi
+            python scripts/bootstrap_automation_state.py --root automation-state
+            cp .rebuilt-registry.json automation-state/state/registry.json
+            git -C automation-state add state/registry.json
+            git -C automation-state commit -m "chore: rebuild automation-state registry" || echo "No state changes to commit"
+            if git -C automation-state push origin automation-state; then
+              exit 0
+            fi
+          done
+          echo "Failed to publish rebuilt registry after 3 attempts"
+          exit 1
