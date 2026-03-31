@@ -1,1 +1,1 @@
-"""Paper Feed refactor package."""
+"""Shared helpers for Paper Feed."""

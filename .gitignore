@@ -46,3 +46,4 @@ web/nul
 # Local test files
 debug_*.py
 .worktrees/
+state/
