@@ -3,7 +3,13 @@ const state = {
   filtered: [],
   keywords: [],
   interactions: { favorites: [], archived: [], hidden: [] },
+  interactionSets: { favorites: new Set(), archived: new Set(), hidden: new Set() },
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
+  inboxViewMode: "swipe", // 'swipe' | 'list'
+  swipeIndex: 0,
+  swipeBusy: false,
+  lastSwipeAction: null,
+  listRenderLimit: 80,
   preset: "",
   focusTopics: [],
   categories: {
@@ -40,6 +46,7 @@ const elements = {
   sortSelect: document.getElementById("sortSelect"),
   summaryToggle: document.getElementById("summaryToggle"),
   btnExportFavorites: document.getElementById("btnExportFavorites"),
+  inboxViewToggle: document.getElementById("inboxViewToggle"),
   cardTemplate: document.getElementById("cardTemplate"),
   topicCloud: document.getElementById("topicCloud"),
   topicCloudWrap: document.getElementById("topicCloudWrap")
@@ -53,11 +60,21 @@ const formatter = new Intl.DateTimeFormat("zh-CN", {
 
 let undoTimeoutId = null;
 let currentClassificationItem = null;
+const LIST_INITIAL_RENDER_LIMIT = 80;
+const LIST_RENDER_STEP = 80;
 
 // --- Interaction Logic ---
 
 function ensureArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function syncInteractionSets() {
+  state.interactionSets = {
+    favorites: new Set(state.interactions.favorites || []),
+    archived: new Set(state.interactions.archived || []),
+    hidden: new Set(state.interactions.hidden || [])
+  };
 }
 
 function normalizeInteractions() {
@@ -79,6 +96,7 @@ function normalizeInteractions() {
     archived: Array.from(archivedSet),
     hidden: Array.from(hiddenSet)
   };
+  syncInteractionSets();
 }
 
 async function loadInteractions() {
@@ -107,25 +125,205 @@ async function saveInteraction(id, action) {
   }
 }
 
+function addUnique(list, id) {
+  if (!list.includes(id)) {
+    list.push(id);
+  }
+}
+
+function removeValue(list, id) {
+  return list.filter((value) => value !== id);
+}
+
+function applyInteractionToState(id, action) {
+  normalizeInteractions();
+
+  if (action === "like") {
+    addUnique(state.interactions.favorites, id);
+    state.interactions.hidden = removeValue(state.interactions.hidden, id);
+    state.interactions.archived = removeValue(state.interactions.archived, id);
+  } else if (action === "unlike") {
+    state.interactions.favorites = removeValue(state.interactions.favorites, id);
+  } else if (action === "archive") {
+    addUnique(state.interactions.archived, id);
+    state.interactions.favorites = removeValue(state.interactions.favorites, id);
+    state.interactions.hidden = removeValue(state.interactions.hidden, id);
+  } else if (action === "unarchive") {
+    state.interactions.archived = removeValue(state.interactions.archived, id);
+  } else if (action === "restore") {
+    addUnique(state.interactions.favorites, id);
+    state.interactions.archived = removeValue(state.interactions.archived, id);
+    state.interactions.hidden = removeValue(state.interactions.hidden, id);
+  } else if (action === "hide") {
+    addUnique(state.interactions.hidden, id);
+    state.interactions.favorites = removeValue(state.interactions.favorites, id);
+    state.interactions.archived = removeValue(state.interactions.archived, id);
+  } else if (action === "unhide") {
+    state.interactions.hidden = removeValue(state.interactions.hidden, id);
+  }
+
+  syncInteractionSets();
+}
+
+function getUndoAction(action) {
+  if (action === "like") return "unlike";
+  if (action === "hide") return "unhide";
+  return "";
+}
+
+function getInteractionMessage(action) {
+  if (action === "like") return "已收藏文章";
+  if (action === "hide") return "已跳过文章";
+  return "已更新文章";
+}
+
+function shouldUseSwipeDeck() {
+  return state.filterMode === "all" && state.inboxViewMode === "swipe";
+}
+
+function shouldLimitListRender() {
+  return state.filterMode === "all" && state.inboxViewMode === "list";
+}
+
+function refreshAfterInteraction(resetSwipeIndex = false) {
+  applyFilters({ resetSwipeIndex });
+}
+
+function showUndoBar(message, onUndo) {
+  const undoContainer = document.getElementById('undoContainer');
+  if (!undoContainer) return;
+
+  undoContainer.textContent = '';
+
+  const undoBar = document.createElement('div');
+  undoBar.className = 'undo-bar';
+
+  const span = document.createElement('span');
+  span.textContent = message;
+
+  const undoBtn = document.createElement('button');
+  undoBtn.className = 'undo-btn';
+  undoBtn.type = "button";
+  undoBtn.textContent = '撤销';
+
+  undoBar.appendChild(span);
+  undoBar.appendChild(undoBtn);
+  undoContainer.appendChild(undoBar);
+
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+  }
+  undoTimeoutId = setTimeout(() => {
+    undoContainer.textContent = '';
+    state.lastSwipeAction = null;
+  }, 10000);
+
+  undoBtn.onclick = () => {
+    if (undoTimeoutId) {
+      clearTimeout(undoTimeoutId);
+      undoTimeoutId = null;
+    }
+    undoContainer.textContent = '';
+    onUndo();
+  };
+}
+
+function restoreCurrentCard(card) {
+  if (card) {
+    card.classList.remove('hidden');
+  }
+}
+
+function getRenderedLogicalCount() {
+  if (shouldLimitListRender()) {
+    return Math.min(state.listRenderLimit, state.filtered.length);
+  }
+  return state.filtered.length;
+}
+
+function removeFilteredItem(id, preferredIndex = state.swipeIndex) {
+  let index = state.filtered.findIndex((item) => item.link === id);
+  if (index < 0 && preferredIndex >= 0 && preferredIndex < state.filtered.length) {
+    index = preferredIndex;
+  }
+  if (index >= 0) {
+    state.filtered.splice(index, 1);
+  }
+  if (state.swipeIndex >= state.filtered.length) {
+    state.swipeIndex = Math.max(0, state.filtered.length - 1);
+  }
+}
+
+function insertFilteredItem(item, index) {
+  if (!item || state.filtered.some((entry) => entry.link === item.link)) return;
+  const safeIndex = Math.max(0, Math.min(index, state.filtered.length));
+  state.filtered.splice(safeIndex, 0, item);
+  state.swipeIndex = safeIndex;
+}
+
+function recordUndoableInteraction(id, action, card = null, undoContext = null) {
+  const undoAction = getUndoAction(action);
+  if (!undoAction) return;
+
+  state.lastSwipeAction = { id, action, undoAction, undoContext };
+  showUndoBar(getInteractionMessage(action), () => {
+    applyInteractionToState(id, undoAction);
+    saveInteraction(id, undoAction);
+
+    if (shouldUseSwipeDeck() && undoContext && undoContext.item) {
+      insertFilteredItem(undoContext.item, undoContext.index);
+      renderList();
+      updateFilterCounts(getRenderedLogicalCount());
+    } else if (shouldUseSwipeDeck()) {
+      applyFilters({ resetSwipeIndex: false });
+    } else {
+      restoreCurrentCard(card);
+      updateFilterCounts();
+    }
+
+    state.lastSwipeAction = null;
+  });
+}
+
+function performPaperAction(id, action, options = {}) {
+  const {
+    card = null,
+    hideCard = true,
+    undoable = false,
+    refresh = false,
+    resetSwipeIndex = false,
+    updateCounts = true,
+    undoContext = null
+  } = options;
+
+  applyInteractionToState(id, action);
+  saveInteraction(id, action);
+
+  if (hideCard && card) {
+    card.classList.add('hidden');
+  }
+
+  if (undoable) {
+    recordUndoableInteraction(id, action, card, undoContext);
+  }
+
+  if (refresh) {
+    refreshAfterInteraction(resetSwipeIndex);
+  } else if (updateCounts) {
+    updateFilterCounts();
+  }
+}
+
 function toggleLike(id, btnElement) {
-  const isLiked = state.interactions.favorites.includes(id);
+  const isLiked = state.interactionSets.favorites.has(id);
   const action = isLiked ? 'unlike' : 'like';
   const card = btnElement.closest('.card');
 
-  if (isLiked) {
-    state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-  } else {
-    state.interactions.favorites.push(id);
-    // If liking, ensure it's unhidden in state
-    if (state.interactions.hidden.includes(id)) {
-      state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    }
-    if (state.interactions.archived.includes(id)) {
-      state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-    }
-  }
-
-  saveInteraction(id, action);
+  performPaperAction(id, action, {
+    card,
+    undoable: action === "like",
+    refresh: false
+  });
 
   // Update button's state first (avoid re-rendering 1000 elements!)
   if (btnElement) {
@@ -141,137 +339,32 @@ function toggleLike(id, btnElement) {
       setActionButtonContent(btnElement, "❤️", "取消收藏");
     }
   }
-
-  // Hide the card after interaction (makes the list feel like an inbox)
-  if (card) {
-    card.classList.add('hidden');
-  }
-  updateFilterCounts();
 }
 
 function toggleHide(id, btnElement) {
-  // 1. Find the card element
   const card = btnElement.closest('.card');
   if (!card) return;
 
-  // 2. Immediate visual feedback - collapse the card
-  card.classList.add('hidden');
-
-  // 3. Update State (synchronous for consistency)
-  if (!state.interactions.hidden.includes(id)) {
-    state.interactions.hidden.push(id);
-  }
-  if (state.interactions.favorites.includes(id)) {
-    state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-  }
-  if (state.interactions.archived.includes(id)) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  }
-
-  updateFilterCounts();
-
-  // 4. Defer non-critical operations
   requestAnimationFrame(() => {
-    // Persist to server (async, won't block UI)
-    saveInteraction(id, 'hide');
-
-    // Show Undo Bar after DOM settles
-    showUndoBar(id, card);
+    performPaperAction(id, "hide", {
+      card,
+      undoable: true,
+      refresh: false
+    });
   });
 }
 
-function showUndoBar(id, card) {
-  const undoContainer = document.getElementById('undoContainer');
-
-  // Clear any existing undo bar (use textContent for performance)
-  undoContainer.textContent = '';
-
-  // Create elements without innerHTML (faster)
-  const undoBar = document.createElement('div');
-  undoBar.className = 'undo-bar';
-
-  const span = document.createElement('span');
-  span.textContent = '已隐藏文章';
-
-  const undoBtn = document.createElement('button');
-  undoBtn.className = 'undo-btn';
-  undoBtn.textContent = '撤销';
-
-  undoBar.appendChild(span);
-  undoBar.appendChild(undoBtn);
-
-  // Append to fixed container
-  undoContainer.appendChild(undoBar);
-
-  // Auto-hide after 10 seconds
-  if (undoTimeoutId) {
-    clearTimeout(undoTimeoutId);
-  }
-  undoTimeoutId = setTimeout(() => {
-    undoContainer.textContent = '';
-  }, 10000);
-
-  // Handle Undo
-  undoBtn.onclick = () => {
-    if (undoTimeoutId) {
-      clearTimeout(undoTimeoutId);
-      undoTimeoutId = null;
-    }
-
-    // Restore State
-    state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    saveInteraction(id, 'unhide');
-
-    // Restore card
-    card.classList.remove('hidden');
-    updateFilterCounts();
-
-    // Hide undo bar
-    undoContainer.textContent = '';
-  };
-}
-
 function toggleArchive(id, btnElement) {
-  const isArchived = state.interactions.archived.includes(id);
+  const isArchived = state.interactionSets.archived.has(id);
   const action = isArchived ? "unarchive" : "archive";
   const card = btnElement.closest(".card");
 
-  if (isArchived) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  } else {
-    state.interactions.archived.push(id);
-    if (state.interactions.favorites.includes(id)) {
-      state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-    }
-    if (state.interactions.hidden.includes(id)) {
-      state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    }
-  }
-
-  saveInteraction(id, action);
-  if (card) {
-    card.classList.add("hidden");
-  }
-  updateFilterCounts();
+  performPaperAction(id, action, { card });
 }
 
 function restoreFromArchive(id, btnElement) {
   const card = btnElement.closest(".card");
-  if (!state.interactions.favorites.includes(id)) {
-    state.interactions.favorites.push(id);
-  }
-  if (state.interactions.archived.includes(id)) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  }
-  if (state.interactions.hidden.includes(id)) {
-    state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-  }
-
-  saveInteraction(id, "restore");
-  if (card) {
-    card.classList.add("hidden");
-  }
-  updateFilterCounts();
+  performPaperAction(id, "restore", { card });
 }
 
 // --- End Interaction Logic ---
@@ -477,8 +570,8 @@ function updateTopicCloudVisibility() {
 
 function computeFocusTopics() {
   const favorites = new Set([
-    ...(state.interactions.favorites || []),
-    ...(state.interactions.archived || [])
+    ...state.interactionSets.favorites,
+    ...state.interactionSets.archived
   ]);
   const counter = new Map();
   state.items.forEach((item) => {
@@ -580,9 +673,7 @@ function updateFilterCounts(visibleCountOverride = null) {
 }
 
 function getCollectionCounts() {
-  const favorites = new Set(state.interactions.favorites);
-  const archived = new Set(state.interactions.archived);
-  const hidden = new Set(state.interactions.hidden);
+  const { favorites, archived, hidden } = state.interactionSets;
 
   let inboxCount = 0;
   state.items.forEach((item) => {
@@ -662,6 +753,9 @@ function configureActionButton(button, options) {
 
 function setModeActionVisibility() {
   const isFavorites = state.filterMode === "favorites";
+  if (elements.inboxViewToggle) {
+    elements.inboxViewToggle.style.display = state.filterMode === "all" ? "inline-flex" : "none";
+  }
   if (btnSummarizeFavorites) {
     btnSummarizeFavorites.style.display = isFavorites ? "inline-flex" : "none";
   }
@@ -705,7 +799,13 @@ function renderWorkflowSummary(visibleCountOverride = null) {
     chips.push({ tone: "muted", text: "可随时恢复到收藏夹或收件箱" });
   } else {
     chips.push({ tone: "accent", text: `待处理 ${counts.inbox} 篇` });
-    chips.push({ tone: "muted", text: "操作建议：❤️ 收藏，❌ 跳过" });
+    if (state.inboxViewMode === "swipe") {
+      description = "像处理卡片一样逐篇判断：右键收藏，左键跳过，必要时随时撤销。";
+      visibleNote = "当前刷卡队列";
+      chips.push({ tone: "muted", text: "键盘：← 跳过，→ 收藏，Z 撤销" });
+    } else {
+      chips.push({ tone: "muted", text: "操作建议：❤️ 收藏，❌ 跳过" });
+    }
   }
 
   if (topTopics.length) {
@@ -757,8 +857,366 @@ function renderAbstractBlock(container, item, highlightTerms) {
   container.style.display = "block";
 }
 
-function renderList() {
+function setupAbstractEditor(item, editArea, textarea, btnSave, btnCancel, afterSave) {
+  if (!editArea || !textarea || !btnSave || !btnCancel) return;
+
+  const closeEditor = () => {
+    editArea.style.display = "none";
+  };
+
+  btnCancel.onclick = closeEditor;
+
+  btnSave.onclick = async function() {
+    const newText = textarea.value.trim();
+    if (!newText) return;
+
+    btnSave.disabled = true;
+    btnSave.textContent = "保存中...";
+
+    try {
+      const res = await fetch("/api/update_abstract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: item.id,
+          abstract: newText
+        })
+      });
+
+      if (res.ok) {
+        item.abstract = newText;
+        item.raw_abstract = newText;
+        item.abstract_source = "user_provided";
+        if (typeof afterSave === "function") {
+          afterSave();
+        }
+      } else {
+        alert("保存失败");
+      }
+    } catch (e) {
+      alert("错误: " + e.message);
+    } finally {
+      btnSave.disabled = false;
+      btnSave.textContent = "保存";
+    }
+  };
+}
+
+function toggleAbstractEditor(item, editArea, textarea) {
+  if (!editArea || !textarea) return;
+
+  if (editArea.style.display === "none" || !editArea.style.display) {
+    editArea.style.display = "block";
+
+    if (item.raw_abstract) {
+      textarea.value = item.raw_abstract;
+    } else if (item.abstract_source === "gpt_generated") {
+      textarea.value = "";
+    } else {
+      textarea.value = item.abstract || "";
+    }
+
+    textarea.focus();
+  } else {
+    editArea.style.display = "none";
+  }
+}
+
+function appendMetaBadges(container, item) {
+  const methodSummary = (item.methods || [])
+    .map((entry) => `${entry.name} (${Math.round((entry.confidence || 0) * 100)}%)`)
+    .join(", ");
+  const topicSummary = (item.topics || [])
+    .map((entry) => `${entry.name} (${Math.round((entry.confidence || 0) * 100)}%)`)
+    .join(", ");
+
+  (item.methods || []).forEach((entry) => appendBadge(container, "method", entry, { title: methodSummary }));
+  (item.topics || []).forEach((entry) => appendBadge(container, "topic", entry, { title: topicSummary }));
+  if (item.user_corrected) {
+    appendTagBadge(container, "用户修正");
+  }
+}
+
+function createSwipeUtilityButton(icon, label, title) {
+  const button = document.createElement("button");
+  configureActionButton(button, {
+    icon,
+    label,
+    title,
+    variant: "action-btn--utility"
+  });
+  return button;
+}
+
+function createSwipeDeckButton(icon, label, title, tone) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `swipe-action swipe-action--${tone}`;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+
+  const iconNode = document.createElement("span");
+  iconNode.className = "swipe-action__icon";
+  iconNode.textContent = icon;
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "swipe-action__label";
+  labelNode.textContent = label;
+
+  button.appendChild(iconNode);
+  button.appendChild(labelNode);
+  return button;
+}
+
+function createSwipePaperCard(item, options = {}) {
+  const { isCurrent = false, isPreview = false } = options;
+  const highlightTerms = getHighlightTerms();
+  const card = document.createElement("article");
+  card.className = ["swipe-card", isCurrent ? "swipe-card--current" : "", isPreview ? "swipe-card--preview" : ""]
+    .filter(Boolean)
+    .join(" ");
+
+  const meta = document.createElement("div");
+  meta.className = "swipe-card__meta";
+
+  const metaText = document.createElement("span");
+  metaText.className = "swipe-card__source";
+  metaText.textContent = `${item.journal || "Unknown"} · ${formatDate(item.date)}`;
+  meta.appendChild(metaText);
+  appendMetaBadges(meta, item);
+
+  const title = document.createElement("a");
+  title.className = "swipe-card__title";
+  title.href = item.link || "#";
+  title.target = "_blank";
+  title.rel = "noreferrer";
+  title.innerHTML = highlightText(item.title || "Untitled", highlightTerms);
+
+  const titleZh = document.createElement("div");
+  titleZh.className = "swipe-card__title-zh";
+  titleZh.innerHTML = item.title_zh ? highlightText(item.title_zh, highlightTerms) : "暂无中文标题";
+
+  const fields = document.createElement("div");
+  fields.className = "swipe-card__fields card__fields";
+  appendField(fields, "作者", item.authors, highlightTerms);
+  appendField(fields, "来源", item.source, highlightTerms);
+  appendField(fields, "出版时间", item.publicationDate, highlightTerms);
+  if (!fields.children.length) {
+    fields.style.display = "none";
+  }
+
+  const abstractWrap = document.createElement("div");
+  abstractWrap.className = "swipe-card__abstract";
+  if (elements.summaryToggle.checked && item.abstract) {
+    const previewItem = {
+      ...item,
+      abstract: truncateText(item.abstract, 520)
+    };
+    renderAbstractBlock(abstractWrap, previewItem, highlightTerms);
+  } else {
+    abstractWrap.style.display = "none";
+  }
+
+  const utility = document.createElement("div");
+  utility.className = "swipe-card__utility";
+
+  const btnOpen = createSwipeUtilityButton("↗", "打开", "打开论文链接");
+  btnOpen.onclick = (e) => {
+    e.preventDefault();
+    if (item.link) {
+      window.open(item.link, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  const btnClassify = createSwipeUtilityButton("🏷️", "分类", "编辑分类");
+  btnClassify.onclick = (e) => {
+    e.preventDefault();
+    openClassificationModal(item);
+  };
+
+  const btnEdit = createSwipeUtilityButton("✏️", "摘要", "补充/编辑摘要");
+  utility.appendChild(btnOpen);
+  utility.appendChild(btnClassify);
+  utility.appendChild(btnEdit);
+
+  const editArea = document.createElement("div");
+  editArea.className = "card__edit-area swipe-card__edit-area";
+  editArea.style.display = "none";
+
+  const textarea = document.createElement("textarea");
+  textarea.placeholder = "在此粘贴或输入摘要...";
+
+  const editActions = document.createElement("div");
+  editActions.className = "swipe-card__edit-actions";
+
+  const btnSave = document.createElement("button");
+  btnSave.type = "button";
+  btnSave.className = "btn btn--primary btn--small";
+  btnSave.textContent = "保存";
+
+  const btnCancel = document.createElement("button");
+  btnCancel.type = "button";
+  btnCancel.className = "btn btn--secondary btn--small";
+  btnCancel.textContent = "取消";
+
+  editActions.appendChild(btnSave);
+  editActions.appendChild(btnCancel);
+  editArea.appendChild(textarea);
+  editArea.appendChild(editActions);
+  setupAbstractEditor(item, editArea, textarea, btnSave, btnCancel, () => renderList());
+
+  btnEdit.onclick = (e) => {
+    e.preventDefault();
+    toggleAbstractEditor(item, editArea, textarea);
+  };
+
+  card.appendChild(meta);
+  card.appendChild(title);
+  card.appendChild(titleZh);
+  card.appendChild(fields);
+  card.appendChild(abstractWrap);
+  card.appendChild(utility);
+  card.appendChild(editArea);
+
+  return card;
+}
+
+function getCurrentSwipeItem() {
+  if (!state.filtered.length) return null;
+  if (state.swipeIndex < 0) state.swipeIndex = 0;
+  if (state.swipeIndex >= state.filtered.length) {
+    state.swipeIndex = Math.max(0, state.filtered.length - 1);
+  }
+  return state.filtered[state.swipeIndex] || null;
+}
+
+function commitSwipeAction(action, direction) {
+  if (state.swipeBusy) return;
+  const item = getCurrentSwipeItem();
+  if (!item) return;
+
+  state.swipeBusy = true;
+  const previousIndex = state.swipeIndex;
+  const card = elements.list.querySelector(".swipe-card--current");
+  if (card) {
+    card.classList.add(direction === "right" ? "swipe-card--leaving-right" : "swipe-card--leaving-left");
+  }
+
+  window.setTimeout(() => {
+    performPaperAction(item.link, action, {
+      hideCard: false,
+      undoable: true,
+      refresh: false,
+      updateCounts: false,
+      undoContext: { item, index: previousIndex }
+    });
+    removeFilteredItem(item.link, previousIndex);
+    renderList();
+    updateFilterCounts(getRenderedLogicalCount());
+    state.swipeBusy = false;
+  }, card ? 180 : 0);
+}
+
+function undoLastInteraction() {
+  if (!state.lastSwipeAction) return;
+  const undoContainer = document.getElementById('undoContainer');
+  const undoButton = undoContainer ? undoContainer.querySelector(".undo-btn") : null;
+  if (undoButton) {
+    undoButton.click();
+  }
+}
+
+function renderSwipeDeck() {
   elements.list.innerHTML = "";
+  elements.list.classList.add("grid--swipe");
+
+  if (state.filtered.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "swipe-empty";
+
+    const heading = document.createElement("strong");
+    heading.textContent = "暂时没有新的文献了。";
+
+    const copy = document.createElement("span");
+    copy.textContent = "可以调整筛选条件，或者切换到收藏夹继续处理已经留住的论文。";
+
+    empty.appendChild(heading);
+    empty.appendChild(copy);
+    elements.list.appendChild(empty);
+    return;
+  }
+
+  const currentItem = getCurrentSwipeItem();
+  const nextItem = state.filtered[state.swipeIndex + 1];
+  const deck = document.createElement("div");
+  deck.className = "swipe-deck";
+
+  if (nextItem) {
+    deck.appendChild(createSwipePaperCard(nextItem, { isPreview: true }));
+  }
+  deck.appendChild(createSwipePaperCard(currentItem, { isCurrent: true }));
+
+  const controls = document.createElement("div");
+  controls.className = "swipe-actions";
+
+  const btnSkip = createSwipeDeckButton("←", "跳过", "跳过这篇论文", "left");
+  btnSkip.onclick = () => commitSwipeAction("hide", "left");
+
+  const progress = document.createElement("div");
+  progress.className = "swipe-progress";
+  progress.textContent = `${state.swipeIndex + 1} / ${state.filtered.length}`;
+
+  const btnLike = createSwipeDeckButton("→", "收藏", "收藏这篇论文", "right");
+  btnLike.onclick = () => commitSwipeAction("like", "right");
+
+  controls.appendChild(btnSkip);
+  controls.appendChild(progress);
+  controls.appendChild(btnLike);
+
+  const hint = document.createElement("div");
+  hint.className = "swipe-hint";
+  hint.textContent = "键盘：← 跳过 · → 收藏 · Z 撤销";
+
+  const shell = document.createElement("div");
+  shell.className = "swipe-shell";
+  shell.appendChild(deck);
+  shell.appendChild(controls);
+  shell.appendChild(hint);
+  elements.list.appendChild(shell);
+}
+
+function renderLoadMoreControl(renderedCount, totalCount) {
+  if (renderedCount >= totalCount) return;
+
+  const more = document.createElement("div");
+  more.className = "list-load-more";
+
+  const label = document.createElement("span");
+  label.textContent = `已显示 ${renderedCount} 篇 / 共 ${totalCount} 篇`;
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn btn--secondary";
+  button.textContent = "加载更多";
+  button.onclick = () => {
+    state.listRenderLimit = Math.min(state.listRenderLimit + LIST_RENDER_STEP, state.filtered.length);
+    renderList();
+    updateFilterCounts(getRenderedLogicalCount());
+  };
+
+  more.appendChild(label);
+  more.appendChild(button);
+  elements.list.appendChild(more);
+}
+
+function renderList() {
+  if (shouldUseSwipeDeck()) {
+    renderSwipeDeck();
+    return;
+  }
+
+  elements.list.innerHTML = "";
+  elements.list.classList.remove("grid--swipe");
   const showSummary = elements.summaryToggle.checked;
   const highlightTerms = getHighlightTerms();
 
@@ -789,8 +1247,11 @@ function renderList() {
 
   // Use DocumentFragment for batch DOM insertion (1000x faster!)
   const fragment = document.createDocumentFragment();
+  const itemsToRender = shouldLimitListRender()
+    ? state.filtered.slice(0, state.listRenderLimit)
+    : state.filtered;
 
-  for (const item of state.filtered) {
+  for (const item of itemsToRender) {
     const node = elements.cardTemplate.content.cloneNode(true);
     const card = node.querySelector(".card");
     const meta = node.querySelector(".card__meta");
@@ -892,8 +1353,8 @@ function renderList() {
     const actionsDiv = document.createElement("div");
     actionsDiv.className = "article-actions";
     
-    const isLiked = state.interactions.favorites.includes(item.link);
-    const isArchived = state.interactions.archived.includes(item.link);
+    const isLiked = state.interactionSets.favorites.has(item.link);
+    const isArchived = state.interactionSets.archived.has(item.link);
     
     const btnLike = document.createElement("button");
     configureActionButton(btnLike, {
@@ -952,70 +1413,10 @@ function renderList() {
 
     btnEdit.onclick = function(e) {
         e.preventDefault();
-        // Toggle visibility
-        if (editArea.style.display === "none") {
-            editArea.style.display = "block";
-            
-            // Intelligent pre-fill
-            let prefillValue = "";
-            if (item.raw_abstract) {
-                prefillValue = item.raw_abstract;
-            } else if (item.abstract_source === "gpt_generated") {
-                // If it was generated from title only, don't prefill the "fake" summary.
-                // Let user paste the real one.
-                prefillValue = ""; 
-            } else {
-                // Fallback to whatever is current
-                prefillValue = item.abstract || "";
-            }
-            
-            textarea.value = prefillValue;
-            textarea.focus();
-        } else {
-            editArea.style.display = "none";
-        }
+        toggleAbstractEditor(item, editArea, textarea);
     };
 
-    btnCancel.onclick = function() {
-        editArea.style.display = "none";
-    };
-
-    btnSave.onclick = async function() {
-        const newText = textarea.value.trim();
-        if (!newText) return;
-        
-        btnSave.disabled = true;
-        btnSave.textContent = "保存中...";
-        
-        try {
-            const res = await fetch("/api/update_abstract", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    id: item.id, // Use strict ID
-                    abstract: newText
-                })
-            });
-            
-            if (res.ok) {
-                // Update local state temporarily so UI reflects change without full reload
-                item.abstract = newText;
-                item.raw_abstract = newText; // Also update raw so next edit shows this
-                item.abstract_source = "user_provided";
-                
-                // Refresh the list to render new abstract state
-                // (Optimally we'd just update DOM, but re-render is safer for badge logic)
-                renderList(); 
-            } else {
-                alert("保存失败");
-            }
-        } catch (e) {
-            alert("错误: " + e.message);
-        } finally {
-            btnSave.disabled = false;
-            btnSave.textContent = "保存";
-        }
-    };
+    setupAbstractEditor(item, editArea, textarea, btnSave, btnCancel, () => renderList());
     
     const btnHide = document.createElement("button");
     configureActionButton(btnHide, {
@@ -1057,9 +1458,14 @@ function renderList() {
 
   // Single DOM insertion instead of 1000 (avoids 1000 reflows!)
   elements.list.appendChild(fragment);
+  renderLoadMoreControl(itemsToRender.length, state.filtered.length);
 }
 
-function applyFilters() {
+function applyFilters(options = {}) {
+  const { resetSwipeIndex = true } = options;
+  if (resetSwipeIndex) {
+    state.listRenderLimit = LIST_INITIAL_RENDER_LIMIT;
+  }
   normalizeMultiSelectAll(elements.filterMethod);
   normalizeMultiSelectAll(elements.filterTopic);
   const keyword = normalize(elements.searchInput.value);
@@ -1076,16 +1482,17 @@ function applyFilters() {
   if (preset === "my_focus") {
     state.focusTopics = computeFocusTopics();
   }
+  const { favorites, archived, hidden } = state.interactionSets;
 
   const filtered = state.items.filter((item) => {
     // 1. Check interactions first
-    if (state.interactions.hidden.includes(item.link)) return false;
-    if (state.filterMode === 'favorites' && !state.interactions.favorites.includes(item.link)) return false;
-    if (state.filterMode === 'archived' && !state.interactions.archived.includes(item.link)) return false;
+    if (hidden.has(item.link)) return false;
+    if (state.filterMode === 'favorites' && !favorites.has(item.link)) return false;
+    if (state.filterMode === 'archived' && !archived.has(item.link)) return false;
     // In "all" mode, hide items that have been processed (favorites or archived)
     if (state.filterMode === 'all') {
-      if (state.interactions.favorites.includes(item.link)) return false;
-      if (state.interactions.archived.includes(item.link)) return false;
+      if (favorites.has(item.link)) return false;
+      if (archived.has(item.link)) return false;
     }
 
     if (journal && item.journal !== journal) return false;
@@ -1135,8 +1542,13 @@ function applyFilters() {
   filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
 
   state.filtered = filtered;
+  if (resetSwipeIndex) {
+    state.swipeIndex = 0;
+  } else if (state.swipeIndex >= state.filtered.length) {
+    state.swipeIndex = Math.max(0, state.filtered.length - 1);
+  }
   renderList();
-  updateFilterCounts(filtered.length);
+  updateFilterCounts(getRenderedLogicalCount());
   updateTopicCloudVisibility();
   if (state.filterMode === "favorites") {
     renderTopicCloud(filtered);
@@ -2129,14 +2541,68 @@ function setupFilters() {
       
       // Update filter
       state.filterMode = btn.dataset.filter;
+      if (state.filterMode !== "all") {
+        state.swipeBusy = false;
+      }
 
       applyFilters();
     });
   });
 }
 
+function updateInboxViewToggle() {
+  if (!elements.inboxViewToggle) return;
+  elements.inboxViewToggle.querySelectorAll("[data-inbox-view]").forEach((button) => {
+    const isActive = button.dataset.inboxView === state.inboxViewMode;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  });
+}
+
+function setupInboxViewToggle() {
+  if (!elements.inboxViewToggle) return;
+  elements.inboxViewToggle.querySelectorAll("[data-inbox-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextMode = button.dataset.inboxView;
+      if (!nextMode || nextMode === state.inboxViewMode) return;
+      state.inboxViewMode = nextMode;
+      state.swipeIndex = 0;
+      state.listRenderLimit = LIST_INITIAL_RENDER_LIMIT;
+      state.swipeBusy = false;
+      updateInboxViewToggle();
+      applyFilters();
+    });
+  });
+  updateInboxViewToggle();
+}
+
+function isTextEditingTarget(target) {
+  if (!target) return false;
+  const tagName = target.tagName ? target.tagName.toLowerCase() : "";
+  if (["input", "select", "textarea", "button"].includes(tagName)) return true;
+  return Boolean(target.isContentEditable || target.closest("dialog[open]"));
+}
+
+function handleSwipeKeyboard(event) {
+  if (!shouldUseSwipeDeck()) return;
+  if (isTextEditingTarget(event.target)) return;
+
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    commitSwipeAction("like", "right");
+  } else if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    commitSwipeAction("hide", "left");
+  } else if (event.key.toLowerCase() === "z") {
+    event.preventDefault();
+    undoLastInteraction();
+  }
+}
+
 async function init() {
   setupFilters();
+  setupInboxViewToggle();
+  document.addEventListener("keydown", handleSwipeKeyboard);
   await loadInteractions();
   await loadCategories();
   await loadFeed();

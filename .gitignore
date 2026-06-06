@@ -47,3 +47,6 @@ web/nul
 debug_*.py
 .worktrees/
 state/
+
+# Local archives created during workspace cleanup
+archive/

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.3" />
+    <link rel="stylesheet" href="styles.css?v=2.5" />
   </head>
   <body>
     <header class="hero">
@@ -62,6 +62,10 @@
             <p id="modeDescription" class="workflow-panel__desc">优先处理新论文，看到有意思的先收藏，剩下的快速跳过。</p>
           </div>
           <div class="workflow-panel__actions">
+            <div id="inboxViewToggle" class="view-toggle" role="group" aria-label="待筛选视图">
+              <button class="view-toggle__btn is-active" type="button" data-inbox-view="swipe">刷卡</button>
+              <button class="view-toggle__btn" type="button" data-inbox-view="list">列表</button>
+            </div>
             <button id="btnExportFavorites" class="btn btn--secondary btn--feature" style="display:none;">📄 导出 RIS</button>
             <button id="btnSummarizeFavorites" class="btn btn--secondary btn--feature" style="display:none;">✨ 生成 AI 总结</button>
           </div>
@@ -312,7 +316,7 @@
       </form>
     </dialog>
 
-    <script src="app.js?v=2.3"></script>
+    <script src="app.js?v=2.5"></script>
   </body>
 </html>
 

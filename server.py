@@ -882,6 +882,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         # 设置静态文件根目录为 web/
         super().__init__(*args, directory=WEB_DIR, **kwargs)
 
+    def end_headers(self):
+        # Local app assets change often during use; avoid stale index/app/style caches.
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        super().end_headers()
+
     def do_GET(self):
         # 解析路径，忽略 query parameters
         path = self.path.split('?')[0]
