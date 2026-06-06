@@ -8,7 +8,7 @@ const state = {
   inboxViewMode: "swipe", // 'swipe' | 'list'
   swipeIndex: 0,
   swipeBusy: false,
-  lastSwipeAction: null,
+  undoStack: [],
   listRenderLimit: 80,
   preset: "",
   focusTopics: [],
@@ -62,6 +62,8 @@ let undoTimeoutId = null;
 let currentClassificationItem = null;
 const LIST_INITIAL_RENDER_LIMIT = 80;
 const LIST_RENDER_STEP = 80;
+const UNDO_BAR_TIMEOUT_MS = 10000;
+const MAX_UNDO_STACK_SIZE = 100;
 
 // --- Interaction Logic ---
 
@@ -189,42 +191,60 @@ function refreshAfterInteraction(resetSwipeIndex = false) {
   applyFilters({ resetSwipeIndex });
 }
 
-function showUndoBar(message, onUndo) {
+function clearUndoTimer() {
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
+}
+
+function clearUndoBar({ clearStack = false } = {}) {
+  clearUndoTimer();
+  if (clearStack) {
+    state.undoStack = [];
+  }
+  const undoContainer = document.getElementById('undoContainer');
+  if (!undoContainer) return;
+  undoContainer.textContent = '';
+}
+
+function getUndoBarMessage(record) {
+  const message = getInteractionMessage(record.action);
+  const count = state.undoStack.length;
+  return count > 1 ? `${message} · ${count} 项可撤销` : message;
+}
+
+function renderUndoBar() {
   const undoContainer = document.getElementById('undoContainer');
   if (!undoContainer) return;
 
   undoContainer.textContent = '';
 
+  const record = state.undoStack[state.undoStack.length - 1];
+  if (!record) return;
+
   const undoBar = document.createElement('div');
   undoBar.className = 'undo-bar';
 
   const span = document.createElement('span');
-  span.textContent = message;
+  span.textContent = getUndoBarMessage(record);
 
   const undoBtn = document.createElement('button');
   undoBtn.className = 'undo-btn';
   undoBtn.type = "button";
-  undoBtn.textContent = '撤销';
+  undoBtn.textContent = state.undoStack.length > 1 ? `撤销 (${state.undoStack.length})` : '撤销';
 
   undoBar.appendChild(span);
   undoBar.appendChild(undoBtn);
   undoContainer.appendChild(undoBar);
 
-  if (undoTimeoutId) {
-    clearTimeout(undoTimeoutId);
-  }
+  clearUndoTimer();
   undoTimeoutId = setTimeout(() => {
-    undoContainer.textContent = '';
-    state.lastSwipeAction = null;
-  }, 10000);
+    clearUndoBar({ clearStack: true });
+  }, UNDO_BAR_TIMEOUT_MS);
 
   undoBtn.onclick = () => {
-    if (undoTimeoutId) {
-      clearTimeout(undoTimeoutId);
-      undoTimeoutId = null;
-    }
-    undoContainer.textContent = '';
-    onUndo();
+    undoLastInteraction();
   };
 }
 
@@ -265,24 +285,11 @@ function recordUndoableInteraction(id, action, card = null, undoContext = null) 
   const undoAction = getUndoAction(action);
   if (!undoAction) return;
 
-  state.lastSwipeAction = { id, action, undoAction, undoContext };
-  showUndoBar(getInteractionMessage(action), () => {
-    applyInteractionToState(id, undoAction);
-    saveInteraction(id, undoAction);
-
-    if (shouldUseSwipeDeck() && undoContext && undoContext.item) {
-      insertFilteredItem(undoContext.item, undoContext.index);
-      renderList();
-      updateFilterCounts(getRenderedLogicalCount());
-    } else if (shouldUseSwipeDeck()) {
-      applyFilters({ resetSwipeIndex: false });
-    } else {
-      restoreCurrentCard(card);
-      updateFilterCounts();
-    }
-
-    state.lastSwipeAction = null;
-  });
+  state.undoStack.push({ id, action, undoAction, card, undoContext });
+  if (state.undoStack.length > MAX_UNDO_STACK_SIZE) {
+    state.undoStack.shift();
+  }
+  renderUndoBar();
 }
 
 function performPaperAction(id, action, options = {}) {
@@ -1118,12 +1125,28 @@ function commitSwipeAction(action, direction) {
 }
 
 function undoLastInteraction() {
-  if (!state.lastSwipeAction) return;
-  const undoContainer = document.getElementById('undoContainer');
-  const undoButton = undoContainer ? undoContainer.querySelector(".undo-btn") : null;
-  if (undoButton) {
-    undoButton.click();
+  const record = state.undoStack.pop();
+  if (!record) {
+    clearUndoBar();
+    return;
   }
+
+  clearUndoTimer();
+  applyInteractionToState(record.id, record.undoAction);
+  saveInteraction(record.id, record.undoAction);
+
+  if (shouldUseSwipeDeck() && record.undoContext && record.undoContext.item) {
+    insertFilteredItem(record.undoContext.item, record.undoContext.index);
+    renderList();
+    updateFilterCounts(getRenderedLogicalCount());
+  } else if (shouldUseSwipeDeck()) {
+    applyFilters({ resetSwipeIndex: false });
+  } else {
+    restoreCurrentCard(record.card);
+    updateFilterCounts();
+  }
+
+  renderUndoBar();
 }
 
 function renderSwipeDeck() {
