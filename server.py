@@ -223,6 +223,73 @@ def clean_journal_name(name):
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean
 
+
+def _ris_clean(value):
+    """Return a single safe RIS field value without allowing tag injection."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _ris_authors(summary):
+    """Extract the feed's conventional Author(s) value into RIS author names."""
+    # Feeds use all four variants below.  Stop at every recognized metadata
+    # label so an author field cannot absorb Source or Publication date values.
+    author_label = r"(?:Author|Authors|Author\(s\)|Authors\(s\))"
+    field_label = rf"(?:Publication\s+date|Source|{author_label})"
+    match = re.search(rf"(?:^|\s){author_label}\s*:\s*(.*?)(?=\s+{field_label}\s*:|$)",
+                      str(summary or ""), re.IGNORECASE)
+    raw = match.group(1).strip(" \t\r\n;,.") if match else ""
+    if not raw:
+        return []
+    normalized = re.sub(r"\s+(?:and|&)\s+", ";", raw, flags=re.IGNORECASE)
+    parts = (normalized.split(";") if ";" in normalized else normalized.split(","))
+    authors = []
+    for part in parts:
+        name = _ris_clean(part)
+        if not name:
+            continue
+        tokens = name.split()
+        authors.append(f"{tokens[-1]}, {' '.join(tokens[:-1])}" if len(tokens) > 1 else name)
+    return authors
+
+
+def _ris_date(value):
+    """Return the RIS PY value; tolerate incomplete or malformed feed dates."""
+    match = re.match(r"\s*(\d{4})", str(value or ""))
+    return match.group(1) if match else ""
+
+
+def build_favorite_ris_entry(item):
+    """Build one canonical RIS record from a SQLite-projected paper."""
+    title = _ris_clean(item.get("title")) or "Untitled"
+    journal = _ris_clean(clean_journal_name(item.get("journal", "")))
+    url = _ris_clean(item.get("link"))
+    lines = ["TY  - JOUR", f"TI  - {title}"]
+    if journal:
+        lines.append(f"JO  - {journal}")
+    for author in _ris_authors(item.get("summary", "")):
+        lines.append(f"AU  - {author}")
+    year = _ris_date(item.get("pub_date"))
+    if year:
+        lines.append(f"PY  - {year}")
+    if url:
+        lines.append(f"UR  - {url}")
+    # This stable note makes the export traceable even if legacy source metadata
+    # is absent.  It deliberately uses the durable SQLite identity, not feed ids.
+    lines.append(f"N1  - Paper Feed ID: {_ris_clean(item.get('paper_id'))}")
+    lines.append("ER  - ")
+    return "\r\n".join(lines)
+
+
+def build_favorites_ris(service=None):
+    """Export the current favorite view as RIS without mutating the database."""
+    service = service or paper_service()
+    items = service.list_papers("favorite")
+    entries = [build_favorite_ris_entry(item) for item in items]
+    return {
+        "count": len(entries),
+        "ris": ("\r\n\r\n".join(entries) + "\r\n") if entries else "",
+    }
+
 def extract_meta_value(text, label):
     if not text:
         return ""
@@ -935,6 +1002,22 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == '/api/export_favorites_ris':
+            try:
+                result = build_favorites_ris()
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                self.send_response(200)
+                self.send_header('Content-type', 'application/x-research-info-systems; charset=utf-8')
+                self.send_header('Content-Disposition', f'attachment; filename="paper-feed-favorites-{timestamp}.ris"')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Paper-Feed-Exported', str(result["count"]))
+                self.end_headers()
+                self.wfile.write(result["ris"].encode('utf-8'))
+            except Exception as error:
+                # A download failure is a read-only operation; return a stable
+                # JSON error shape and leave SQLite untouched.
+                self.send_json(500, {"status": "error", "message": "RIS export failed", "detail": str(error)[:400]})
+            return
         if path.startswith('/api/papers/') and path.endswith('/review'):
             paper_id = path[len('/api/papers/'):-len('/review')].strip('/')
             try:

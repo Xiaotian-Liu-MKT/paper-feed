@@ -5,6 +5,10 @@ const state = {
   interactions: { favorites: [], archived: [], hidden: [] },
   paperApiAvailable: false,
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
+  inboxViewMode: "swipe", // 'swipe' | 'list'
+  swipeIndex: 0,
+  swipeBusy: false,
+  undoStack: [],
   visibleLimit: 40,
   preset: "",
   focusTopics: [],
@@ -37,10 +41,13 @@ const elements = {
   topicCloudWrap: document.getElementById("topicCloudWrap"),
   advancedFilters: document.getElementById("advancedFilters"),
   clearAdvancedFilters: document.getElementById("btnClearAdvancedFilters"),
+  inboxViewToggle: document.getElementById("inboxViewToggle"),
   loadMore: document.getElementById("btnLoadMore")
 };
 
 const PAGE_SIZE = 40;
+const UNDO_BAR_TIMEOUT_MS = 10000;
+const MAX_UNDO_STACK_SIZE = 100;
 
 const formatter = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -257,6 +264,128 @@ function showUndoBar(item, card, beforeHide) {
     // Hide undo bar
     undoContainer.textContent = '';
   };
+}
+
+// Inbox deck keeps its own, bounded history so several decisions can be undone
+// one by one.  The paper object is retained only for rendering; all state and
+// server writes use paperKey(item), which prefers the durable paper_id.
+function shouldUseSwipeDeck() {
+  return state.filterMode === "all" && state.inboxViewMode === "swipe";
+}
+
+function clearUndoBar({ clearStack = false } = {}) {
+  if (undoTimeoutId) clearTimeout(undoTimeoutId);
+  undoTimeoutId = null;
+  if (clearStack) state.undoStack = [];
+  const container = document.getElementById("undoContainer");
+  if (container) container.textContent = "";
+}
+
+function undoMessage(action) {
+  return ({ like: "已收藏文章", hide: "已跳过文章", archive: "已归档文章" })[action] || "已更新文章";
+}
+
+function renderUndoStack() {
+  const container = document.getElementById("undoContainer");
+  if (!container) return;
+  container.textContent = "";
+  const record = state.undoStack[state.undoStack.length - 1];
+  if (!record) return;
+  const bar = document.createElement("div");
+  bar.className = "undo-bar";
+  const message = document.createElement("span");
+  message.textContent = state.undoStack.length > 1 ? `${undoMessage(record.action)} · ${state.undoStack.length} 项可撤销` : undoMessage(record.action);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "undo-btn";
+  button.textContent = state.undoStack.length > 1 ? `撤销 (${state.undoStack.length})` : "撤销";
+  button.onclick = undoLastInteraction;
+  bar.append(message, button);
+  container.appendChild(bar);
+  if (undoTimeoutId) clearTimeout(undoTimeoutId);
+  undoTimeoutId = setTimeout(() => clearUndoBar({ clearStack: true }), UNDO_BAR_TIMEOUT_MS);
+}
+
+function swipeUndoAction(action) {
+  return ({ like: "unlike", hide: "unhide", archive: "unarchive" })[action] || null;
+}
+
+function currentSwipeItem() {
+  state.swipeIndex = Math.max(0, Math.min(state.swipeIndex, Math.max(0, state.filtered.length - 1)));
+  return state.filtered[state.swipeIndex] || null;
+}
+
+function removeSwipeItem(item, index) {
+  const id = paperKey(item);
+  const found = state.filtered.findIndex((candidate) => paperKey(candidate) === id);
+  state.filtered.splice(found >= 0 ? found : index, 1);
+  state.swipeIndex = Math.min(index, Math.max(0, state.filtered.length - 1));
+}
+
+function setSwipeBusy(busy, message = "") {
+  state.swipeBusy = busy;
+  document.querySelectorAll(".swipe-action, .undo-btn").forEach((button) => {
+    button.disabled = busy;
+    button.setAttribute("aria-busy", busy ? "true" : "false");
+  });
+  if (message) setStatus(message);
+}
+
+function commitSwipeAction(action, direction) {
+  if (!shouldUseSwipeDeck() || state.swipeBusy) return;
+  const item = currentSwipeItem();
+  const id = paperKey(item);
+  if (!item || !id) return;
+  setSwipeBusy(true, "正在保存操作…");
+  const index = state.swipeIndex;
+  const before = JSON.parse(JSON.stringify(state.interactions));
+  const card = elements.list.querySelector(".swipe-card--current");
+  if (card) card.classList.add(direction === "right" ? "swipe-card--leaving-right" : "swipe-card--leaving-left");
+  setTimeout(() => {
+    applyInteractionAction(id, action);
+    removeSwipeItem(item, index);
+    state.undoStack.push({ item, id, action, undoAction: swipeUndoAction(action), index });
+    if (state.undoStack.length > MAX_UNDO_STACK_SIZE) state.undoStack.shift();
+    renderList();
+    updateFilterCounts();
+    renderUndoStack();
+    saveInteraction(item, action).catch((error) => {
+      state.interactions = before;
+      state.undoStack = state.undoStack.filter((record) => record.id !== id || record.action !== action);
+      applyFilters();
+      renderUndoStack();
+      setStatus(`操作未保存，已恢复原状态：${error.message}`);
+      alert(`操作失败，已恢复原状态：${error.message}`);
+    }).finally(() => { setSwipeBusy(false); });
+  }, card ? 180 : 0);
+}
+
+function undoLastInteraction() {
+  if (state.swipeBusy) {
+    setStatus("正在保存上一项操作，请稍候再撤销。");
+    return;
+  }
+  const record = state.undoStack.pop();
+  if (!record) return clearUndoBar();
+  setSwipeBusy(true, "正在保存撤销…");
+  const before = JSON.parse(JSON.stringify(state.interactions));
+  applyInteractionAction(record.id, record.undoAction);
+  const index = Math.max(0, Math.min(record.index, state.filtered.length));
+  if (!state.filtered.some((item) => paperKey(item) === record.id)) state.filtered.splice(index, 0, record.item);
+  state.swipeIndex = index;
+  renderList();
+  updateFilterCounts();
+  renderUndoStack();
+  saveInteraction(record.item, record.undoAction).catch((error) => {
+    state.interactions = before;
+    state.filtered = state.filtered.filter((item) => paperKey(item) !== record.id);
+    state.undoStack.push(record);
+    renderList();
+    updateFilterCounts();
+    renderUndoStack();
+    setStatus(`撤销未保存，已恢复原状态：${error.message}`);
+    alert(`撤销失败，已恢复原状态：${error.message}`);
+  }).finally(() => { setSwipeBusy(false); });
 }
 
 function toggleArchive(item) {
@@ -565,7 +694,76 @@ function updateFilterCounts() {
   if (elArch) elArch.textContent = archCount > 0 ? archCount : "";
 }
 
+function createSwipeAction(label, action, direction) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `swipe-action swipe-action--${direction}`;
+  button.textContent = label;
+  button.onclick = () => commitSwipeAction(action, direction);
+  return button;
+}
+
+function renderSwipeDeck() {
+  elements.list.textContent = "";
+  elements.list.classList.add("grid--swipe");
+  const item = currentSwipeItem();
+  if (!item) {
+    const empty = document.createElement("div");
+    empty.className = "swipe-empty";
+    empty.textContent = "暂时没有新的文献了。切换到收藏或归档可继续处理。";
+    elements.list.appendChild(empty);
+    return;
+  }
+  const shell = document.createElement("div");
+  shell.className = "swipe-shell";
+  const deck = document.createElement("div");
+  deck.className = "swipe-deck";
+  const next = state.filtered[state.swipeIndex + 1];
+  if (next) {
+    const preview = document.createElement("article");
+    preview.className = "swipe-card swipe-card--preview";
+    preview.textContent = next.title || "Untitled";
+    deck.appendChild(preview);
+  }
+  const card = document.createElement("article");
+  card.className = "swipe-card swipe-card--current";
+  const meta = document.createElement("div");
+  meta.className = "swipe-card__meta";
+  meta.textContent = `${item.journal || "Unknown"} · ${formatDate(item.date)}`;
+  const title = document.createElement("a");
+  title.className = "swipe-card__title";
+  title.href = item.link || "#";
+  title.target = "_blank";
+  title.rel = "noreferrer";
+  title.textContent = item.title || "Untitled";
+  const titleZh = document.createElement("div");
+  titleZh.className = "swipe-card__title-zh";
+  titleZh.textContent = item.title_zh || "";
+  const abstract = document.createElement("p");
+  abstract.className = "swipe-card__abstract";
+  abstract.textContent = elements.summaryToggle.checked && item.abstract ? truncateText(item.abstract, 520) : "";
+  card.append(meta, title, titleZh, abstract);
+  deck.appendChild(card);
+  const actions = document.createElement("div");
+  actions.className = "swipe-actions";
+  actions.append(
+    createSwipeAction("← 跳过", "hide", "left"),
+    createSwipeAction("归档", "archive", "archive"),
+    createSwipeAction("收藏 →", "like", "right")
+  );
+  const progress = document.createElement("div");
+  progress.className = "swipe-progress";
+  progress.textContent = `${state.swipeIndex + 1} / ${state.filtered.length}`;
+  const hint = document.createElement("div");
+  hint.className = "swipe-hint";
+  hint.textContent = "键盘：← 跳过 · → 收藏 · A 归档 · Z 撤销";
+  shell.append(deck, actions, progress, hint);
+  elements.list.appendChild(shell);
+}
+
 function renderList() {
+  if (shouldUseSwipeDeck()) return renderSwipeDeck();
+  elements.list.classList.remove("grid--swipe");
   elements.list.innerHTML = "";
   const showSummary = elements.summaryToggle.checked;
   const highlightTerms = getHighlightTerms();
@@ -897,6 +1095,19 @@ function isTypingTarget(target) {
 function handleTriageShortcut(event) {
   if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) return;
   if (state.filterMode !== "all" || document.querySelector("dialog[open]")) return;
+
+  if (shouldUseSwipeDeck()) {
+    const key = event.key.toLowerCase();
+    const swipeAction = key === "arrowright" ? ["like", "right"] : key === "arrowleft" ? ["hide", "left"] : key === "a" ? ["archive", "archive"] : null;
+    if (swipeAction) {
+      event.preventDefault();
+      commitSwipeAction(swipeAction[0], swipeAction[1]);
+    } else if (key === "z") {
+      event.preventDefault();
+      undoLastInteraction();
+    }
+    return;
+  }
 
   const card = elements.list.querySelector(".card:not(.hidden)");
   if (!card) return;
@@ -1719,6 +1930,7 @@ const classificationForm = document.getElementById("classificationForm");
 const btnCancelClassification = document.getElementById("btnCancelClassification");
 
 const btnSummarizeFavorites = document.getElementById("btnSummarizeFavorites");
+const btnExportFavorites = document.getElementById("btnExportFavorites");
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -1946,6 +2158,10 @@ function setupFilters() {
   const buttons = document.querySelectorAll('.filter-btn');
   buttons.forEach(btn => {
     btn.addEventListener('click', () => {
+      if (state.swipeBusy) {
+        setStatus("正在保存操作，请稍候再切换视图。");
+        return;
+      }
       // Toggle active class
       buttons.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -1957,7 +2173,66 @@ function setupFilters() {
       if (btnSummarizeFavorites) {
         btnSummarizeFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
       }
+      if (btnExportFavorites) {
+        btnExportFavorites.style.display = state.filterMode === 'favorites' ? 'inline-block' : 'none';
+      }
 
+      applyFilters();
+    });
+  });
+}
+
+async function exportFavoritesRis() {
+  if (!ensureArray(state.interactions.favorites).length) {
+    const message = "还没有收藏论文，无法导出 RIS。";
+    setStatus(message);
+    alert(message);
+    return false;
+  }
+  try {
+    if (btnExportFavorites) btnExportFavorites.disabled = true;
+    const response = await fetch("/api/export_favorites_ris", { method: "POST" });
+    if (!response.ok) throw new Error(`导出失败（HTTP ${response.status || "错误"}）`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "paper-feed-favorites.ris";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setStatus("RIS 文件已开始下载。");
+    return true;
+  } catch (error) {
+    const message = `RIS 导出失败：${error.message || "网络错误"}`;
+    setStatus(message);
+    alert(message);
+    return false;
+  } finally {
+    if (btnExportFavorites) btnExportFavorites.disabled = false;
+  }
+}
+
+if (btnExportFavorites) btnExportFavorites.addEventListener("click", exportFavoritesRis);
+
+function setupInboxViewToggle() {
+  if (!elements.inboxViewToggle) return;
+  elements.inboxViewToggle.querySelectorAll("[data-inbox-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (state.swipeBusy) {
+        setStatus("正在保存操作，请稍候再切换视图。");
+        return;
+      }
+      const mode = button.dataset.inboxView;
+      if (!mode || mode === state.inboxViewMode) return;
+      state.inboxViewMode = mode;
+      state.swipeIndex = 0;
+      elements.inboxViewToggle.querySelectorAll("[data-inbox-view]").forEach((entry) => {
+        const active = entry.dataset.inboxView === mode;
+        entry.classList.toggle("is-active", active);
+        entry.setAttribute("aria-pressed", String(active));
+      });
       applyFilters();
     });
   });
@@ -1965,6 +2240,7 @@ function setupFilters() {
 
 async function init() {
   setupFilters();
+  setupInboxViewToggle();
   document.addEventListener("keydown", handleTriageShortcut);
   await loadInteractions();
   await loadCategories();

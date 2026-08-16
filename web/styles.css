@@ -258,6 +258,32 @@ h1 {
   color: #94a3b8;
 }
 
+.view-toggle { display: inline-flex; gap: 2px; margin-left: 12px; padding: 3px; border: 1px solid var(--soft); border-radius: 8px; background: #fff; }
+.view-toggle__btn { border: 0; border-radius: 5px; padding: 5px 9px; color: #64748b; background: transparent; cursor: pointer; font: inherit; font-size: .85rem; }
+.view-toggle__btn.is-active { color: #fff; background: var(--accent); }
+
+.grid--swipe { display: block; contain: none; }
+.swipe-shell { width: min(100%, 760px); margin: 0 auto; }
+.swipe-deck { position: relative; min-height: 350px; }
+.swipe-card { position: relative; z-index: 2; min-height: 310px; padding: 30px; border: 1px solid var(--soft); border-radius: 16px; background: #fff; box-shadow: var(--shadow); }
+.swipe-card--preview { position: absolute; inset: 12px -8px -12px 8px; z-index: 1; overflow: hidden; color: transparent; background: #f8fafc; box-shadow: none; }
+.swipe-card__meta { color: #64748b; font-size: .88rem; }
+.swipe-card__title { display: block; margin: 14px 0 8px; color: #172554; font-size: 1.35rem; font-weight: 700; line-height: 1.4; text-decoration: none; }
+.swipe-card__title-zh { color: #64748b; line-height: 1.5; }
+.swipe-card__abstract { margin-top: 18px; color: #475569; line-height: 1.7; }
+.swipe-actions { display: flex; justify-content: center; gap: 12px; margin-top: 24px; }
+.swipe-action { min-width: 108px; padding: 10px 14px; border: 1px solid var(--soft); border-radius: 10px; background: #fff; color: #334155; cursor: pointer; font: inherit; }
+.swipe-action--left { border-color: #fecaca; color: #b91c1c; }
+.swipe-action--archive { border-color: #fde68a; color: #92400e; }
+.swipe-action--right { border-color: #bbf7d0; color: #166534; }
+.swipe-progress, .swipe-hint { margin-top: 13px; text-align: center; color: #64748b; font-size: .88rem; }
+.swipe-hint { color: #94a3b8; }
+.swipe-empty { padding: 48px 24px; border: 1px dashed var(--soft); border-radius: 14px; text-align: center; color: #64748b; }
+.swipe-card--leaving-right { animation: swipeLeaveRight .18s ease-in forwards; }
+.swipe-card--leaving-left { animation: swipeLeaveLeft .18s ease-in forwards; }
+@keyframes swipeLeaveRight { to { opacity: 0; transform: translateX(110px) rotate(3deg); } }
+@keyframes swipeLeaveLeft { to { opacity: 0; transform: translateX(-110px) rotate(-3deg); } }
+
 .grid {
   display: flex;
   flex-direction: column;
