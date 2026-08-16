@@ -3,11 +3,15 @@ import contextlib
 import http.server
 import socketserver
 import threading
+import unittest
 from pathlib import Path
 
-import pytest
-
-playwright = pytest.importorskip("playwright.sync_api")
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    PlaywrightError = None
+    sync_playwright = None
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,10 +30,10 @@ def static_server():
         thread.join(timeout=2)
 
 
-def test_swipe_undo_and_favorites_ris_button():
+def run_swipe_undo_and_favorites_ris_smoke():
     paper = {"paper_id": "paper-1", "title": "Swipe paper", "link": "https://example.invalid/paper", "journal": "Journal", "pub_date": "2026-08-01"}
     reviews = []
-    with static_server() as base_url, playwright.sync_playwright() as p:
+    with static_server() as base_url, sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
@@ -70,3 +74,15 @@ def test_swipe_undo_and_favorites_ris_button():
             page.locator("#btnExportFavorites").click()
         assert download_info.value.suggested_filename == "paper-feed-favorites.ris"
         browser.close()
+
+
+@unittest.skipUnless(sync_playwright is not None, "Playwright is not installed in this Python environment")
+class TestSwipeRisBrowserSmoke(unittest.TestCase):
+    def test_swipe_undo_and_favorites_ris_button(self):
+        try:
+            run_swipe_undo_and_favorites_ris_smoke()
+        except PlaywrightError as error:
+            # A venv may contain the Python package but not the Chromium binary.
+            if "Executable doesn't exist" in str(error) or "browserType.launch" in str(error):
+                self.skipTest(f"Playwright Chromium unavailable: {error}")
+            raise
