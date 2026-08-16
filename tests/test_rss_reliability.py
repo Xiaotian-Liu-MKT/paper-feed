@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import get_RSS
+from paper_feed.db import connect
 
 
 RSS_XML = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Test Journal</title>
@@ -53,12 +54,17 @@ class PublicationReliabilityTests(unittest.TestCase):
             {"url": "https://two.test/rss", "success": False, "entries": []},
         ]
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(get_RSS, "WEB_DIR", directory), \
-             patch.object(get_RSS, "JOURNAL_HASH_FILE", os.path.join(directory, "journals.hash")), \
-             patch.object(get_RSS, "load_config", side_effect=[list(x["url"] for x in results), ["marketing"]]), \
-             patch.object(get_RSS, "fetch_rss_result", side_effect=results), \
-             patch.object(get_RSS, "get_existing_items", return_value=[]), \
-             patch.object(get_RSS, "generate_rss_xml") as publish:
+            patch.object(get_RSS, "WEB_DIR", directory), \
+            patch.object(get_RSS, "JOURNAL_HASH_FILE", os.path.join(directory, "journals.hash")), \
+            patch.dict(os.environ, {"PAPER_FEED_DB": os.path.join(directory, "paper_feed.sqlite3")}), \
+            patch.object(get_RSS, "load_config", side_effect=[list(x["url"] for x in results), ["marketing"]]), \
+            patch.object(get_RSS, "fetch_rss_result", side_effect=results), \
+            patch.object(get_RSS, "get_existing_items", return_value=[]), \
+            patch.object(get_RSS, "get_config", return_value={}), \
+            patch.object(get_RSS, "generate_rss_xml") as publish:
+            # A created temporary schema prevents legacy bootstrap from reading
+            # project XML and proves this test has no project database state.
+            connect(os.path.join(directory, "paper_feed.sqlite3")).close()
             outcome = get_RSS.run_rss_flow()
 
         self.assertTrue(outcome["published"])
@@ -75,9 +81,11 @@ class PublicationReliabilityTests(unittest.TestCase):
             hash_file = os.path.join(directory, "journals.hash")
             with open(hash_file, "w", encoding="utf-8") as handle:
                 handle.write("existing-hash")
+            connect(os.path.join(directory, "paper_feed.sqlite3")).close()
             with patch.object(get_RSS, "WEB_DIR", directory), \
-                 patch.object(get_RSS, "JOURNAL_HASH_FILE", hash_file), \
-                 patch.object(get_RSS, "load_config", side_effect=[urls, ["marketing"]]), \
+                patch.object(get_RSS, "JOURNAL_HASH_FILE", hash_file), \
+                patch.dict(os.environ, {"PAPER_FEED_DB": os.path.join(directory, "paper_feed.sqlite3")}), \
+                patch.object(get_RSS, "load_config", side_effect=[urls, ["marketing"]]), \
                  patch.object(get_RSS, "fetch_rss_result", side_effect=results), \
                  patch.object(get_RSS, "generate_rss_xml") as publish:
                 outcome = get_RSS.run_rss_flow()

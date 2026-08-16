@@ -32,12 +32,17 @@ jobs:
     - name: Run RSS Script
       env: 
         RSS_KEYWORDS: ${{ secrets.RSS_KEYWORDS }}
-      run: python get_RSS.py
+      run: |
+        # SQLite is an ephemeral CI cache. get_RSS.py bootstraps it from the
+        # committed XML/JSON compatibility exports when it is absent.
+        rm -f data/paper_feed.sqlite3 data/paper_feed.sqlite3-wal data/paper_feed.sqlite3-shm
+        python get_RSS.py
 
     - name: Commit and Push changes
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        # Never stage the local SQLite history database.
         git add -f filtered_feed.xml web/feed.json web/translations.json web/journals.hash
         # 只有当有新文件生成或文件变动时才提交
         git commit -m "Auto-update RSS feed" || echo "No changes to commit"

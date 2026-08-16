@@ -11,11 +11,13 @@ import threading
 import queue
 import uuid
 from functools import partial
+from urllib.parse import parse_qs, urlparse
+from paper_feed.service import PaperFeedService, PaperNotFound, PaperReferenceError
 
 # 导入 RSS 抓取逻辑
 # 确保 get_RSS.py 在同一目录下
 try:
-    from get_RSS import run_rss_flow, get_config, summarize_specific_papers, load_abstracts, save_abstracts
+    from get_RSS import run_rss_flow, get_config, summarize_specific_papers
 except ImportError:
     print("Error: Could not import run_rss_flow from get_RSS.py")
     sys.exit(1)
@@ -32,6 +34,11 @@ JOURNALS_FILE = "journals.dat"
 JOURNALS_META_FILE = "journals_meta.json"
 RSS_LIST_FILE = "RSS list.md"
 FILE_LOCK = threading.RLock()
+
+
+def paper_service():
+    """A request-scoped service; connections are never shared by HTTP threads."""
+    return PaperFeedService(".", os.environ.get("PAPER_FEED_DB"))
 
 
 def atomic_write_text(path, content, encoding="utf-8"):
@@ -125,56 +132,22 @@ def run_reanalysis_job():
 
 
 def run_summarize_job():
-    with FILE_LOCK:
-        data = {"favorites": []}
-        if os.path.exists(INTERACTIONS_FILE):
-            with open(INTERACTIONS_FILE, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-    favorites = data.get("favorites", [])
-    if not favorites:
+    favorites = paper_service().favorite_legacy_ids()
+    legacy_ids = [legacy_id for _, legacy_id in favorites if legacy_id]
+    if not legacy_ids:
         return {"message": "No favorites to summarize.", "summarized": 0}
-    return summarize_specific_papers(favorites)
+    # The legacy summarizer needs RSS ids.  Selection is SQLite-backed, so a link
+    # that differs from RSS id still selects the correct paper.
+    # The summarizer writes its result directly to SQLite.  Do not re-import the
+    # legacy cache here: it may contain an older version of the same abstract.
+    return summarize_specific_papers(legacy_ids)
 
 
 def apply_interaction_change(request_data):
-    """Lock the full read-modify-write cycle for short user interactions."""
-    with FILE_LOCK:
-        data = {"favorites": [], "archived": [], "hidden": []}
-        if os.path.exists(INTERACTIONS_FILE):
-            try:
-                with open(INTERACTIONS_FILE, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                pass
-        for key in data:
-            if not isinstance(data.get(key), list):
-                data[key] = []
-        action = request_data.get("action")
-        item_id = request_data.get("id")
-        if not action or not item_id:
-            raise ValueError("Missing interaction action or id")
-        transitions = {
-            "like": ("favorites", ("hidden", "archived")),
-            "archive": ("archived", ("favorites", "hidden")),
-            "restore": ("favorites", ("archived", "hidden")),
-            "hide": ("hidden", ("favorites", "archived")),
-        }
-        removals = {"unlike": "favorites", "unarchive": "archived", "unhide": "hidden"}
-        if action in transitions:
-            destination, remove_from = transitions[action]
-            if item_id not in data[destination]:
-                data[destination].append(item_id)
-            for key in remove_from:
-                if item_id in data[key]:
-                    data[key].remove(item_id)
-        elif action in removals:
-            key = removals[action]
-            if item_id in data[key]:
-                data[key].remove(item_id)
-        else:
-            raise ValueError("Unknown interaction action")
-        atomic_write_json(INTERACTIONS_FILE, data)
-        return data
+    service = paper_service()
+    paper_id = service.resolve_reference(request_data)
+    service.review(paper_id, request_data.get("action"))
+    return service.interactions()
 
 TITLE_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
@@ -438,18 +411,9 @@ def analyze_temporal_trends(favorite_items, hidden_items):
     return trend_data
 
 def generate_title_report():
-    if not os.path.exists(FEED_FILE):
-        return {"status": "error", "message": "feed.json not found"}
-    if not os.path.exists(INTERACTIONS_FILE):
-        return {"status": "error", "message": "interactions.json not found"}
-
-    with open(FEED_FILE, 'r', encoding='utf-8') as f:
-        feed = json.load(f)
-    with open(INTERACTIONS_FILE, 'r', encoding='utf-8') as f:
-        interactions = json.load(f)
-
-    items = feed.get("items", [])
-    by_link = {item.get("link"): item for item in items if item.get("link")}
+    items = paper_service().list_papers("all")
+    interactions = paper_service().interactions()
+    by_link = {item.get("paper_id"): item for item in items if item.get("paper_id")}
 
     raw_favorites = interactions.get("favorites") or []
     raw_archived = interactions.get("archived") or []
@@ -842,7 +806,23 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         # 解析路径，忽略 query parameters
-        path = self.path.split('?')[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == '/api/papers':
+            try:
+                view = parse_qs(parsed.query).get("view", ["inbox"])[0]
+                self.send_json(200, {"items": paper_service().list_papers(view), "view": view})
+            except ValueError as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+            return
+
+        if path.startswith('/api/papers/'):
+            paper_id = path[len('/api/papers/'):]
+            if '/' not in paper_id and paper_id:
+                item = paper_service().get_paper(paper_id)
+                self.send_json(200 if item else 404, item or {"status": "error", "message": "paper_id not found"})
+                return
 
         # 添加一个 API 来获取当前配置（用于回显到前端）
         if path == '/api/config':
@@ -905,20 +885,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         if path == '/api/interactions':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Expires', '0')
-            self.end_headers()
-            if os.path.exists(INTERACTIONS_FILE):
-                try:
-                    with open(INTERACTIONS_FILE, 'r', encoding='utf-8') as f:
-                        self.wfile.write(f.read().encode('utf-8'))
-                except:
-                    self.wfile.write(b'{"favorites": [], "archived": [], "hidden": []}')
-            else:
-                self.wfile.write(b'{"favorites": [], "archived": [], "hidden": []}')
+            self.send_json(200, paper_service().interactions())
             return
 
         if path == '/api/preference_report':
@@ -966,6 +933,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path.startswith('/api/papers/') and path.endswith('/review'):
+            paper_id = path[len('/api/papers/'):-len('/review')].strip('/')
+            try:
+                req_data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+                item = paper_service().review(paper_id, req_data.get("action"))
+                self.send_json(200, {"status": "ok", "paper": item, "interactions": paper_service().interactions()})
+            except PaperNotFound as error:
+                self.send_json(404, {"status": "error", "message": str(error)})
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+            return
         if self.path == '/api/interactions':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
@@ -974,10 +954,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 data = apply_interaction_change(req_data)
                 self.send_json(200, data)
                 return
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            except PaperReferenceError as e:
+                self.send_json(400, {"status": "error", "message": str(e)})
+            except PaperNotFound as e:
+                self.send_json(404, {"status": "error", "message": str(e)})
+            except (ValueError, json.JSONDecodeError) as e:
+                self.send_json(400, {"status": "error", "message": str(e)})
             return
 
         if self.path == '/api/summarize_favorites':
@@ -1006,31 +988,22 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             try:
                 req_data = json.loads(post_data.decode('utf-8'))
-                item_id = req_data.get("id")
+                item_id = paper_service().resolve_reference(req_data)
                 new_abstract = req_data.get("abstract")
                 
                 if not item_id or new_abstract is None:
                     raise ValueError("Missing id or abstract")
                 
-                # Load, Update, Save
-                cache = load_abstracts()
-                
-                # Update logic: preserve existing metadata if possible, but update content
-                if item_id not in cache:
-                    cache[item_id] = {}
-                
-                cache[item_id]['abstract'] = new_abstract
-                cache[item_id]['source'] = 'user_provided'
-                # Also update raw_abstract to ensure future re-summaries use this text
-                cache[item_id]['raw_abstract'] = new_abstract 
-                cache[item_id]['updated_at'] = datetime.datetime.now().isoformat()
-                
-                save_abstracts(cache)
+                paper_service().save_abstract(item_id, new_abstract)
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok", "message": "Abstract updated"}).encode('utf-8'))
+            except PaperNotFound as e:
+                self.send_json(404, {"status": "error", "message": str(e)})
+            except (PaperReferenceError, ValueError) as e:
+                self.send_json(400, {"status": "error", "message": str(e)})
             except Exception as e:
                 print(f"Update abstract error: {e}")
                 self.send_response(500)
@@ -1043,7 +1016,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             try:
                 req_data = json.loads(post_data.decode('utf-8'))
-                item_id = req_data.get("id")
+                item_id = paper_service().resolve_reference(req_data)
                 if not item_id:
                     raise ValueError("Missing id")
 
@@ -1054,11 +1027,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 subjects = [t for t in (req_data.get("subjects") or []) if isinstance(t, str)]
                 novelty_score = req_data.get("novelty_score")
 
-                corrections = load_user_corrections()
-                previous = corrections.get(item_id, {})
-                correction_count = previous.get("correction_count", 0) + 1
-
-                corrections[item_id] = {
+                correction = {
                     "methods": methods,
                     "topics": topics,
                     "theories": theories,
@@ -1066,29 +1035,20 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     "subjects": subjects,
                     "novelty_score": novelty_score,
                     "updated_at": datetime.datetime.now().isoformat(),
-                    "correction_count": correction_count
                 }
-                save_user_corrections(corrections)
-
-                primary_method = methods[0]["name"] if methods else "Qualitative"
-                primary_topic = topics[0]["name"] if topics else "Other Marketing"
-                update_feed_item_classification(item_id, {
-                    "methods": methods,
-                    "topics": topics,
-                    "theories": theories,
-                    "context": context,
-                    "subjects": subjects,
-                    "novelty_score": novelty_score,
-                    "method": primary_method,
-                    "topic": primary_topic,
-                    "classification_source": "user",
-                    "user_corrected": True
-                })
+                correction.update({"method": methods[0]["name"] if methods else "Qualitative",
+                                   "topic": topics[0]["name"] if topics else "Other Marketing",
+                                   "classification_source": "user", "user_corrected": True})
+                paper_service().save_classification(item_id, correction)
 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok", "message": "Classification updated"}).encode('utf-8'))
+            except PaperNotFound as e:
+                self.send_json(404, {"status": "error", "message": str(e)})
+            except (PaperReferenceError, ValueError) as e:
+                self.send_json(400, {"status": "error", "message": str(e)})
             except Exception as e:
                 print(f"Update classification error: {e}")
                 self.send_response(500)

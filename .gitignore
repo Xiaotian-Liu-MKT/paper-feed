@@ -21,6 +21,13 @@ filtered_feed.xml
 web/feed.json
 web/translations.json
 web/interactions.json
+web/abstracts.json
+web/user_corrections.json
+data/paper_feed.sqlite3
+data/paper_feed.sqlite3-wal
+data/paper_feed.sqlite3-shm
+data/paper_feed.sqlite3-*
+data/paper_feed-legacy-backup-*/
 web/journals.hash
 web/preference_report.json
 web/preference_report.json.backup

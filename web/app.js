@@ -3,6 +3,7 @@ const state = {
   filtered: [],
   keywords: [],
   interactions: { favorites: [], archived: [], hidden: [] },
+  paperApiAvailable: false,
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
   visibleLimit: 40,
   preset: "",
@@ -58,6 +59,30 @@ function ensureArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+// A paper_id is the durable server identity.  id/link remain only for old
+// feed.json exports and the legacy interactions endpoint.
+function paperKey(item) {
+  return item && (item.paper_id || item.id || item.link);
+}
+
+function legacyReference(item) {
+  return item && { paper_id: item.paper_id, id: item.id, link: item.link };
+}
+
+const LOCAL_INTERACTIONS_KEY = "paper-feed:interactions";
+
+function loadLocalInteractions() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_INTERACTIONS_KEY) || "null");
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveLocalInteractions() {
+  try { localStorage.setItem(LOCAL_INTERACTIONS_KEY, JSON.stringify(state.interactions)); } catch (_) { /* storage is optional */ }
+}
+
 function normalizeInteractions() {
   const favorites = ensureArray(state.interactions.favorites);
   const archived = ensureArray(state.interactions.archived);
@@ -87,96 +112,101 @@ async function loadInteractions() {
     if (res.ok) {
       state.interactions = await res.json();
       normalizeInteractions();
+      saveLocalInteractions();
+      return true;
     }
   } catch (e) {
     console.warn("Failed to load interactions", e);
   }
+  const local = loadLocalInteractions();
+  if (local) {
+    state.interactions = local;
+    normalizeInteractions();
+  }
+  return false;
 }
 
-async function saveInteraction(id, action) {
-  try {
-    await fetch("/api/interactions", {
+function applyInteractionAction(id, action) {
+  const lists = state.interactions;
+  lists.favorites = ensureArray(lists.favorites).filter((x) => x !== id);
+  lists.archived = ensureArray(lists.archived).filter((x) => x !== id);
+  lists.hidden = ensureArray(lists.hidden).filter((x) => x !== id);
+  if (action === "like" || action === "restore") lists.favorites.push(id);
+  if (action === "archive") lists.archived.push(id);
+  if (action === "hide") lists.hidden.push(id);
+  normalizeInteractions();
+}
+
+async function saveInteraction(item, action) {
+  const id = paperKey(item);
+  if (!id) throw new Error("论文缺少可用标识，无法保存操作。");
+  if (item.paper_id && state.paperApiAvailable) {
+    const res = await fetch(`/api/papers/${encodeURIComponent(item.paper_id)}/review`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, action })
+      body: JSON.stringify({ action })
     });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || "论文状态保存失败");
+    const payload = await res.json();
+    if (payload.interactions) {
+      state.interactions = payload.interactions;
+      normalizeInteractions();
+      saveLocalInteractions();
+    }
+    return payload;
+  }
+  // Static GitHub Pages / legacy feed compatibility.
+  try {
+    const res = await fetch("/api/interactions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...legacyReference(item), id, action })
+    });
+    if (!res.ok) throw new Error("旧互动接口不可用");
+    const payload = await res.json();
+    if (payload && payload.favorites) state.interactions = payload;
   } catch (e) {
-    console.error("Failed to save interaction", e);
+    if (!state.paperApiAvailable) { saveLocalInteractions(); return null; }
+    throw e;
   }
 }
 
-function toggleLike(id, btnElement) {
-  const isLiked = state.interactions.favorites.includes(id);
-  const action = isLiked ? 'unlike' : 'like';
-  const card = btnElement.closest('.card');
-
-  if (isLiked) {
-    state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-  } else {
-    state.interactions.favorites.push(id);
-    // If liking, ensure it's unhidden in state
-    if (state.interactions.hidden.includes(id)) {
-      state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    }
-    if (state.interactions.archived.includes(id)) {
-      state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-    }
-  }
-
-  saveInteraction(id, action);
-
-  // Update button's state first (avoid re-rendering 1000 elements!)
-  if (btnElement) {
-    if (isLiked) {
-      btnElement.classList.remove('liked');
-      btnElement.innerHTML = '🤍';
-      btnElement.title = "收藏";
-    } else {
-      btnElement.classList.add('liked');
-      btnElement.innerHTML = '❤️';
-      btnElement.title = "取消收藏";
-    }
-  }
-
-  // Hide the card after interaction (makes the list feel like an inbox)
-  if (card) {
-    card.classList.add('hidden');
-  }
-  updateFilterCounts();
-}
-
-function toggleHide(id, btnElement) {
-  // 1. Find the card element
-  const card = btnElement.closest('.card');
-  if (!card) return;
-
-  // 2. Immediate visual feedback - collapse the card
-  card.classList.add('hidden');
-
-  // 3. Update State (synchronous for consistency)
-  if (!state.interactions.hidden.includes(id)) {
-    state.interactions.hidden.push(id);
-  }
-  if (state.interactions.favorites.includes(id)) {
-    state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-  }
-  if (state.interactions.archived.includes(id)) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  }
-
-  updateFilterCounts();
-
-  // 4. Defer non-critical operations
-  requestAnimationFrame(() => {
-    // Persist to server (async, won't block UI)
-    saveInteraction(id, 'hide');
-
-    // Show Undo Bar after DOM settles
-    showUndoBar(id, card);
+function performInteraction(item, action) {
+  const id = paperKey(item);
+  const before = JSON.parse(JSON.stringify(state.interactions));
+  applyInteractionAction(id, action);
+  applyFilters();
+  saveInteraction(item, action).catch((error) => {
+    state.interactions = before;
+    applyFilters();
+    setStatus(`操作未保存，已恢复原状态：${error.message}`);
+    alert(`操作失败，已恢复原状态：${error.message}`);
   });
 }
 
-function showUndoBar(id, card) {
+function toggleLike(item) {
+  const id = paperKey(item);
+  const isLiked = state.interactions.favorites.includes(id);
+  const action = isLiked ? 'unlike' : 'like';
+  performInteraction(item, action);
+}
+
+function toggleHide(item, btnElement) {
+  const id = paperKey(item);
+  const card = btnElement.closest('.card');
+  const before = JSON.parse(JSON.stringify(state.interactions));
+  applyInteractionAction(id, "hide");
+  applyFilters();
+  showUndoBar(item, card, before);
+  saveInteraction(item, "hide").catch((error) => {
+    state.interactions = before;
+    applyFilters();
+    setStatus(`隐藏未保存，已恢复原状态：${error.message}`);
+    alert(`隐藏失败，已恢复原状态：${error.message}`);
+  });
+}
+
+function showUndoBar(item, card, beforeHide) {
+  const id = paperKey(item);
   const undoContainer = document.getElementById('undoContainer');
 
   // Clear any existing undo bar (use textContent for performance)
@@ -214,60 +244,30 @@ function showUndoBar(id, card) {
       undoTimeoutId = null;
     }
 
-    // Restore State
-    state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    saveInteraction(id, 'unhide');
-
-    // Restore card
-    card.classList.remove('hidden');
-    updateFilterCounts();
+    const beforeUndo = JSON.parse(JSON.stringify(state.interactions));
+    applyInteractionAction(id, "unhide");
+    applyFilters();
+    saveInteraction(item, 'unhide').catch((error) => {
+      state.interactions = beforeUndo || beforeHide;
+      applyFilters();
+      setStatus(`撤销未保存，已恢复原状态：${error.message}`);
+      alert(`撤销失败，已恢复原状态：${error.message}`);
+    });
 
     // Hide undo bar
     undoContainer.textContent = '';
   };
 }
 
-function toggleArchive(id, btnElement) {
+function toggleArchive(item) {
+  const id = paperKey(item);
   const isArchived = state.interactions.archived.includes(id);
   const action = isArchived ? "unarchive" : "archive";
-  const card = btnElement.closest(".card");
-
-  if (isArchived) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  } else {
-    state.interactions.archived.push(id);
-    if (state.interactions.favorites.includes(id)) {
-      state.interactions.favorites = state.interactions.favorites.filter(x => x !== id);
-    }
-    if (state.interactions.hidden.includes(id)) {
-      state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-    }
-  }
-
-  saveInteraction(id, action);
-  if (card) {
-    card.classList.add("hidden");
-  }
-  updateFilterCounts();
+  performInteraction(item, action);
 }
 
-function restoreFromArchive(id, btnElement) {
-  const card = btnElement.closest(".card");
-  if (!state.interactions.favorites.includes(id)) {
-    state.interactions.favorites.push(id);
-  }
-  if (state.interactions.archived.includes(id)) {
-    state.interactions.archived = state.interactions.archived.filter(x => x !== id);
-  }
-  if (state.interactions.hidden.includes(id)) {
-    state.interactions.hidden = state.interactions.hidden.filter(x => x !== id);
-  }
-
-  saveInteraction(id, "restore");
-  if (card) {
-    card.classList.add("hidden");
-  }
-  updateFilterCounts();
+function restoreFromArchive(item) {
+  performInteraction(item, "restore");
 }
 
 // --- End Interaction Logic ---
@@ -478,7 +478,7 @@ function computeFocusTopics() {
   ]);
   const counter = new Map();
   state.items.forEach((item) => {
-    if (!favorites.has(item.link)) return;
+    if (!favorites.has(paperKey(item))) return;
     (item.topicLabels || []).forEach((topic) => {
       counter.set(topic, (counter.get(topic) || 0) + 1);
     });
@@ -548,7 +548,7 @@ function updateFilterCounts() {
   let inboxCount = 0;
   // Inbox is items NOT in favorites, archived, hidden
   state.items.forEach(item => {
-    if (!favorites.has(item.link) && !archived.has(item.link) && !hidden.has(item.link)) {
+    if (!favorites.has(paperKey(item)) && !archived.has(paperKey(item)) && !hidden.has(paperKey(item))) {
       inboxCount++;
     }
   });
@@ -713,15 +713,15 @@ function renderList() {
     const actionsDiv = document.createElement("div");
     actionsDiv.className = "article-actions";
     
-    const isLiked = state.interactions.favorites.includes(item.link);
-    const isArchived = state.interactions.archived.includes(item.link);
+    const isLiked = state.interactions.favorites.includes(paperKey(item));
+    const isArchived = state.interactions.archived.includes(paperKey(item));
     
     const btnLike = document.createElement("button");
     btnLike.className = `action-btn ${isLiked ? 'liked' : ''}`;
     btnLike.textContent = isInbox ? "收藏" : (isLiked ? '❤️' : '🤍');
     btnLike.title = isLiked ? "取消收藏" : "收藏";
     btnLike.dataset.triageAction = "favorite";
-    btnLike.onclick = function(e) { e.preventDefault(); toggleLike(item.link, this); };
+    btnLike.onclick = function(e) { e.preventDefault(); toggleLike(item); };
 
     const btnArchive = document.createElement("button");
     btnArchive.className = "action-btn";
@@ -732,13 +732,13 @@ function renderList() {
         ? "稍后阅读"
         : "归档 (移出收藏)";
     btnArchive.dataset.triageAction = "later";
-    btnArchive.onclick = function(e) { e.preventDefault(); toggleArchive(item.link, this); };
+    btnArchive.onclick = function(e) { e.preventDefault(); toggleArchive(item); };
 
     const btnRestore = document.createElement("button");
     btnRestore.className = "action-btn";
     btnRestore.innerHTML = "↩️";
     btnRestore.title = "恢复到收藏";
-    btnRestore.onclick = function(e) { e.preventDefault(); restoreFromArchive(item.link, this); };
+    btnRestore.onclick = function(e) { e.preventDefault(); restoreFromArchive(item); };
 
     const btnClassify = document.createElement("button");
     btnClassify.className = "action-btn action-btn--secondary";
@@ -803,7 +803,7 @@ function renderList() {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    id: item.id, // Use strict ID
+                    ...legacyReference(item),
                     abstract: newText
                 })
             });
@@ -835,7 +835,7 @@ function renderList() {
     btnHide.dataset.triageAction = "hide";
     btnHide.onclick = function(e) { 
       e.preventDefault(); 
-      toggleHide(item.link, this); 
+      toggleHide(item, this);
     };
     
     actionsDiv.appendChild(btnClassify);
@@ -944,13 +944,13 @@ function applyFilters() {
 
   const filtered = state.items.filter((item) => {
     // 1. Check interactions first
-    if (hidden.has(item.link)) return false;
-    if (state.filterMode === 'favorites' && !favorites.has(item.link)) return false;
-    if (state.filterMode === 'archived' && !archived.has(item.link)) return false;
+    if (hidden.has(paperKey(item))) return false;
+    if (state.filterMode === 'favorites' && !favorites.has(paperKey(item))) return false;
+    if (state.filterMode === 'archived' && !archived.has(paperKey(item))) return false;
     // In "all" mode, hide items that have been processed (favorites or archived)
     if (state.filterMode === 'all') {
-      if (favorites.has(item.link)) return false;
-      if (archived.has(item.link)) return false;
+      if (favorites.has(paperKey(item))) return false;
+      if (archived.has(paperKey(item))) return false;
     }
 
     if (journal && item.journal !== journal) return false;
@@ -1540,19 +1540,31 @@ function attachHandlers() {
 
 async function loadFeed() {
   setStatus("加载中...");
+  const priorVisibleLimit = state.visibleLimit;
+  let payload;
   try {
-    // 添加时间戳参数和缓存控制，确保每次都获取最新数据
-    const response = await fetch("feed.json?t=" + Date.now(), {
-      cache: 'no-store',
-      headers: {
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-      }
-    });
-    if (!response.ok) {
-      throw new Error("feed.json missing");
+    const response = await fetch("/api/papers?view=all", { cache: "no-store" });
+    if (!response.ok) throw new Error("papers API unavailable");
+    payload = await response.json();
+    if (!Array.isArray(payload.items)) throw new Error("papers API returned no items");
+    state.paperApiAvailable = true;
+  } catch (apiError) {
+    state.paperApiAvailable = false;
+    try {
+      // Static GitHub Pages has no API; retain the legacy export as a readable fallback.
+      const response = await fetch("feed.json?t=" + Date.now(), {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" }
+      });
+      if (!response.ok) throw new Error("feed.json missing");
+      payload = await response.json();
+      console.warn("Paper API unavailable; using feed.json fallback", apiError);
+    } catch (feedError) {
+      setStatus("无法加载论文：Paper API 与 feed.json 均不可用。");
+      return false;
     }
-    const payload = await response.json();
+  }
+  try {
     state.keywords = payload.keywords || [];
     state.items = (payload.items || []).map((item) => {
       const parsed = parseSummary(item.summary);
@@ -1598,9 +1610,15 @@ async function loadFeed() {
       : "";
     attachHandlers();
     applyFilters();
+    if (priorVisibleLimit > PAGE_SIZE) {
+      state.visibleLimit = Math.min(priorVisibleLimit, state.filtered.length);
+      renderList();
+    }
     updateFilterCounts();
+    return true;
   } catch (error) {
-    setStatus("无法加载 feed.json，请先运行 get_RSS.py 并用本地服务器打开页面。");
+    setStatus("论文数据格式无效，无法显示。");
+    return false;
   }
 }
 
@@ -1651,7 +1669,7 @@ async function saveClassificationEdits() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        id: currentClassificationItem.id,
+        ...legacyReference(currentClassificationItem),
         methods,
         topics,
         theories: mergedTheories,

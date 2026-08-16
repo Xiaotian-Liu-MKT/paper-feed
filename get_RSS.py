@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rfeed import Item, Feed, Guid
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, unquote
+from paper_feed.ingestion import ingest_fetch_results, ensure_database, save_translations as save_db_translations, save_abstracts as save_db_abstracts
+from paper_feed.exporter import database_items, export_items
 
 # --- 配置区域 ---
 OUTPUT_FILE = "filtered_feed.xml"
@@ -715,6 +717,12 @@ def match_entry(entry, queries):
 
 def generate_rss_xml(items, queries):
     """生成 RSS 2.0 XML 文件 (已加入非法字符清洗)"""
+    # RSS jobs hand this function durable DB records.  Keep the legacy signature
+    # for callers and tests, but never rebuild job history from XML/cache files.
+    if items and items[0].get("paper_id"):
+        export_items(items, OUTPUT_FILE, FEED_JSON, queries, limit=MAX_ITEMS, atomic_write=atomic_write)
+        print(f"Successfully generated {OUTPUT_FILE} with {min(len(items), MAX_ITEMS)} items.")
+        return
     rss_items = []
     
     items.sort(key=lambda x: x['pub_date'], reverse=True)
@@ -880,6 +888,7 @@ def write_feed_json(items, queries):
         primary_topic = pick_primary(topics, "Other Marketing")
 
         data.append({
+            "paper_id": item.get("paper_id"),
             "id": item['id'],
             "title": strip_tags(remove_illegal_xml_chars(display_title)),
             "title_zh": strip_tags(title_zh),
@@ -924,6 +933,22 @@ def compute_journal_hash(journals):
     content = "\n".join(journals).strip() + "\n"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+
+def analyze_database_items(database, items, config=None):
+    """Run GPT only for missing/stale durable translations and store by paper_id."""
+    config = config or get_config()
+    api_key = config.get("OPENAI_API_KEY")
+    if not api_key:
+        return 0
+    stale = [item for item in items if not isinstance(item.get("translation"), dict)
+             or item["translation"].get("classification_version") != CLASSIFICATION_VERSION]
+    if not stale:
+        return 0
+    titles = list(dict.fromkeys(item["title"] for item in stale))
+    results = batch_analyze_papers(titles, api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY")) or {}
+    durable = {item["paper_id"]: results[item["title"]] for item in stale if item["title"] in results}
+    return save_db_translations(database, durable)
+
 def run_rss_flow():
     # 请确保这里的调用参数与你目前的 secrets 配置一致
     rss_urls = load_config('journals.dat', 'RSS_JOURNALS')
@@ -960,9 +985,14 @@ def run_rss_flow():
 
     successful_sources = [result["url"] for result in fetched_by_index if result and result["success"]]
     failed_sources = [result["url"] for result in fetched_by_index if not result or not result["success"]]
+    # Bootstrap only when no local DB exists (notably GitHub Actions), then log
+    # every fetch outcome and ingest successful source entries in one transaction.
+    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
+    ingestion = ingest_fetch_results(fetched_by_index, ".", database, predicate=lambda entry: match_entry(entry, queries))
     if not successful_sources:
         print("All RSS sources failed; keeping existing feed outputs unchanged.")
         return {
+            "run_id": ingestion["run_id"], "status": ingestion["status"],
             "successful_sources": successful_sources,
             "failed_sources": failed_sources,
             "new_items": 0,
@@ -973,29 +1003,16 @@ def run_rss_flow():
     # new entries were found. Do not update this marker on a total fetch outage.
     atomic_write(JOURNAL_HASH_FILE, journal_hash)
 
-    existing_entries = get_existing_items()
-    seen_ids = set(entry['id'] for entry in existing_entries)
-
-    # Reapply the current keyword rules to the historical feed. This both repairs
-    # older over-inclusive feeds and keeps the displayed inbox intentionally small.
-    all_entries = [entry for entry in existing_entries if match_entry(entry, queries)]
-    new_count = 0
-
-    for result in fetched_by_index:
-        for entry in result["entries"]:
-            if entry['id'] in seen_ids:
-                continue
-            seen_ids.add(entry['id'])
-            if match_entry(entry, queries):
-                all_entries.append(entry)
-                new_count += 1
-                print(f"Keyword match: {entry['title'][:50]}...")
-
-    all_entries.sort(key=lambda entry: entry['pub_date'], reverse=True)
-    all_entries = all_entries[:MAX_ITEMS]
-    print(f"Added {new_count} new entries.")
+    # Filtering and exports are both projections of SQLite.  Unlike the old XML
+    # implementation, no local history is capped at MAX_ITEMS.
+    all_entries = database_items(database, lambda entry: match_entry(entry, queries))
+    analyze_database_items(database, all_entries)
+    all_entries = database_items(database, lambda entry: match_entry(entry, queries))
+    new_count = ingestion["new_observations"]
+    print(f"Added {new_count} fetched matching entries.")
     generate_rss_xml(all_entries, queries)
     return {
+        "run_id": ingestion["run_id"], "status": ingestion["status"],
         "successful_sources": successful_sources,
         "failed_sources": failed_sources,
         "new_items": new_count,
@@ -1003,181 +1020,58 @@ def run_rss_flow():
     }
 
 def run_reanalysis_flow():
-    """只运行 AI 分析，不抓取 RSS"""
+    """Reanalyse the durable store and regenerate compatibility exports from it."""
     print("Starting AI Re-analysis...")
-    
-    # 1. Load config
     config = get_config()
-    api_key = config.get("OPENAI_API_KEY")
-    if not api_key:
-        print("Error: No API Key configured.")
+    if not config.get("OPENAI_API_KEY"):
         return {"status": "error", "message": "No API Key configured."}
-
-    # 2. Load existing items from XML (source of truth)
-    items = get_existing_items()
-    if not items:
-        print("No items found to analyze.")
-        return {"status": "ok", "message": "No items found to analyze."}
-
-    # 3. Load cache
-    translation_cache = load_translations()
-    
-    # DEBUG: Print sample cache items
-    print(f"DEBUG: Cache size: {len(translation_cache)}")
-    sample_keys = list(translation_cache.keys())[:3]
-    for k in sample_keys:
-        print(f"DEBUG SAMPLE: {k[:30]}... -> {translation_cache[k]}")
-    
-    # 4. Identify items needing analysis
-    categories = load_categories() or {}
-    VALID_METHODS = [m.get("name") for m in categories.get("methods", []) if isinstance(m, dict) and m.get("name")]
-    VALID_TOPICS = [t.get("name") for t in categories.get("topics", []) if isinstance(t, dict) and t.get("name")]
-    if not VALID_METHODS:
-        VALID_METHODS = ["Experiment", "Archival", "Theoretical", "Review", "Qualitative"]
-    if not VALID_TOPICS:
-        VALID_TOPICS = ["Other Marketing"]
-
-    titles_to_analyze = []
-    for item in items:
-        raw_title = item['title']
-        cache_val = translation_cache.get(raw_title)
-
-        needs_update = False
-
-        # Case 1: Not in cache
-        if not cache_val:
-            needs_update = True
-        # Case 2: Is old string format
-        elif isinstance(cache_val, str):
-            needs_update = True
-        # Case 3: Is dict but missing keys or has invalid values
-        elif isinstance(cache_val, dict):
-            cached_methods = normalize_label_entries(cache_val.get("methods", cache_val.get("method", "")), set(VALID_METHODS))
-            cached_topics = normalize_label_entries(cache_val.get("topics", cache_val.get("topic", "")), set(VALID_TOPICS))
-            if not cached_methods:
-                needs_update = True
-            if not cached_topics:
-                needs_update = True
-            if cache_val.get("classification_version") != CLASSIFICATION_VERSION:
-                needs_update = True
-            
-        if needs_update:
-            titles_to_analyze.append(raw_title)
-            
-    if not titles_to_analyze:
-        print("All items are already analyzed and up-to-date.")
-        # Still need to regenerate JSON to reflect any manual changes
-        queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-        write_feed_json(items, queries)
-        return {"status": "ok", "message": "All items already analyzed."}
-
-    print(f"Found {len(titles_to_analyze)} items needing AI analysis...")
-    
-    # 5. Run Batch Analysis
-    new_results = batch_analyze_papers(titles_to_analyze, api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
-    
-    # 6. Update Cache
-    if new_results:
-        translation_cache.update(new_results)
-        save_translations(translation_cache)
-        print(f"Updated cache with {len(new_results)} new entries.")
-    
-    # 7. Regenerate JSON
+    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
     queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-    write_feed_json(items, queries)
-    print("Re-analysis complete.")
-    return {"status": "ok", "message": f"Updated {len(new_results)} paper analyses."}
+    items = database_items(database, lambda entry: match_entry(entry, queries))
+    saved = analyze_database_items(database, items, config)
+    items = database_items(database, lambda entry: match_entry(entry, queries))
+    generate_rss_xml(items, queries)
+    return {"status": "ok", "message": f"Updated {saved} paper analyses.", "updated": saved}
 
 def summarize_specific_papers(target_ids):
-    """
-    按需对指定 ID 列表的论文进行 AI 总结。
-    target_ids: list of strings (urls/ids)
-    """
+    """Summarize requested durable records, then regenerate compatibility exports."""
     print(f"Request to summarize {len(target_ids)} papers...")
-    
-    # 1. Config
     config = get_config()
     api_key = config.get("OPENAI_API_KEY")
     if not api_key:
-        print("Error: No API Key configured.")
         return {"status": "error", "message": "No API Key configured."}
-    
-    base_url = config.get("OPENAI_BASE_URL")
-    proxy = config.get("OPENAI_PROXY")
-    
-    # 2. Load Items
-    items = get_existing_items()
-    # Build map for fast access
-    item_map = {item['id']: item for item in items}
-    
-    # 3. Load Cache
-    abstract_cache = load_abstracts()
-    
-    updated_count = 0
-    
-    for tid in target_ids:
-        # Check if item exists in our feed
-        if tid not in item_map:
+    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
+    item_map = {}
+    for item in database_items(database):
+        for key in (item["paper_id"], item.get("id"), *item.get("legacy_ids", [])):
+            if key:
+                item_map[str(key)] = item
+    updates = {}
+    visited = set()
+    for target in dict.fromkeys(str(target) for target in target_ids):
+        item = item_map.get(target)
+        if not item or item["paper_id"] in visited:
             continue
-            
-        item = item_map[tid]
-        
-        # Check if already summarized
-        cached = abstract_cache.get(tid, {})
-        source = cached.get('source', '')
-        
-        if source in ['gpt_summarized', 'gpt_generated']:
-            continue # Already done
-            
-        # Do we have raw abstract?
-        raw_abstract = cached.get('raw_abstract')
-        if not raw_abstract and source in ['crossref', 'semantic_scholar']:
-             # If source is external but raw_abstract missing, the 'abstract' field IS the raw one
-             raw_abstract = cached.get('abstract')
-
-        # Perform Summary
-        summary = None
-        new_source = ''
-        
-        if raw_abstract:
-            # Summarize existing
-            print(f"Summarizing abstract for: {item['title'][:50]}...")
-            summary = summarize_abstract_with_gpt(
-                raw_abstract, item['title'], api_key, 
-                base_url, proxy
-            )
-            new_source = 'gpt_summarized'
+        visited.add(item["paper_id"])
+        existing = item.get("abstract") or {}
+        if existing.get("source") in {"gpt_summarized", "gpt_generated"}:
+            continue
+        raw = existing.get("raw_abstract") or (existing.get("abstract") if existing.get("source") in {"crossref", "semantic_scholar"} else None)
+        if raw:
+            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
+            source = "gpt_summarized"
         else:
-            # Generate from scratch
-            print(f"Generating summary for: {item['title'][:50]}...")
-            summary = generate_abstract_with_gpt(
-                item['title'], item['journal'], api_key,
-                base_url, proxy
-            )
-            new_source = 'gpt_generated'
-            
+            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
+            source = "gpt_generated"
         if summary:
-            abstract_cache[tid] = {
-                'abstract': summary,
-                'source': new_source,
-                'fetched_at': datetime.datetime.now().isoformat()
-            }
-            if raw_abstract:
-                abstract_cache[tid]['raw_abstract'] = raw_abstract
-            updated_count += 1
-            
-            # Auto-save every 5 updates
-            if updated_count % 5 == 0:
-                save_abstracts(abstract_cache)
-
-    if updated_count > 0:
-        save_abstracts(abstract_cache)
-        print("Regenerating feed JSON with new summaries...")
-        queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-        write_feed_json(items, queries)
-        return {"status": "ok", "message": f"Successfully summarized {updated_count} papers."}
-    else:
-        return {"status": "ok", "message": "No new summaries needed (all up to date)."}
+            payload = {"abstract": summary, "source": source, "fetched_at": datetime.datetime.now().isoformat()}
+            if raw:
+                payload["raw_abstract"] = raw
+            updates[item["paper_id"]] = payload
+    updated_count = save_db_abstracts(database, updates)
+    queries = load_config('keywords.dat', 'RSS_KEYWORDS')
+    generate_rss_xml(database_items(database, lambda entry: match_entry(entry, queries)), queries)
+    return {"status": "ok", "message": f"Successfully summarized {updated_count} papers.", "updated": updated_count}
 
 if __name__ == '__main__':
     run_rss_flow()
