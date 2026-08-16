@@ -48,6 +48,9 @@
             </select>
           </label>
 
+          <details id="advancedFilters" class="advanced-filters">
+            <summary>更多筛选</summary>
+            <div class="controls controls--advanced">
           <label class="control">
             <span>研究方法</span>
             <select id="filterMethod" class="select--compact-multi" multiple size="1">
@@ -99,6 +102,9 @@
             <span>截止日期</span>
             <input id="toDate" type="date" />
           </label>
+            </div>
+            <button id="btnClearAdvancedFilters" class="btn btn--secondary btn--small" type="button">清除高级筛选</button>
+          </details>
 
           <label class="control">
             <span>排序</span>
@@ -116,6 +122,7 @@
 
         <div class="status">
           <span id="countLabel">加载中...</span>
+          <span class="keyboard-hint">快捷键（待筛选）：F 收藏 · L 稍后 · X 隐藏 · O 打开</span>
           <span id="generatedAt"></span>
         </div>
         <div id="topicCloudWrap" class="topic-cloud-wrap is-hidden">
@@ -126,6 +133,9 @@
 
       <section>
         <div id="list" class="grid"></div>
+        <div class="load-more-wrap">
+          <button id="btnLoadMore" class="btn btn--secondary" type="button" hidden>加载更多</button>
+        </div>
       </section>
     </main>
 

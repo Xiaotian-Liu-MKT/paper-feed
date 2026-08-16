@@ -237,6 +237,27 @@ h1 {
   font-size: 0.875rem;
 }
 
+.advanced-filters {
+  flex-basis: 100%;
+  border: 1px solid var(--soft);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.advanced-filters summary {
+  cursor: pointer;
+  color: #475569;
+  font-weight: 600;
+}
+
+.controls--advanced {
+  margin: 16px 0 10px;
+}
+
+.keyboard-hint {
+  color: #94a3b8;
+}
+
 .grid {
   display: flex;
   flex-direction: column;
@@ -244,6 +265,12 @@ h1 {
   /* Optimize for large lists */
   will-change: auto;
   contain: layout;
+}
+
+.load-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin: 24px 0 8px;
 }
 
 .card {
@@ -311,6 +338,43 @@ h1 {
   color: #334155;
   margin-bottom: 16px;
   line-height: 1.4;
+}
+
+.card--compact {
+  padding: 18px 20px;
+}
+
+.card--compact .card__title {
+  font-size: 1.15rem;
+  margin-bottom: 6px;
+}
+
+.card--compact .card__title_zh {
+  font-size: 1rem;
+  margin-bottom: 8px;
+}
+
+.card--compact .card__fields,
+.card--compact .card__abstract,
+.card--compact .card__edit-area,
+.card--compact .card__summary,
+.card--compact .card__toggle,
+.card--compact .action-btn--secondary {
+  display: none !important;
+}
+
+.card--compact.is-expanded .card__fields,
+.card--compact.is-expanded .card__abstract,
+.card--compact.is-expanded .card__edit-area,
+.card--compact.is-expanded .card__summary,
+.card--compact.is-expanded .card__toggle,
+.card--compact.is-expanded .action-btn--secondary {
+  display: flex !important;
+}
+
+.card--compact.is-expanded .card__summary,
+.card--compact.is-expanded .card__abstract {
+  display: block !important;
 }
 
 .card__fields {
@@ -518,6 +582,21 @@ h1 {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.card--compact .action-btn {
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  color: #334155;
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.55rem;
+}
+
+.card--compact .action-btn:focus-visible,
+.action-btn:focus-visible {
+  outline: 3px solid var(--glow);
+  outline-offset: 2px;
 }
 
 .action-btn:hover {

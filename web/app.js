@@ -4,6 +4,7 @@ const state = {
   keywords: [],
   interactions: { favorites: [], archived: [], hidden: [] },
   filterMode: 'all', // 'all' | 'favorites' | 'archived'
+  visibleLimit: 40,
   preset: "",
   focusTopics: [],
   categories: {
@@ -32,8 +33,13 @@ const elements = {
   summaryToggle: document.getElementById("summaryToggle"),
   cardTemplate: document.getElementById("cardTemplate"),
   topicCloud: document.getElementById("topicCloud"),
-  topicCloudWrap: document.getElementById("topicCloudWrap")
+  topicCloudWrap: document.getElementById("topicCloudWrap"),
+  advancedFilters: document.getElementById("advancedFilters"),
+  clearAdvancedFilters: document.getElementById("btnClearAdvancedFilters"),
+  loadMore: document.getElementById("btnLoadMore")
 };
+
+const PAGE_SIZE = 40;
 
 const formatter = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -43,6 +49,8 @@ const formatter = new Intl.DateTimeFormat("zh-CN", {
 
 let undoTimeoutId = null;
 let currentClassificationItem = null;
+let searchDebounceId = null;
+let handlersAttached = false;
 
 // --- Interaction Logic ---
 
@@ -573,15 +581,19 @@ function renderList() {
       empty.textContent = "暂时没有新的文献了...";
     }
     elements.list.appendChild(empty);
+    updateLoadMoreButton();
     return;
   }
 
   // Use DocumentFragment for batch DOM insertion (1000x faster!)
   const fragment = document.createDocumentFragment();
 
-  for (const item of state.filtered) {
+  const visibleItems = state.filtered.slice(0, state.visibleLimit);
+  const isInbox = state.filterMode === "all";
+  for (const item of visibleItems) {
     const node = elements.cardTemplate.content.cloneNode(true);
     const card = node.querySelector(".card");
+    if (isInbox) card.classList.add("card--compact");
     const meta = node.querySelector(".card__meta");
     const title = node.querySelector(".card__title");
     const titleZh = node.querySelector(".card__title_zh");
@@ -706,15 +718,20 @@ function renderList() {
     
     const btnLike = document.createElement("button");
     btnLike.className = `action-btn ${isLiked ? 'liked' : ''}`;
-    btnLike.innerHTML = isLiked ? '❤️' : '🤍';
+    btnLike.textContent = isInbox ? "收藏" : (isLiked ? '❤️' : '🤍');
     btnLike.title = isLiked ? "取消收藏" : "收藏";
+    btnLike.dataset.triageAction = "favorite";
     btnLike.onclick = function(e) { e.preventDefault(); toggleLike(item.link, this); };
 
     const btnArchive = document.createElement("button");
     btnArchive.className = "action-btn";
-    // If in favorites (not archived), show box (archive). If in archived, show upload (unarchive).
-    btnArchive.innerHTML = isArchived ? "📤" : "📦"; 
-    btnArchive.title = isArchived ? "取消归档 (回到收件箱)" : "归档 (移出收藏)";
+    btnArchive.textContent = isInbox ? "稍后" : (isArchived ? "📤" : "📦");
+    btnArchive.title = isArchived
+      ? "取消归档 (回到收件箱)"
+      : state.filterMode === "all"
+        ? "稍后阅读"
+        : "归档 (移出收藏)";
+    btnArchive.dataset.triageAction = "later";
     btnArchive.onclick = function(e) { e.preventDefault(); toggleArchive(item.link, this); };
 
     const btnRestore = document.createElement("button");
@@ -724,7 +741,7 @@ function renderList() {
     btnRestore.onclick = function(e) { e.preventDefault(); restoreFromArchive(item.link, this); };
 
     const btnClassify = document.createElement("button");
-    btnClassify.className = "action-btn";
+    btnClassify.className = "action-btn action-btn--secondary";
     btnClassify.innerHTML = '🏷️';
     btnClassify.title = "编辑分类";
     btnClassify.onclick = function(e) {
@@ -734,7 +751,7 @@ function renderList() {
 
     // Edit Abstract Button
     const btnEdit = document.createElement("button");
-    btnEdit.className = "action-btn";
+    btnEdit.className = "action-btn action-btn--secondary";
     btnEdit.innerHTML = '✏️';
     btnEdit.title = "补充/编辑摘要";
     
@@ -813,8 +830,9 @@ function renderList() {
     
     const btnHide = document.createElement("button");
     btnHide.className = "action-btn";
-    btnHide.innerHTML = '❌';
+    btnHide.textContent = isInbox ? "不感兴趣" : '❌';
     btnHide.title = "不感兴趣";
+    btnHide.dataset.triageAction = "hide";
     btnHide.onclick = function(e) { 
       e.preventDefault(); 
       toggleHide(item.link, this); 
@@ -822,6 +840,19 @@ function renderList() {
     
     actionsDiv.appendChild(btnClassify);
     actionsDiv.appendChild(btnEdit); // Add Edit button
+    if (isInbox) {
+      const btnDetails = document.createElement("button");
+      btnDetails.className = "action-btn action-btn--details";
+      btnDetails.type = "button";
+      btnDetails.textContent = "详情";
+      btnDetails.setAttribute("aria-expanded", "false");
+      btnDetails.onclick = () => {
+        const expanded = card.classList.toggle("is-expanded");
+        btnDetails.textContent = expanded ? "收起" : "详情";
+        btnDetails.setAttribute("aria-expanded", String(expanded));
+      };
+      actionsDiv.appendChild(btnDetails);
+    }
     
     // Explicit Button Logic
     if (state.filterMode === "favorites") {
@@ -835,6 +866,7 @@ function renderList() {
     } else {
       // Inbox or other
       actionsDiv.appendChild(btnLike);
+      actionsDiv.appendChild(btnArchive);
       actionsDiv.appendChild(btnHide);
     }
     
@@ -848,6 +880,45 @@ function renderList() {
 
   // Single DOM insertion instead of 1000 (avoids 1000 reflows!)
   elements.list.appendChild(fragment);
+  updateLoadMoreButton();
+}
+
+function updateLoadMoreButton() {
+  if (!elements.loadMore) return;
+  const remaining = state.filtered.length - state.visibleLimit;
+  elements.loadMore.hidden = remaining <= 0;
+  elements.loadMore.textContent = remaining > 0 ? `加载更多（${Math.min(PAGE_SIZE, remaining)}）` : "加载更多";
+}
+
+function isTypingTarget(target) {
+  return target instanceof Element && Boolean(target.closest("input, textarea, select, button, [contenteditable='true']"));
+}
+
+function handleTriageShortcut(event) {
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) return;
+  if (state.filterMode !== "all" || document.querySelector("dialog[open]")) return;
+
+  const card = elements.list.querySelector(".card:not(.hidden)");
+  if (!card) return;
+  const key = event.key.toLowerCase();
+  const actionByKey = { f: "favorite", l: "later", x: "hide" };
+
+  if (key === "o") {
+    const link = card.querySelector(".card__title");
+    if (link && link.href) {
+      event.preventDefault();
+      window.open(link.href, "_blank", "noopener");
+    }
+    return;
+  }
+
+  const action = actionByKey[key];
+  if (!action) return;
+  const button = card.querySelector(`[data-triage-action="${action}"]`);
+  if (button) {
+    event.preventDefault();
+    button.click();
+  }
 }
 
 function applyFilters() {
@@ -867,16 +938,19 @@ function applyFilters() {
   if (preset === "my_focus") {
     state.focusTopics = computeFocusTopics();
   }
+  const favorites = new Set(state.interactions.favorites);
+  const archived = new Set(state.interactions.archived);
+  const hidden = new Set(state.interactions.hidden);
 
   const filtered = state.items.filter((item) => {
     // 1. Check interactions first
-    if (state.interactions.hidden.includes(item.link)) return false;
-    if (state.filterMode === 'favorites' && !state.interactions.favorites.includes(item.link)) return false;
-    if (state.filterMode === 'archived' && !state.interactions.archived.includes(item.link)) return false;
+    if (hidden.has(item.link)) return false;
+    if (state.filterMode === 'favorites' && !favorites.has(item.link)) return false;
+    if (state.filterMode === 'archived' && !archived.has(item.link)) return false;
     // In "all" mode, hide items that have been processed (favorites or archived)
     if (state.filterMode === 'all') {
-      if (state.interactions.favorites.includes(item.link)) return false;
-      if (state.interactions.archived.includes(item.link)) return false;
+      if (favorites.has(item.link)) return false;
+      if (archived.has(item.link)) return false;
     }
 
     if (journal && item.journal !== journal) return false;
@@ -913,8 +987,7 @@ function applyFilters() {
     if (toDate && item.date > toDate) return false;
 
     if (keyword) {
-      const haystack = `${item.title} ${item.title_zh || ""} ${item.summary} ${item.abstract || ""} ${item.journal}`.toLowerCase();
-      if (!haystack.includes(keyword)) {
+      if (!item.searchText.includes(keyword)) {
         return false;
       }
     }
@@ -926,6 +999,7 @@ function applyFilters() {
   filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
 
   state.filtered = filtered;
+  state.visibleLimit = PAGE_SIZE;
   setStatus(`共 ${filtered.length} 篇`);
   renderList();
   updateTopicCloudVisibility();
@@ -1406,8 +1480,9 @@ function applyUrlFilters() {
 }
 
 function attachHandlers() {
+  if (handlersAttached) return;
+  handlersAttached = true;
   const controls = [
-    elements.searchInput,
     elements.journalSelect,
     elements.filterMethod,
     elements.filterTopic,
@@ -1429,6 +1504,38 @@ function attachHandlers() {
     control.addEventListener("input", applyFilters);
     control.addEventListener("change", applyFilters);
   });
+
+  if (elements.searchInput) {
+    elements.searchInput.addEventListener("input", () => {
+      clearTimeout(searchDebounceId);
+      searchDebounceId = setTimeout(applyFilters, 200);
+    });
+  }
+  if (elements.loadMore) {
+    elements.loadMore.addEventListener("click", () => {
+      state.visibleLimit += PAGE_SIZE;
+      renderList();
+    });
+  }
+  if (elements.advancedFilters) {
+    const saved = localStorage.getItem("paper-feed:advanced-filters");
+    elements.advancedFilters.open = saved === "open";
+    elements.advancedFilters.addEventListener("toggle", () => {
+      localStorage.setItem("paper-feed:advanced-filters", elements.advancedFilters.open ? "open" : "closed");
+    });
+  }
+  if (elements.clearAdvancedFilters) {
+    elements.clearAdvancedFilters.addEventListener("click", () => {
+      if (elements.filterMethod) setFilterSelections(elements.filterMethod, []);
+      if (elements.filterTopic) setFilterSelections(elements.filterTopic, []);
+      if (elements.filterMethodMode) elements.filterMethodMode.value = "any";
+      if (elements.filterTopicMode) elements.filterTopicMode.value = "any";
+      if (elements.filterPreset) elements.filterPreset.value = "";
+      if (elements.fromDate) elements.fromDate.value = "";
+      if (elements.toDate) elements.toDate.value = "";
+      applyFilters();
+    });
+  }
 }
 
 async function loadFeed() {
@@ -1479,7 +1586,8 @@ async function loadFeed() {
         publicationDate: parsed.publicationDate,
         source: parsed.source,
         authors: parsed.authors,
-        date: new Date(item.pub_date)
+        date: new Date(item.pub_date),
+        searchText: `${item.title || ""} ${item.title_zh || ""} ${parsed.text || ""} ${item.abstract || ""} ${item.journal || ""}`.toLowerCase()
       };
     });
 
@@ -1594,6 +1702,45 @@ const btnCancelClassification = document.getElementById("btnCancelClassification
 
 const btnSummarizeFavorites = document.getElementById("btnSummarizeFavorites");
 
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function runBackgroundJob(endpoint, button, busyLabel, idleLabel) {
+  button.disabled = true;
+  button.textContent = busyLabel;
+  try {
+    const response = await fetch(endpoint, { method: "POST" });
+    const payload = await response.json();
+    if (response.status !== 202 || !payload.job) {
+      throw new Error(payload.message || "无法启动后台任务");
+    }
+    let job = payload.job;
+    while (job.status === "queued" || job.status === "running") {
+      setStatus(job.stage === "queued" ? "任务已排队，仍可继续浏览论文。" : `正在${job.kind === "fetch" ? "更新 RSS" : job.kind === "reanalyze" ? "进行 AI 分析" : "生成 AI 总结"}…`);
+      await sleep(800);
+      const statusResponse = await fetch(`/api/jobs/${job.id}`, { cache: "no-store" });
+      if (!statusResponse.ok) throw new Error("无法读取任务状态");
+      job = await statusResponse.json();
+    }
+    if (job.status === "failed" || job.status === "cancelled") {
+      throw new Error(job.message || "任务失败，原有数据未变更。");
+    }
+    await loadFeed();
+    const failures = job.result?.failed_sources?.length || 0;
+    setStatus(failures ? `更新完成：${failures} 个来源失败，已保留成功结果。` : "任务完成。");
+    if (job.status === "partial_failed") {
+      alert(`任务完成，但有 ${failures} 个 RSS 来源失败。已发布成功来源的数据。`);
+    }
+    return job;
+  } catch (error) {
+    setStatus("任务出错；原有数据保持不变。");
+    alert("任务失败：" + error.message);
+    return null;
+  } finally {
+    button.disabled = false;
+    button.textContent = idleLabel;
+  }
+}
+
 if (btnSummarizeFavorites) {
   btnSummarizeFavorites.addEventListener("click", async () => {
     if (state.interactions.favorites.length === 0) {
@@ -1605,27 +1752,7 @@ if (btnSummarizeFavorites) {
       return;
     }
     
-    try {
-      btnSummarizeFavorites.disabled = true;
-      btnSummarizeFavorites.textContent = "生成中...";
-      setStatus("正在请求 AI 生成总结...");
-      
-      const res = await fetch("/api/summarize_favorites", { method: "POST" });
-      const result = await res.json();
-      
-      if (res.ok) {
-        setStatus("总结生成完成，正在重新加载...");
-        await loadFeed();
-        alert(result.message);
-      } else {
-        alert("生成失败: " + result.message);
-      }
-    } catch (e) {
-      alert("生成出错: " + e.message);
-    } finally {
-      btnSummarizeFavorites.disabled = false;
-      btnSummarizeFavorites.textContent = "✨ 生成 AI 总结";
-    }
+    await runBackgroundJob("/api/summarize_favorites", btnSummarizeFavorites, "生成中...", "✨ 生成 AI 总结");
   });
 }
 
@@ -1635,28 +1762,7 @@ if (btnReanalyze) {
       return;
     }
 
-    try {
-      btnReanalyze.disabled = true;
-      btnReanalyze.textContent = "分析中...";
-      setStatus("正在请求 AI 分析文章分类...");
-
-      const res = await fetch("/api/reanalyze", { method: "POST" });
-      const result = await res.json();
-
-      if (res.ok) {
-        setStatus("分析完成，正在重新加载...");
-        await loadFeed();
-        alert(`AI 分析完成！\n${result.message}`);
-      } else {
-        throw new Error(result.message || "Unknown error");
-      }
-    } catch (e) {
-      alert("分析失败：" + e.message);
-      setStatus("AI 分析出错");
-    } finally {
-      btnReanalyze.disabled = false;
-      btnReanalyze.textContent = "🧠 AI 分析";
-    }
+    await runBackgroundJob("/api/reanalyze", btnReanalyze, "分析中...", "🧠 AI 分析");
   });
 }
 
@@ -1668,7 +1774,8 @@ if (btnSettings && modal) {
       const res = await fetch("/api/config");
       if (res.ok) {
         const config = await res.json();
-        form.OPENAI_API_KEY.value = config.OPENAI_API_KEY || "";
+        form.OPENAI_API_KEY.value = "";
+        form.OPENAI_API_KEY.placeholder = config.api_key_configured ? "已配置（留空则保持不变）" : "sk-...";
         form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
         form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
       }
@@ -1813,28 +1920,7 @@ if (btnRefresh) {
       return;
     }
     
-    try {
-      btnRefresh.disabled = true;
-      btnRefresh.textContent = "更新中...";
-      setStatus("正在从服务器拉取最新论文...");
-      
-      const res = await fetch("/api/fetch", { method: "POST" });
-      const result = await res.json();
-      
-      if (res.ok) {
-        setStatus("更新完成，正在重新加载...");
-        await loadFeed(); // Reload the feed data
-        alert(`更新成功！\n${result.message}`);
-      } else {
-        throw new Error(result.message || "Unknown error");
-      }
-    } catch (e) {
-      alert("更新失败：" + e.message);
-      setStatus("更新出错");
-    } finally {
-      btnRefresh.disabled = false;
-      btnRefresh.textContent = "🔄 立即更新";
-    }
+    await runBackgroundJob("/api/fetch", btnRefresh, "更新中...", "🔄 立即更新");
   });
 }
 
@@ -1861,6 +1947,7 @@ function setupFilters() {
 
 async function init() {
   setupFilters();
+  document.addEventListener("keydown", handleTriageShortcut);
   await loadInteractions();
   await loadCategories();
   await loadFeed();

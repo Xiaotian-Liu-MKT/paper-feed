@@ -15,16 +15,19 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
 
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
+
+    - name: Run tests
+      run: python -m unittest discover -s tests -p "test_*.py" -v
 
     - name: Run RSS Script
       env: 
@@ -35,7 +38,7 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add -f filtered_feed.xml
+        git add -f filtered_feed.xml web/feed.json web/translations.json web/journals.hash
         # 只有当有新文件生成或文件变动时才提交
         git commit -m "Auto-update RSS feed" || echo "No changes to commit"
         git push

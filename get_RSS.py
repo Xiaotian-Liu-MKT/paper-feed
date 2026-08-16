@@ -5,7 +5,9 @@ import datetime
 import time
 import json
 import hashlib
+import tempfile
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rfeed import Item, Feed, Guid
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, unquote
@@ -20,11 +22,37 @@ ABSTRACTS_CACHE = os.path.join(WEB_DIR, "abstracts.json")
 CATEGORIES_FILE = os.path.join(WEB_DIR, "categories.json")
 USER_CORRECTIONS_FILE = os.path.join(WEB_DIR, "user_corrections.json")
 MAX_ITEMS = 1000
+RSS_FETCH_WORKERS = 8
+RSS_REQUEST_TIMEOUT = (5, 20)
+AI_ANALYSIS_WORKERS = 5
 ABSTRACT_FETCH_WORKERS = 5
 CLASSIFICATION_VERSION = "v2"
 
 # OpenAI 配置
 CONFIG_FILE = "config.json"
+
+
+def atomic_write(path, content, encoding="utf-8"):
+    """Durably replace *path* without exposing a partially-written file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        if isinstance(content, bytes):
+            handle = os.fdopen(fd, "wb")
+        else:
+            handle = os.fdopen(fd, "w", encoding=encoding)
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 def get_config():
     config = {
@@ -238,8 +266,7 @@ def load_translations():
     return {}
 
 def save_translations(cache):
-    with open(TRANSLATIONS_CACHE, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    atomic_write(TRANSLATIONS_CACHE, json.dumps(cache, ensure_ascii=False, indent=2))
 
 def load_categories():
     if os.path.exists(CATEGORIES_FILE):
@@ -271,8 +298,7 @@ def load_abstracts():
 
 def save_abstracts(cache):
     """保存摘要缓存"""
-    with open(ABSTRACTS_CACHE, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    atomic_write(ABSTRACTS_CACHE, json.dumps(cache, ensure_ascii=False, indent=2))
 
 def normalize_label_entries(raw_entries, valid_names=None):
     entries = []
@@ -314,7 +340,6 @@ def batch_analyze_papers(titles, api_key, base_url=None, proxy=None):
     
     from openai import OpenAI
     import httpx
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     
     http_client = None
     if proxy:
@@ -404,8 +429,9 @@ Example:
             print(f"Analysis error for chunk: {e}")
             return []
 
-    print(f"Starting concurrent analysis with 20 threads for {len(chunks)} chunks...")
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    worker_count = min(AI_ANALYSIS_WORKERS, len(chunks))
+    print(f"Starting concurrent analysis with {worker_count} workers for {len(chunks)} chunks...")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_to_chunk = {executor.submit(analyze_chunk, chunk): chunk for chunk in chunks}
 
         completed = 0
@@ -567,12 +593,32 @@ def convert_struct_time_to_datetime(struct_time):
         return datetime.datetime.now()
     return datetime.datetime.fromtimestamp(time.mktime(struct_time))
 
-def parse_rss(rss_url, retries=3):
-    # (保持不变)
+def fetch_rss_result(rss_url, retries=3):
+    """Fetch one source and retain enough status information for job reporting."""
     print(f"Fetching: {rss_url}...")
-    for attempt in range(retries):
+    retries = max(1, retries)
+    last_error = None
+    last_status = None
+    for attempt in range(1, retries + 1):
         try:
-            feed = feedparser.parse(rss_url)
+            response = requests.get(
+                rss_url,
+                headers={"User-Agent": "Paper-Feed/1.0 (+https://github.com/Xiaotian-Liu-MKT/paper-feed)"},
+                timeout=RSS_REQUEST_TIMEOUT,
+            )
+            last_status = getattr(response, "status_code", None)
+            if last_status is not None and not 200 <= last_status < 300:
+                last_error = f"HTTP {last_status}"
+                # Client errors (including 404) will not improve with a retry.
+                retryable = last_status == 429 or last_status >= 500
+                print(f"Error fetching {rss_url} (attempt {attempt}/{retries}): {last_error}")
+                if not retryable:
+                    break
+                if attempt < retries:
+                    time.sleep(2 ** (attempt - 1))
+                continue
+
+            feed = feedparser.parse(response.content)
             entries = []
             journal_title = feed.feed.get('title', 'Unknown Journal')
             
@@ -589,11 +635,35 @@ def parse_rss(rss_url, retries=3):
                     'journal': journal_title,
                     'id': entry.get('id', entry.get('link', ''))
                 })
-            return entries
+            return {
+                "url": rss_url,
+                "success": True,
+                "entries": entries,
+                "status_code": last_status,
+                "attempts": attempt,
+                "error": None,
+            }
+        except (requests.RequestException, OSError) as e:
+            last_error = str(e)
+            print(f"Error fetching {rss_url} (attempt {attempt}/{retries}): {e}")
         except Exception as e:
-            print(f"Error parsing {rss_url}: {e}")
-            time.sleep(2)
-    return []
+            last_error = str(e)
+            print(f"Error parsing {rss_url} (attempt {attempt}/{retries}): {e}")
+        if attempt < retries:
+            time.sleep(2 ** (attempt - 1))
+    return {
+        "url": rss_url,
+        "success": False,
+        "entries": [],
+        "status_code": last_status,
+        "attempts": attempt,
+        "error": last_error or "unknown fetch failure",
+    }
+
+
+def parse_rss(rss_url, retries=3):
+    """Backward-compatible entry-only interface for callers outside the job flow."""
+    return fetch_rss_result(rss_url, retries=retries)["entries"]
 
 def get_existing_items():
     # (保持不变，但增加容错：如果 XML 坏了，就返回空列表重新抓)
@@ -614,16 +684,16 @@ def get_existing_items():
         for entry in feed.entries:
             pub_struct = entry.get('published_parsed')
             pub_date = convert_struct_time_to_datetime(pub_struct)
-            
-        entries.append({
-            'title': entry.get('title', ''),
-            'link': entry.get('link', ''),
-            'pub_date': pub_date,
-            'summary': entry.get('summary', ''),
-            'journal': entry.get('author', ''),
-            'id': entry.get('id', entry.get('link', '')),
-            'is_old': True
-        })
+
+            entries.append({
+                'title': entry.get('title', ''),
+                'link': entry.get('link', ''),
+                'pub_date': pub_date,
+                'summary': entry.get('summary', ''),
+                'journal': entry.get('author', ''),
+                'id': entry.get('id', entry.get('link', '')),
+                'is_old': True
+            })
         return entries
     except Exception as e:
         print(f"Error reading existing file: {e}")
@@ -685,8 +755,7 @@ def generate_rss_xml(items, queries):
         items = rss_items
     )
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(feed.rss())
+    atomic_write(OUTPUT_FILE, feed.rss())
     print(f"Successfully generated {OUTPUT_FILE} with {len(rss_items)} items.")
 
 def write_feed_json(items, queries):
@@ -848,8 +917,7 @@ def write_feed_json(items, queries):
         "items": data
     }
 
-    with open(FEED_JSON, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=True, indent=2)
+    atomic_write(FEED_JSON, json.dumps(payload, ensure_ascii=True, indent=2))
     print(f"Generated {FEED_JSON} with {len(data)} items.")
 
 def compute_journal_hash(journals):
@@ -863,7 +931,7 @@ def run_rss_flow():
     
     if not rss_urls or not queries:
         print("Error: Configuration files are empty or missing.")
-        return
+        return {"successful_sources": [], "failed_sources": [], "new_items": 0, "published": False}
 
     os.makedirs(WEB_DIR, exist_ok=True)
     journal_hash = compute_journal_hash(rss_urls)
@@ -875,30 +943,64 @@ def run_rss_flow():
     if prev_hash and prev_hash != journal_hash:
         print("Journal list changed. Keeping cached history; only future updates are affected.")
 
-    with open(JOURNAL_HASH_FILE, "w", encoding="utf-8") as f:
-        f.write(journal_hash)
+    print("Starting RSS fetch from remote...")
+    with ThreadPoolExecutor(max_workers=min(RSS_FETCH_WORKERS, len(rss_urls))) as executor:
+        futures = {executor.submit(fetch_rss_result, url): index for index, url in enumerate(rss_urls)}
+        fetched_by_index = [None for _ in rss_urls]
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                fetched_by_index[index] = future.result()
+            except Exception as e:
+                print(f"Unexpected RSS worker failure for {rss_urls[index]}: {e}")
+                fetched_by_index[index] = {
+                    "url": rss_urls[index], "success": False, "entries": [],
+                    "status_code": None, "attempts": 0, "error": str(e),
+                }
+
+    successful_sources = [result["url"] for result in fetched_by_index if result and result["success"]]
+    failed_sources = [result["url"] for result in fetched_by_index if not result or not result["success"]]
+    if not successful_sources:
+        print("All RSS sources failed; keeping existing feed outputs unchanged.")
+        return {
+            "successful_sources": successful_sources,
+            "failed_sources": failed_sources,
+            "new_items": 0,
+            "published": False,
+        }
+
+    # A successful fetch authorizes publication, including runs where no matching
+    # new entries were found. Do not update this marker on a total fetch outage.
+    atomic_write(JOURNAL_HASH_FILE, journal_hash)
 
     existing_entries = get_existing_items()
     seen_ids = set(entry['id'] for entry in existing_entries)
-    
-    all_entries = existing_entries.copy()
+
+    # Reapply the current keyword rules to the historical feed. This both repairs
+    # older over-inclusive feeds and keeps the displayed inbox intentionally small.
+    all_entries = [entry for entry in existing_entries if match_entry(entry, queries)]
     new_count = 0
 
-    print("Starting RSS fetch from remote...")
-    for url in rss_urls:
-        fetched_entries = parse_rss(url)
-        for entry in fetched_entries:
+    for result in fetched_by_index:
+        for entry in result["entries"]:
             if entry['id'] in seen_ids:
                 continue
-            
-            all_entries.append(entry)
             seen_ids.add(entry['id'])
-            new_count += 1
             if match_entry(entry, queries):
+                all_entries.append(entry)
+                new_count += 1
                 print(f"Keyword match: {entry['title'][:50]}...")
 
+    all_entries.sort(key=lambda entry: entry['pub_date'], reverse=True)
+    all_entries = all_entries[:MAX_ITEMS]
     print(f"Added {new_count} new entries.")
     generate_rss_xml(all_entries, queries)
+    return {
+        "successful_sources": successful_sources,
+        "failed_sources": failed_sources,
+        "new_items": new_count,
+        "published": True,
+    }
 
 def run_reanalysis_flow():
     """只运行 AI 分析，不抓取 RSS"""
@@ -909,13 +1011,13 @@ def run_reanalysis_flow():
     api_key = config.get("OPENAI_API_KEY")
     if not api_key:
         print("Error: No API Key configured.")
-        return
+        return {"status": "error", "message": "No API Key configured."}
 
     # 2. Load existing items from XML (source of truth)
     items = get_existing_items()
     if not items:
         print("No items found to analyze.")
-        return
+        return {"status": "ok", "message": "No items found to analyze."}
 
     # 3. Load cache
     translation_cache = load_translations()
@@ -967,7 +1069,7 @@ def run_reanalysis_flow():
         # Still need to regenerate JSON to reflect any manual changes
         queries = load_config('keywords.dat', 'RSS_KEYWORDS')
         write_feed_json(items, queries)
-        return
+        return {"status": "ok", "message": "All items already analyzed."}
 
     print(f"Found {len(titles_to_analyze)} items needing AI analysis...")
     
@@ -984,6 +1086,7 @@ def run_reanalysis_flow():
     queries = load_config('keywords.dat', 'RSS_KEYWORDS')
     write_feed_json(items, queries)
     print("Re-analysis complete.")
+    return {"status": "ok", "message": f"Updated {len(new_results)} paper analyses."}
 
 def summarize_specific_papers(target_ids):
     """

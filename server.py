@@ -6,6 +6,10 @@ import sys
 import datetime
 import html
 import re
+import tempfile
+import threading
+import queue
+import uuid
 from functools import partial
 
 # 导入 RSS 抓取逻辑
@@ -27,6 +31,150 @@ USER_CORRECTIONS_FILE = os.path.join(WEB_DIR, "user_corrections.json")
 JOURNALS_FILE = "journals.dat"
 JOURNALS_META_FILE = "journals_meta.json"
 RSS_LIST_FILE = "RSS list.md"
+FILE_LOCK = threading.RLock()
+
+
+def atomic_write_text(path, content, encoding="utf-8"):
+    """Replace a file only after its complete contents reach disk."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".paper-feed-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path, payload, ensure_ascii=False):
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=ensure_ascii, indent=2))
+
+
+class JobRunner:
+    """One local worker prevents concurrent refresh/reanalysis writes."""
+    def __init__(self):
+        self._jobs = {}
+        self._lock = threading.RLock()
+        self._queue = queue.Queue()
+        self._worker = threading.Thread(target=self._run, daemon=True, name="paper-feed-jobs")
+        self._worker.start()
+
+    def enqueue(self, kind, action):
+        with self._lock:
+            for job in self._jobs.values():
+                if job["kind"] == kind and job["status"] in {"queued", "running"}:
+                    return dict(job), True
+            job_id = uuid.uuid4().hex
+            job = {"id": job_id, "kind": kind, "status": "queued", "stage": "queued",
+                   "progress": 0, "message": "任务已排队", "started_at": None,
+                   "finished_at": None, "result": None}
+            self._jobs[job_id] = job
+            self._queue.put((job_id, action))
+            return dict(job), False
+
+    def get(self, job_id):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return dict(job) if job else None
+
+    def _run(self):
+        while True:
+            job_id, action = self._queue.get()
+            with self._lock:
+                job = self._jobs[job_id]
+                job.update(status="running", stage="processing", progress=10,
+                           message="任务正在执行", started_at=datetime.datetime.now().isoformat())
+            try:
+                result = action() or {}
+                status = "succeeded"
+                if isinstance(result, dict) and result.get("status") == "error":
+                    status = "failed"
+                elif isinstance(result, dict) and result.get("published") is False and not result.get("successful_sources"):
+                    status = "failed"
+                elif isinstance(result, dict) and result.get("failed_sources"):
+                    status = "partial_failed"
+                with self._lock:
+                    job.update(status=status, stage="completed", progress=100,
+                               message="任务完成" if status == "succeeded" else "任务完成，部分来源失败",
+                               finished_at=datetime.datetime.now().isoformat(), result=result)
+            except Exception as error:
+                with self._lock:
+                    job.update(status="failed", stage="failed", progress=100,
+                               message=str(error), finished_at=datetime.datetime.now().isoformat(), result={})
+            finally:
+                self._queue.task_done()
+
+
+JOB_RUNNER = JobRunner()
+
+
+def run_fetch_job():
+    return run_rss_flow()
+
+
+def run_reanalysis_job():
+    from get_RSS import run_reanalysis_flow
+    return run_reanalysis_flow()
+
+
+def run_summarize_job():
+    with FILE_LOCK:
+        data = {"favorites": []}
+        if os.path.exists(INTERACTIONS_FILE):
+            with open(INTERACTIONS_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+    favorites = data.get("favorites", [])
+    if not favorites:
+        return {"message": "No favorites to summarize.", "summarized": 0}
+    return summarize_specific_papers(favorites)
+
+
+def apply_interaction_change(request_data):
+    """Lock the full read-modify-write cycle for short user interactions."""
+    with FILE_LOCK:
+        data = {"favorites": [], "archived": [], "hidden": []}
+        if os.path.exists(INTERACTIONS_FILE):
+            try:
+                with open(INTERACTIONS_FILE, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                pass
+        for key in data:
+            if not isinstance(data.get(key), list):
+                data[key] = []
+        action = request_data.get("action")
+        item_id = request_data.get("id")
+        if not action or not item_id:
+            raise ValueError("Missing interaction action or id")
+        transitions = {
+            "like": ("favorites", ("hidden", "archived")),
+            "archive": ("archived", ("favorites", "hidden")),
+            "restore": ("favorites", ("archived", "hidden")),
+            "hide": ("hidden", ("favorites", "archived")),
+        }
+        removals = {"unlike": "favorites", "unarchive": "archived", "unhide": "hidden"}
+        if action in transitions:
+            destination, remove_from = transitions[action]
+            if item_id not in data[destination]:
+                data[destination].append(item_id)
+            for key in remove_from:
+                if item_id in data[key]:
+                    data[key].remove(item_id)
+        elif action in removals:
+            key = removals[action]
+            if item_id in data[key]:
+                data[key].remove(item_id)
+        else:
+            raise ValueError("Unknown interaction action")
+        atomic_write_json(INTERACTIONS_FILE, data)
+        return data
 
 TITLE_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
@@ -538,8 +686,8 @@ def generate_title_report():
     # 生成智能洞察（需要在report之后，因为它依赖report内容）
     report['insights_summary'] = generate_insights_summary(report)
 
-    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2, ensure_ascii=True)
+    with FILE_LOCK:
+        atomic_write_json(REPORT_FILE, report, ensure_ascii=True)
 
     return {"status": "ok", "report": report}
 
@@ -571,8 +719,8 @@ def load_journal_meta():
 
 def save_journal_meta(meta):
     try:
-        with open(JOURNALS_META_FILE, 'w', encoding='utf-8') as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        with FILE_LOCK:
+            atomic_write_json(JOURNALS_META_FILE, meta)
     except:
         pass
 
@@ -619,8 +767,8 @@ def load_categories():
         return {}
 
 def save_categories(payload):
-    with open(CATEGORIES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with FILE_LOCK:
+        atomic_write_json(CATEGORIES_FILE, payload)
 
 def load_user_corrections():
     if not os.path.exists(USER_CORRECTIONS_FILE):
@@ -632,8 +780,8 @@ def load_user_corrections():
         return {}
 
 def save_user_corrections(payload):
-    with open(USER_CORRECTIONS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with FILE_LOCK:
+        atomic_write_json(USER_CORRECTIONS_FILE, payload)
 
 def normalize_label_entries(raw_entries):
     entries = []
@@ -677,13 +825,20 @@ def update_feed_item_classification(item_id, updated):
             changed = True
             break
     if changed:
-        with open(FEED_FILE, 'w', encoding='utf-8') as f:
-            json.dump(feed, f, ensure_ascii=True, indent=2)
+        with FILE_LOCK:
+            atomic_write_json(FEED_FILE, feed, ensure_ascii=True)
 
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         # 设置静态文件根目录为 web/
         super().__init__(*args, directory=WEB_DIR, **kwargs)
+
+    def send_json(self, status_code, payload):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
 
     def do_GET(self):
         # 解析路径，忽略 query parameters
@@ -699,9 +854,20 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
             config = get_config()
-            # 处于安全考虑，返回时可以脱敏，或者因为是本地运行，直接返回方便编辑
-            # 这里直接返回
-            self.wfile.write(json.dumps(config).encode('utf-8'))
+            safe_config = {
+                "api_key_configured": bool(config.get("OPENAI_API_KEY")),
+                "OPENAI_BASE_URL": config.get("OPENAI_BASE_URL") or "",
+                "OPENAI_PROXY": config.get("OPENAI_PROXY") or ""
+            }
+            self.wfile.write(json.dumps(safe_config).encode('utf-8'))
+            return
+
+        if path.startswith('/api/jobs/'):
+            job = JOB_RUNNER.get(path.rsplit('/', 1)[-1])
+            if not job:
+                self.send_json(404, {"status": "error", "message": "Job not found"})
+            else:
+                self.send_json(200, job)
             return
 
         if path == '/api/journals':
@@ -805,69 +971,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             try:
                 req_data = json.loads(post_data.decode('utf-8'))
-                
-                # Load existing
-                data = {"favorites": [], "archived": [], "hidden": []}
-                if os.path.exists(INTERACTIONS_FILE):
-                    try:
-                        with open(INTERACTIONS_FILE, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                    except:
-                        pass
-
-                for key in ["favorites", "archived", "hidden"]:
-                    if not isinstance(data.get(key), list):
-                        data[key] = []
-                
-                action = req_data.get("action")
-                item_id = req_data.get("id") # Using link as ID
-                
-                if action and item_id:
-                    if action == "like":
-                        if item_id not in data["favorites"]:
-                            data["favorites"].append(item_id)
-                        if item_id in data["hidden"]:
-                            data["hidden"].remove(item_id)
-                        if item_id in data["archived"]:
-                            data["archived"].remove(item_id)
-                    elif action == "unlike":
-                        if item_id in data["favorites"]:
-                            data["favorites"].remove(item_id)
-                    elif action == "archive":
-                        if item_id not in data["archived"]:
-                            data["archived"].append(item_id)
-                        if item_id in data["favorites"]:
-                            data["favorites"].remove(item_id)
-                        if item_id in data["hidden"]:
-                            data["hidden"].remove(item_id)
-                    elif action == "unarchive":
-                        if item_id in data["archived"]:
-                            data["archived"].remove(item_id)
-                    elif action == "restore":
-                        if item_id not in data["favorites"]:
-                            data["favorites"].append(item_id)
-                        if item_id in data["archived"]:
-                            data["archived"].remove(item_id)
-                        if item_id in data["hidden"]:
-                            data["hidden"].remove(item_id)
-                    elif action == "hide":
-                        if item_id not in data["hidden"]:
-                            data["hidden"].append(item_id)
-                        if item_id in data["favorites"]:
-                            data["favorites"].remove(item_id)
-                        if item_id in data["archived"]:
-                            data["archived"].remove(item_id)
-                    elif action == "unhide":
-                        if item_id in data["hidden"]:
-                            data["hidden"].remove(item_id)
-                
-                with open(INTERACTIONS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                    
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(data).encode('utf-8'))
+                data = apply_interaction_change(req_data)
+                self.send_json(200, data)
+                return
             except Exception as e:
                 self.send_response(500)
                 self.end_headers()
@@ -875,33 +981,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         if self.path == '/api/summarize_favorites':
-            print("Received summarize favorites request...")
-            try:
-                # Load interactions
-                favorites = []
-                if os.path.exists(INTERACTIONS_FILE):
-                    with open(INTERACTIONS_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        favorites = data.get("favorites", [])
-                
-                if not favorites:
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "ok", "message": "No favorites to summarize."}).encode('utf-8'))
-                    return
-
-                result = summarize_specific_papers(favorites)
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode('utf-8'))
-            except Exception as e:
-                print(f"Summarize error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            job, duplicate = JOB_RUNNER.enqueue("summarize", run_summarize_job)
+            self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
         if self.path == '/api/preference_report':
@@ -1045,12 +1126,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                         current_config = json.load(f)
                 
+                # A blank password field means "keep the existing key" because
+                # read APIs deliberately never return secrets to the browser.
+                if not new_config.get("OPENAI_API_KEY"):
+                    new_config.pop("OPENAI_API_KEY", None)
                 current_config.update(new_config)
                 
                 # 写入文件
                 # 这里的 CONFIG_FILE 是在根目录下，不是 web/ 下，更安全
-                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(current_config, f, ensure_ascii=False, indent=2)
+                with FILE_LOCK:
+                    atomic_write_json(CONFIG_FILE, current_config)
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
@@ -1083,11 +1168,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         cleaned.append(value)
                         seen.add(value)
 
-                with open(JOURNALS_FILE, 'w', encoding='utf-8') as f:
-                    if cleaned:
-                        f.write("\n".join(cleaned) + "\n")
-                    else:
-                        f.write("")
+                with FILE_LOCK:
+                    atomic_write_text(JOURNALS_FILE, "\n".join(cleaned) + ("\n" if cleaned else ""))
 
                 meta = {}
                 if meta_payload is None:
@@ -1142,37 +1224,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         if self.path == '/api/reanalyze':
-            print("Received re-analyze request...")
-            try:
-                from get_RSS import run_reanalysis_flow
-                run_reanalysis_flow()
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Re-analysis completed"}).encode('utf-8'))
-            except Exception as e:
-                print(f"Re-analyze error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            job, duplicate = JOB_RUNNER.enqueue("reanalyze", run_reanalysis_job)
+            self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
         if self.path == '/api/fetch':
-            print("Received fetch request...")
-            try:
-                # 运行爬虫和翻译
-                run_rss_flow()
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Fetch completed"}).encode('utf-8'))
-            except Exception as e:
-                print(f"Fetch error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            job, duplicate = JOB_RUNNER.enqueue("fetch", run_fetch_job)
+            self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
         # 如果不是上述 API，返回 404
@@ -1181,8 +1239,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
 def run_server():
     # 允许地址重用，防止重启时端口被占
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(('', PORT), CustomHandler) as httpd:
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    with http.server.ThreadingHTTPServer(('127.0.0.1', PORT), CustomHandler) as httpd:
         print(f"Server started at http://localhost:{PORT}")
         print("Press Ctrl+C to stop.")
         try:
