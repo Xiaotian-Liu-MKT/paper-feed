@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from paper_feed.db import SCHEMA_VERSION, PaperRepository, connect
+from paper_feed.exporter import database_items
 from paper_feed.importer import LegacyImporter
 
 
@@ -52,6 +53,68 @@ class PaperFeedStorageTests(unittest.TestCase):
             self.assertEqual(first, by_url)
             self.assertEqual(science_direct, clean_science_direct)
             repo.conn.close()
+
+    def test_distinct_publisher_records_with_shared_front_matter_do_not_merge(self):
+        """Real RSS front matter can share title, journal, and publication date."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = PaperRepository(connect(os.path.join(directory, "p.sqlite3")))
+            with repo.transaction():
+                first = repo.resolve({
+                    "source": "legacy_xml", "id": "https://www.sciencedirect.com/science/article/pii/S0167811626000388",
+                    "title": "Editorial Board", "journal": "International Journal of Research in Marketing",
+                    "pub_date": "Sun, 16 Aug 2026 06:20:51 GMT",
+                    "link": "https://www.sciencedirect.com/science/article/pii/S0167811626000388?dgcid=rss_sd_all",
+                })
+                second = repo.resolve({
+                    "source": "legacy_xml", "id": "https://www.sciencedirect.com/science/article/pii/S0167811626000479",
+                    "title": "Editorial Board", "journal": "International Journal of Research in Marketing",
+                    "pub_date": "Sun, 16 Aug 2026 06:20:51 GMT",
+                    "link": "https://www.sciencedirect.com/science/article/pii/S0167811626000479?dgcid=rss_sd_all",
+                })
+            self.assertNotEqual(first, second)
+            self.assertEqual(repo.conn.execute("SELECT count(*) FROM papers").fetchone()[0], 2)
+            repo.conn.close()
+
+    def test_importer_merges_matching_xml_and_json_legacy_guids_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = b'''<?xml version="1.0"?><rss><channel><item><title>Canonical title</title>
+                <link>https://publisher.test/article/original</link><guid>shared-legacy-guid</guid>
+                <pubDate>2026-08-16</pubDate><author>Journal</author></item></channel></rss>'''
+            (root / "filtered_feed.xml").write_bytes(xml)
+            # The JSON projection may contain normalized display text and a
+            # rewritten link; its legacy GUID remains the import bridge.
+            write_json(directory, "feed.json", {"items": [{
+                "id": "shared-legacy-guid", "title": "Normalized title",
+                "link": "https://publisher.test/article/normalized", "journal": "Journal",
+                "pub_date": "2026-08-16",
+            }, {
+                "id": "stale-local-only", "title": "Must not expand XML history",
+                "link": "https://publisher.test/article/stale", "journal": "Journal",
+                "pub_date": "2026-08-16",
+            }]})
+            database = os.path.join(directory, "data", "paper_feed.sqlite3")
+            first = LegacyImporter(directory, database).run()
+            second = LegacyImporter(directory, database).run()
+            conn = connect(database)
+            self.assertEqual((first["database"]["papers"], second["database"]["papers"]), (1, 1))
+            self.assertEqual(conn.execute("SELECT count(*) FROM paper_observations").fetchone()[0], 2)
+            conn.close()
+
+    def test_clean_xml_bootstrap_preserves_distinct_same_front_matter_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = "https://www.sciencedirect.com/science/article/pii/S0167811626000388"
+            second = "https://www.sciencedirect.com/science/article/pii/S0167811626000479"
+            xml = f'''<?xml version="1.0"?><rss><channel>
+                <item><title>Editorial Board</title><link>{first}?dgcid=rss_sd_all</link><guid>{first}</guid><pubDate>Sun, 16 Aug 2026 06:20:51 GMT</pubDate><author>International Journal of Research in Marketing</author></item>
+                <item><title>Editorial Board</title><link>{second}?dgcid=rss_sd_all</link><guid>{second}</guid><pubDate>Sun, 16 Aug 2026 06:20:51 GMT</pubDate><author>International Journal of Research in Marketing</author></item>
+                </channel></rss>'''
+            (root / "filtered_feed.xml").write_text(xml, encoding="utf-8")
+            database = os.path.join(directory, "data", "paper_feed.sqlite3")
+            outcome = LegacyImporter(directory, database).run(_backup_enabled=False)
+            self.assertEqual(outcome["database"]["papers"], 2)
+            self.assertEqual([item["id"] for item in database_items(database)], [first, second])
 
     def test_doi_abs_pages_are_not_treated_as_arxiv(self):
         with tempfile.TemporaryDirectory() as directory:

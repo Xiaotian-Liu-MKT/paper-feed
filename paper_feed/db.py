@@ -88,9 +88,15 @@ class PaperRepository:
     def resolve(self, record, create=True):
         """Return a durable paper_id; title-only records never merge."""
         choices = identifiers(record)
-        paper_fingerprint = fingerprint(record)
-        if paper_fingerprint:
-            choices.append(paper_fingerprint)
+        # A title/journal/date fingerprint is only a fallback for records with
+        # no durable identifier at all.  Publisher front matter can legitimately
+        # share all three fields while carrying distinct DOI/PII/URL identities.
+        # Treating the fingerprint as an additional matching key merged those
+        # distinct legacy RSS entries during CI bootstrap.
+        if not choices:
+            paper_fingerprint = fingerprint(record)
+            if paper_fingerprint:
+                choices.append(paper_fingerprint)
         matched_ids = {
             row[0]
             for kind, value in choices
@@ -119,12 +125,30 @@ class PaperRepository:
                  record.get("pub_date"), canonical_url(record.get("link")), stamp, stamp),
             )
 
+        self._claim_identifiers(paper_id, choices, stamp)
+        return paper_id
+
+    def attach_record_identifiers(self, paper_id, record):
+        """Attach durable identifiers after an importer matched a legacy alias."""
+        choices = identifiers(record)
+        if not choices:
+            paper_fingerprint = fingerprint(record)
+            if paper_fingerprint:
+                choices.append(paper_fingerprint)
+        self._claim_identifiers(paper_id, choices, now())
+
+    def _claim_identifiers(self, paper_id, choices, stamp):
         for kind, value in choices:
+            row = self.conn.execute(
+                "SELECT paper_id FROM paper_identifiers WHERE identifier_type=? AND identifier_value=?",
+                (kind, value),
+            ).fetchone()
+            if row and row[0] != paper_id:
+                raise ValueError("conflicting existing paper identities")
             self.conn.execute(
                 "INSERT OR IGNORE INTO paper_identifiers VALUES (?, ?, ?, ?)",
                 (kind, value, paper_id, stamp),
             )
-        return paper_id
 
     def ensure_inbox(self, paper_id):
         stamp = now()

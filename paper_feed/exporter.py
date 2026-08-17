@@ -37,6 +37,18 @@ def _rss_date(value):
     return format_datetime(stamp.astimezone(timezone.utc), usegmt=True)
 
 
+def _legacy_order(item):
+    try:
+        return int(item.get("_legacy_order"))
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _sort_items(items):
+    """Newest first, preserving legacy RSS order for equal timestamps."""
+    return sorted(items, key=lambda item: (-_date_key(item.get("pub_date")), _legacy_order(item), item["paper_id"]))
+
+
 def database_items(database, predicate=None):
     """Return all durable papers (the caller may impose a display predicate)."""
     conn = connect(database)
@@ -64,7 +76,7 @@ def database_items(database, predicate=None):
             if predicate is None or predicate(item):
                 items.append(item)
         # Stable newest-first ordering before any export limit is applied.
-        return sorted(sorted(items, key=lambda item: item["paper_id"]), key=lambda item: _date_key(item.get("pub_date")), reverse=True)
+        return _sort_items(items)
     finally:
         conn.close()
 
@@ -76,7 +88,7 @@ def _labels(value):
 
 def export_items(items, xml_path, json_path, queries=(), limit=1000, atomic_write=None):
     """Atomically write legacy XML/JSON; limits only the presentation, never DB."""
-    items = sorted(sorted(items, key=lambda item: item["paper_id"]), key=lambda item: _date_key(item.get("pub_date")), reverse=True)[:limit]
+    items = _sort_items(items)[:limit]
     data = []
     for item in items:
         translation, abstract, correction = (item.get("translation") or {}), (item.get("abstract") or {}), (item.get("user_correction") or {})

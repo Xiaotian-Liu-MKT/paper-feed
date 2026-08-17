@@ -1003,11 +1003,13 @@ def run_rss_flow():
     # new entries were found. Do not update this marker on a total fetch outage.
     atomic_write(JOURNAL_HASH_FILE, journal_hash)
 
-    # Filtering and exports are both projections of SQLite.  Unlike the old XML
-    # implementation, no local history is capped at MAX_ITEMS.
-    all_entries = database_items(database, lambda entry: match_entry(entry, queries))
+    # SQLite contains the accepted history.  Keywords are deliberately applied
+    # only while ingesting newly fetched observations above; reapplying them here
+    # would make a changed RSS_KEYWORDS secret erase previously published papers
+    # from the compatibility exports (and from CI's legacy bootstrap).
+    all_entries = database_items(database)
     analyze_database_items(database, all_entries)
-    all_entries = database_items(database, lambda entry: match_entry(entry, queries))
+    all_entries = database_items(database)
     new_count = ingestion["new_observations"]
     print(f"Added {new_count} fetched matching entries.")
     generate_rss_xml(all_entries, queries)
@@ -1027,9 +1029,11 @@ def run_reanalysis_flow():
         return {"status": "error", "message": "No API Key configured."}
     database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
     queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-    items = database_items(database, lambda entry: match_entry(entry, queries))
+    # Reanalysis enriches every durable paper; current fetch keywords do not
+    # redefine the already accepted historical collection.
+    items = database_items(database)
     saved = analyze_database_items(database, items, config)
-    items = database_items(database, lambda entry: match_entry(entry, queries))
+    items = database_items(database)
     generate_rss_xml(items, queries)
     return {"status": "ok", "message": f"Updated {saved} paper analyses.", "updated": saved}
 
@@ -1070,7 +1074,9 @@ def summarize_specific_papers(target_ids):
             updates[item["paper_id"]] = payload
     updated_count = save_db_abstracts(database, updates)
     queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-    generate_rss_xml(database_items(database, lambda entry: match_entry(entry, queries)), queries)
+    # Summarizing selected papers must regenerate the complete durable history,
+    # regardless of later changes to the fetch keyword configuration.
+    generate_rss_xml(database_items(database), queries)
     return {"status": "ok", "message": f"Successfully summarized {updated_count} papers.", "updated": updated_count}
 
 if __name__ == '__main__':

@@ -31,23 +31,45 @@ class LegacyImporter:
 
     def records(self):
         records = []
+        xml_orders = {}
         xml_path = self.root / "filtered_feed.xml"
         if xml_path.exists():
             for _, item in ET.iterparse(xml_path, events=("end",)):
                 if item.tag.rsplit("}", 1)[-1] != "item":
                     continue
                 values = {child.tag.rsplit("}", 1)[-1]: child.text or "" for child in item}
-                records.append({
+                record = {
                     "source": "legacy_xml", "guid": values.get("guid"), "id": values.get("guid"),
                     "title": values.get("title"), "link": values.get("link"),
                     "journal": values.get("author"), "pub_date": values.get("pubDate"),
                     "summary": values.get("description"),
-                })
+                    # RSS has many equal publication timestamps.  Retain its
+                    # original stable order so a clean CI bootstrap can emit a
+                    # byte-order-compatible rolling projection.
+                    "_legacy_order": len(records),
+                }
+                records.append(record)
+                if record["id"]:
+                    xml_orders.setdefault(str(record["id"]), record["_legacy_order"])
                 item.clear()
         feed = read_json(self.root / "web/feed.json", {}).get("items", [])
         for item in feed:
             if isinstance(item, dict):
-                records.append({"source": "legacy_feed", "guid": item.get("id"), **item})
+                legacy_key = item.get("id")
+                # filtered_feed.xml is the committed, portable compatibility
+                # baseline.  A local web/feed.json is an ignored cache and can
+                # be stale or from a different prior projection; it may enrich
+                # matching XML records but must not silently expand a clean
+                # bootstrap into their accidental union.
+                if xml_orders and str(legacy_key) not in xml_orders:
+                    continue
+                records.append({
+                    "source": "legacy_feed", "guid": legacy_key,
+                    # When both projections exist, XML is the committed
+                    # compatibility baseline; keep its tie-break position.
+                    "_legacy_order": xml_orders.get(str(legacy_key), len(records)),
+                    **item,
+                })
         return records
 
     def backup_legacy_files(self):
@@ -124,8 +146,17 @@ class LegacyImporter:
     def _import_records(self, conn, repo, records, summary, unresolved, fail_after):
         for index, record in enumerate(records, 1):
             try:
-                paper_id = repo.resolve(record)
-                repo.add_legacy_alias(paper_id, record.get("id") or record.get("guid"))
+                legacy_key = record.get("id") or record.get("guid")
+                # XML and JSON compatibility exports describe the same legacy
+                # paper set but carry different source labels.  Resolve their
+                # shared legacy GUID first, so importing both files cannot turn
+                # one feed into two partially overlapping collections.
+                paper_id = repo.legacy_paper_id(legacy_key) if legacy_key else None
+                if paper_id:
+                    repo.attach_record_identifiers(paper_id, record)
+                else:
+                    paper_id = repo.resolve(record)
+                repo.add_legacy_alias(paper_id, legacy_key)
                 repo.ensure_inbox(paper_id)
             except ValueError as exc:
                 unresolved.append(("record", str(record.get("id") or record.get("link") or index), str(exc), record))

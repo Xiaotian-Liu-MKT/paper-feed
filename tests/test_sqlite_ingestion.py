@@ -74,6 +74,20 @@ class SQLiteIngestionTests(unittest.TestCase):
         analyze.assert_called_once()
         self.assertEqual(database_items(self.db)[0]["translation"]["zh"], "中文")
 
+    def test_reanalysis_exports_full_history_after_keywords_change(self):
+        self.ingest([{"url": "one", "success": True, "entries": [entry(1)]}])
+        xml, feed = os.path.join(self.temp.name, "out.xml"), os.path.join(self.temp.name, "web", "feed.json")
+        with patch.dict(os.environ, {"PAPER_FEED_DB": self.db}), \
+             patch.object(get_RSS, "get_config", return_value={"OPENAI_API_KEY": "test"}), \
+             patch.object(get_RSS, "load_config", return_value=["unrelated accounting keyword"]), \
+             patch.object(get_RSS, "batch_analyze_papers", return_value={}), \
+             patch.object(get_RSS, "OUTPUT_FILE", xml), patch.object(get_RSS, "FEED_JSON", feed):
+            result = get_RSS.run_reanalysis_flow()
+
+        self.assertEqual(result["status"], "ok")
+        with open(feed, encoding="utf-8") as handle:
+            self.assertEqual([item["id"] for item in json.load(handle)["items"]], ["guid-1"])
+
     def test_transaction_rolls_back_conflicting_identities(self):
         self.ingest([{"url": "a", "success": True, "entries": [entry(1, "https://doi.org/10.1000/a"), entry(2, "https://doi.org/10.1000/b")]}])
         collision = entry(3, "https://doi.org/10.1000/a", "shared")
@@ -109,7 +123,7 @@ class SQLiteIngestionTests(unittest.TestCase):
         xml, feed = os.path.join(self.temp.name, "out.xml"), os.path.join(self.temp.name, "web", "feed.json")
         with patch.dict(os.environ, {"PAPER_FEED_DB": self.db}), \
              patch.object(get_RSS, "get_config", return_value={"OPENAI_API_KEY": "test"}), \
-             patch.object(get_RSS, "load_config", return_value=["marketing"]), \
+             patch.object(get_RSS, "load_config", return_value=["unrelated accounting keyword"]), \
              patch.object(get_RSS, "OUTPUT_FILE", xml), patch.object(get_RSS, "FEED_JSON", feed), \
              patch.object(get_RSS, "generate_abstract_with_gpt", return_value="durable summary") as generate:
             result = get_RSS.summarize_specific_papers(["guid-0", oldest["paper_id"], "legacy-oldest"])

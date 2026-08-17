@@ -20,7 +20,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
+        python-version: '3.11'
 
     - name: Install dependencies
       run: |
@@ -42,8 +42,27 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        if [[ ! -f filtered_feed.xml || ! -f web/feed.json ]]; then
+          echo "Publication guard failed: expected both filtered_feed.xml and web/feed.json after RSS generation." >&2
+          exit 1
+        fi
+        python -m paper_feed.publish_guard --xml filtered_feed.xml --json web/feed.json
+        if git cat-file -e HEAD:filtered_feed.xml 2>/dev/null; then
+          git show HEAD:filtered_feed.xml > "$RUNNER_TEMP/previous_filtered_feed.xml"
+          python -m paper_feed.publish_guard --xml filtered_feed.xml --json web/feed.json \
+            --baseline-xml "$RUNNER_TEMP/previous_filtered_feed.xml" --projection-limit 1000
+        fi
         # Never stage the local SQLite history database.
-        git add -f filtered_feed.xml web/feed.json web/translations.json web/journals.hash
-        # 只有当有新文件生成或文件变动时才提交
-        git commit -m "Auto-update RSS feed" || echo "No changes to commit"
+        files=(filtered_feed.xml web/feed.json)
+        for optional_file in web/translations.json web/journals.hash; do
+          if [[ -f "$optional_file" ]]; then
+            files+=("$optional_file")
+          fi
+        done
+        git add -f -- "${files[@]}"
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        git commit -m "Auto-update RSS feed"
         git push
