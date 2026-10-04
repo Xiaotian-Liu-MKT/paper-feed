@@ -1,5 +1,6 @@
 """Compatibility exports derived from durable Paper Feed SQLite records."""
 import json
+import re
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
@@ -105,7 +106,7 @@ def export_items(items, xml_path, json_path, queries=(), limit=1000, atomic_writ
           "methods": methods, "topics": topics, "theories": translation.get("theories", []), "context": translation.get("context", []), "subjects": translation.get("subjects", []),
           "novelty_score": translation.get("novelty_score"), "classification_source": "user" if correction else "gpt", "classification_version": translation.get("classification_version", ""), "user_corrected": bool(correction),
           "summary": item.get("summary", ""), "abstract": abstract.get("abstract", ""), "raw_abstract": abstract.get("raw_abstract", ""), "abstract_source": abstract.get("source", ""), "journal": item.get("journal", ""), "pub_date": str(item.get("pub_date") or "")})
-    payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "keywords": sorted({p.strip() for q in queries for p in q.split("AND") if p.strip()}, key=str.lower), "items": data}
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "keywords": sorted({p.strip() for q in queries for p in re.split(r"\s+AND\s+", q, flags=re.IGNORECASE) if p.strip()}, key=str.lower), "items": data}
     root = ET.Element("rss", version="2.0"); channel = ET.SubElement(root, "channel")
     for tag, value in (("title", "My Customized Papers"), ("link", "https://github.com/your_username/your_repo"), ("description", "Aggregated research papers")):
         ET.SubElement(channel, tag).text = value

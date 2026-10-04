@@ -3,16 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>期刊管理 - Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.1" />
+    <title>Paper Feed · 期刊管理</title>
+    <link rel="stylesheet" href="styles.css?v=2.2" />
+    <link rel="stylesheet" href="pages.css?v=1.0" />
   </head>
   <body class="journals-page">
     <header class="hero">
       <div class="hero__bg"></div>
-      <div class="hero__actions">
-        <a class="btn btn--secondary" href="index.html">🏠 返回主页</a>
-        <a class="btn btn--secondary" href="stats.html">📊 统计</a>
-      </div>
+      <nav id="site-nav" class="hero__actions" aria-label="站点导航"></nav>
       <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
         <h1>期刊订阅管理</h1>
@@ -42,7 +40,22 @@
           <button id="btnExport" class="btn btn--secondary" type="button">导出文件</button>
           <button id="btnSave" class="btn btn--primary" type="button">保存更新</button>
         </div>
-        <p class="panel-hint">保存会覆盖 `journals.dat`，导入会自动去重并清理空行。</p>
+        <p class="panel-hint">保存会覆盖 `journals.dat`，导入会自动去重并清理空行；URL 中的 utm_* 跟踪参数会在保存时自动去除。</p>
+      </section>
+
+      <section class="panel" id="catalogPanel">
+        <details id="catalogDetails" class="report-details">
+          <summary>📖 从目录添加</summary>
+          <p class="panel-hint" style="margin-top: 12px;">从内置期刊目录（RSS list.md）中勾选要订阅的期刊，已订阅的会自动勾选并禁用。点击「添加所选」会合并到当前列表并立即保存。</p>
+          <div class="catalog-toolbar">
+            <input id="catalogSearch" type="search" placeholder="按名称 / 学科 / 标签筛选目录" />
+            <span id="catalogCount" class="panel-note"></span>
+            <button id="btnCatalogAdd" class="btn btn--primary" type="button" disabled>添加所选</button>
+          </div>
+          <div id="catalogGroups" class="catalog-groups">
+            <p class="panel-hint">展开后加载目录...</p>
+          </div>
+        </details>
       </section>
 
       <section class="journal-layout">
@@ -83,6 +96,7 @@
       </div>
     </dialog>
 
-    <script src="journals.js?v=1.0"></script>
+    <script src="nav.js?v=1.0"></script>
+    <script src="journals.js?v=1.1"></script>
   </body>
 </html>

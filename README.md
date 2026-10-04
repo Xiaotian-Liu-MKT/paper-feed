@@ -2,94 +2,196 @@
 
 一个 browser-first 的本地学术论文 RSS 筛选器：抓取期刊 RSS、按关键词过滤，并在浏览器中完成检索、刷卡分流、收藏、偏好分析和 RIS 导出。
 
+> ### 快速开始（3 步）
+>
+> 1. **创建虚拟环境并安装依赖**（需要 Python 3.11+）
+>    ```powershell
+>    py -3.11 -m venv .venv        # 没有 3.11 时可用：py -m venv .venv
+>    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+>    ```
+> 2. **先以只读方式启动**：`run_web.bat start`（macOS/Linux：`./run_web.sh start`）。
+>    这一步不联网、不调用 AI、不产生费用，浏览器会打开 `http://127.0.0.1:8000`。
+> 3. **在网页里完成配置后再更新**：点 ⚙️ **设置** 填入 API Key（可选），点 🔑 **关键词** 编辑并预览关键词，在 **期刊** 页勾选要订阅的期刊，最后点 **立即更新** 抓取新论文。
+
 ## 主要功能
 
-- **多源聚合**：从多个学术期刊 RSS 源获取最新论文。
-- **智能过滤**：基于自定义关键词筛选相关论文。
-- **双语与 AI 功能**：可选的 OpenAI 标题翻译、分类和收藏论文总结。
-- **现代化 Web 界面**：关键词、期刊和摘要搜索；日期与期刊筛选；收藏、归档、隐藏；收件箱刷卡和撤销；收藏 RIS 导出。
+- **多源聚合**：从多个学术期刊 RSS 源获取最新论文，期刊可在网页中从目录勾选订阅。
+- **智能过滤**：基于自定义关键词规则（AND / 排除 / 短语）筛选相关论文，并可在保存前预览命中情况。
+- **双语与 AI 功能**：可选的 OpenAI 兼容接口（含 DeepSeek 等）用于标题翻译、分类和收藏论文总结。
+- **现代化 Web 界面**：关键词、期刊和摘要搜索；日期与期刊筛选；待筛选/收藏/归档/已隐藏四个视图；收件箱刷卡和撤销；键盘快捷键；收藏 RIS 导出。
 - **本地优先数据**：SQLite 保存论文、状态和分析结果；兼容保留 RSS/XML/JSON 导出。
 
 ## 系统要求与安装
 
-- 推荐 Python 3.11（当前依赖也已在 Python 3.13 验证）。
-- 仅在刷新 RSS 或调用 OpenAI 时需要互联网连接。
+- Python **3.11+**（当前依赖也已在 Python 3.13 验证）。
+- 仅在刷新 RSS 或调用 AI 时需要互联网连接。
 
-在 Windows 中创建项目专用虚拟环境并安装依赖：
+Windows：
 
 ```powershell
 py -3.11 -m venv .venv
+# 如果提示找不到 3.11，可直接使用已安装的默认 Python 3.11+：
+py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-主要依赖包括：
+macOS / Linux：
 
-- `feedparser`：RSS feed 解析
-- `rfeed`：RSS feed 生成
-- `openai`：可选的 OpenAI API 客户端
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+主要依赖：`feedparser`（RSS 解析）、`rfeed`（RSS 生成）、`requests`、`openai`（可选的 AI 客户端）。
 
 ## 配置
 
-### 1. 配置 RSS 源（`journals.dat`）
+### 1. AI 设置（可选）
 
-在 `journals.dat` 中添加要订阅的 RSS 源，每行一个 URL：
+两种方式任选其一：
+
+- **网页设置**：启动后点击 ⚙️ **设置**，填写 API Key、Base URL、模型名等，保存后写入本地 `config.json`。
+- **手动复制**：把 `config.json.example` 复制为 `config.json`（已被 `.gitignore` 忽略）后编辑。
+
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 使用 AI 时必填 | 保留 `your-api-key-here` 等以 `your-` 开头的占位值视为“未配置” |
+| `OPENAI_BASE_URL` | 可选 | 留空使用 OpenAI 官方地址；使用 DeepSeek 等兼容服务时填其地址，如 `https://api.deepseek.com` |
+| `OPENAI_MODEL` | 可选 | 默认 `gpt-4o-mini`；使用 DeepSeek 时可填 `deepseek-chat` |
+| `OPENAI_PROXY` | 可选 | HTTP 代理地址，如 `http://127.0.0.1:7890` |
+
+**配置优先级**：非空环境变量 > `config.json` 中的非空、非占位值 > 默认值。项目不会自动加载 `.env`。
+
+不配置 AI 也能抓取 RSS、浏览和分流论文，只是标题翻译、AI 分类和 AI 总结会被跳过。AI 调用可能产生费用；不要将真实密钥写入文档、测试、日志或提交记录。
+
+### 2. 关键词（`keywords.dat` 或网页 🔑 关键词）
+
+推荐在网页中点击 🔑 **关键词** 编辑：编辑器提供 **预览**，会用已入库的论文（标题 + 摘要）统计每条规则的命中数并列出示例，确认后再保存。也可以直接编辑 `keywords.dat`，`keywords.dat.example` 提供了一份消费者行为方向的示例。
+
+语法：
+
+- 每行一条规则，多行之间是“**或**”关系，命中任意一行即保留。
+- 同一行用 `AND` 连接多个词，所有词都必须出现（大小写均可：小写 `and` 同样会被当作连接词；若要匹配含 and 的短语，请加双引号，如 `"supply and demand"`）。
+- 词前加 `-` 或 `NOT ` 表示排除。
+- 不区分大小写，按**词首**匹配：`consum` 能匹配 consumer / consumption，`ai` 不会误匹配 said。
+- 多词短语用英文双引号，如 `"word of mouth"`。
+- 以 `#` 开头的行是注释。
+
+```
+# 情绪
+embarrassment
+shame AND consum
+"social media" AND marketing
+AI AND NOT agriculture
+chatbot AND -medical
+```
+
+**注意**：关键词只在抓取时过滤**新抓取**的论文；修改关键词不会删除已经入库的论文。
+
+### 3. 期刊（`journals.dat` 或网页“期刊”页）
+
+在网页的 **期刊** 页面可以直接从期刊目录中勾选订阅，目录来自 `RSS list.md`，按学科分组，覆盖市场营销与消费者行为、社会心理、管理、决策科学、信息系统、经济学、旅游与酒店管理等。也可以粘贴任意 RSS 链接。保存时会自动去除 `utm_*` 等跟踪参数。
+
+`journals.dat` 每行一个 RSS URL，可直接编辑：
 
 ```
 https://academic.oup.com/rss/site_5397/advanceAccess_3258.xml
-https://journals.sagepub.com/action/showFeed?...
+https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mksc
 ```
 
-`RSS list.md` 收录了市场营销与消费者行为、社会心理、管理、决策科学、信息系统、经济学、旅游与酒店管理等期刊的 RSS 链接。
+### 4. 端口
 
-### 2. 配置关键词（`keywords.dat`）
+默认端口是 `8000`。端口被占用时，可以设置环境变量 `PAPER_FEED_PORT`，或给 `server.py` 传 `--port`：
 
-每行一个关键词，支持 `AND` 逻辑：
-
+```powershell
+$env:PAPER_FEED_PORT = "8010"; run_web.bat start
+.\.venv\Scripts\python.exe server.py --port 8010
 ```
-embarrassment
-social media AND marketing
-consumer behavior
-```
-
-### 3. 配置 OpenAI（可选）
-
-可在根目录（已忽略）`config.json` 或环境变量中配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_PROXY`。不要将真实密钥写入文档、测试、日志或提交记录。
-
-未配置 OpenAI 仍可浏览既有数据和抓取 RSS；翻译、AI 分类和 AI 总结功能不可用。
 
 ## 使用方法
 
-### 方式一：刷新 RSS
+### 启动 Web 界面
+
+Windows 推荐使用启动器（始终使用 `.venv\Scripts\python.exe`）：
+
+```powershell
+run_web.bat start    # 不刷新 RSS，仅启动或打开已有本地数据（推荐首次使用）
+run_web.bat          # 默认：先刷新 RSS，再启动或打开应用
+run_web.bat refresh  # 与默认行为相同的显式别名
+```
+
+macOS / Linux 使用 `run_web.sh`，参数相同：
+
+```bash
+chmod +x run_web.sh   # 首次使用
+./run_web.sh start
+```
+
+也可以直接运行 `.\.venv\Scripts\python.exe server.py`。服务只监听 `127.0.0.1`，包含本地写入接口和后台任务，**不要进行公网端口转发**。
+
+**注意：** 裸运行 `run_web.bat` 和 `run_web.bat refresh` 都可能联网、调用 AI 并修改生成物；只想查看现有结果时使用 `start`。
+
+### 视图与快捷键
+
+| 视图 | 说明 |
+| --- | --- |
+| 待筛选 | 收件箱，新论文都在这里；处理后移出 |
+| 收藏 | 感兴趣的论文；可生成 AI 总结、补充摘要、导出 RIS，并显示主题云 |
+| 归档 | 暂时不处理但想保留的论文 |
+| 已隐藏 | 标为“不感兴趣”的论文；可在这里一键恢复 |
+| 全部 | 所有论文（含已处理），卡片上显示当前状态 |
+
+常用快捷键：
+
+- **刷卡模式**：`→` 收藏、`←` 不感兴趣、`A`（或 `L`）归档、`O` 打开原文、`Z` 撤销；也可用鼠标/触屏左右拖动卡片。
+- **列表模式**：`J`/`K` 移动高亮卡片，`F` 收藏、`A`（或 `L`）归档、`X` 不感兴趣、`O` 打开原文。
+- `Z` 在任何视图都可撤销最近的操作（最多 20 步，切换视图时清空）；按 **`?`** 弹出完整快捷键说明。
+
+顶部导航栏可在主页、期刊、偏好报告、统计页之间切换。更新 RSS、重新分析和 AI 总结以后台任务运行，刷新页面后仍能看到正在运行的任务。
+
+### 命令行刷新 RSS
 
 ```powershell
 .\.venv\Scripts\python.exe get_RSS.py
 ```
 
-该命令会从已配置 RSS 源获取论文、按关键词过滤、导入 SQLite，并更新兼容导出。它可能联网、调用 OpenAI，并修改 `data/paper_feed.sqlite3`、`filtered_feed.xml`、`web/feed.json`、`web/translations.json` 等本地生成物。
+该命令会从已配置 RSS 源获取论文、按关键词过滤、导入 SQLite，并更新兼容导出。它可能联网、调用 AI，并修改 `data/paper_feed.sqlite3`、`filtered_feed.xml`、`web/feed.json`、`web/translations.json` 等本地生成物。
 
-### 方式二：启动 Web 服务器
-
-```powershell
-.\.venv\Scripts\python.exe server.py
-```
-
-服务仅监听 `http://127.0.0.1:8000`，用于浏览现有本地数据。它包含本地写入接口和后台任务，不要进行公网端口转发。
-
-Windows 推荐使用启动器；它始终使用 `.venv\Scripts\python.exe`，并通过只读 `/api/interactions` 的 `favorites`、`archived`、`hidden` 数组结构识别已运行的 Paper Feed 服务，否则报告端口冲突：
+### 备份与旧数据导入
 
 ```powershell
-run_web.bat          # 默认：先刷新 RSS，再启动或打开应用
-run_web.bat refresh  # 与默认行为相同的显式别名
-run_web.bat start    # 不刷新 RSS，仅启动或打开已有本地数据
+.\.venv\Scripts\python.exe -m paper_feed backup         # 备份 SQLite 数据库
+.\.venv\Scripts\python.exe -m paper_feed import-legacy  # 从旧版 JSON 状态文件导入
 ```
 
-**注意：** 裸运行 `run_web.bat` 和 `run_web.bat refresh` 都可能联网、调用 OpenAI 并修改生成物；只想查看现有结果时使用 `run_web.bat start`。
+数据库是唯一的数据真相源，升级或大改前建议先执行 `backup`。
 
-Web 界面支持浏览、搜索和筛选论文，收藏/归档/隐藏及收件箱刷卡（左右方向键和 `A`/`Z` 快捷键），并可对收藏生成 AI 总结和导出 RIS。更新 RSS、重新分析和 AI 总结以后台 job 运行，前端可轮询状态，避免阻塞浏览操作。
+### 在其他 RSS 阅读器中订阅
 
-### 订阅 RSS Feed
+`filtered_feed.xml` 是 SQLite 数据的兼容 RSS 导出，不是主数据源。本仓库**没有**配置 GitHub Pages 等托管；如果想在其他阅读器订阅，需要自行把该文件放到你控制的 Web 服务器上。对于公开仓库，也可以直接订阅它在 GitHub 上的 raw 链接（`https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/filtered_feed.xml`）。
 
-`filtered_feed.xml` 是 SQLite 数据的兼容 RSS 导出，不是主数据源。需要在其他 RSS 阅读器中订阅时，可将该文件部署到你控制的 Web 服务器后添加其链接。
+## Fork 与自动更新（GitHub Actions）
+
+`.github/workflows/rss_action.yaml` 每 6 小时（也可手动）运行一次 RSS 更新，并把 `filtered_feed.xml`、`web/feed.json` 等导出提交回仓库。Fork 后按以下步骤启用：
+
+1. **启用 Actions**：在你的 fork 中打开 **Actions** 标签页，点击 “I understand my workflows, go ahead and enable them”。定时任务在 fork 中默认是关闭的。
+2. **配置 Secrets**：进入 **Settings → Secrets and variables → Actions → New repository secret**：
+
+   | Secret | 是否必填 | 说明 |
+   | --- | --- | --- |
+   | `RSS_KEYWORDS` | 推荐 | 关键词规则，多条用换行或 `;` 分隔；不设置时使用仓库中的 `keywords.dat` |
+   | `OPENAI_API_KEY` | 可选 | 不设置则跳过 AI 翻译与分类 |
+   | `OPENAI_BASE_URL` | 可选 | 兼容接口地址（如 DeepSeek） |
+   | `OPENAI_MODEL` | 可选 | 模型名，默认 `gpt-4o-mini` |
+
+   用 Secret 保存关键词可以避免把研究方向公开在仓库里。
+3. **清理继承来的导出与订阅**：fork 会带上原作者的数据。首次运行前，删除或替换这些文件并提交：
+   - `filtered_feed.xml`、`web/feed.json`（以及存在时的 `web/translations.json`）：删除（自动化在没有数据库时会从它们“引导”历史数据，不删会继承原作者的论文）。
+   - `journals.dat`：换成你自己的期刊列表。
+   - `journals_meta.json`：删除或清空为 `{}`，避免残留旧期刊名称。
+4. **手动运行一次**：在 Actions 页选择 “Auto RSS Fetch” → **Run workflow**，确认运行成功后，后续会按计划自动更新。
+
+自动化中的 SQLite 只是临时缓存，不会被提交；本地使用的数据库与仓库中的导出互不覆盖。
 
 ## 数据与文件结构
 
@@ -99,14 +201,17 @@ SQLite 是唯一的持久化真相源，默认路径是 `data/paper_feed.sqlite3
 paper-feed/
 ├── get_RSS.py              # RSS 抓取、导入与兼容导出
 ├── server.py               # 127.0.0.1 本地 Web/API 与后台任务
-├── paper_feed/             # SQLite、论文身份、导入与服务层
+├── paper_feed/             # SQLite、论文身份、导入、备份与服务层
 ├── data/paper_feed.sqlite3 # SQLite 真相源（本地生成，默认忽略）
 ├── journals.dat            # RSS 源列表
-├── keywords.dat            # 关键词列表
+├── keywords.dat            # 关键词规则（keywords.dat.example 为示例）
+├── config.json.example     # AI 配置模板（复制为 config.json）
+├── RSS list.md             # 期刊目录（期刊页的勾选来源）
 ├── filtered_feed.xml       # 兼容 RSS 导出
-├── web/feed.json           # 兼容前端导出
-├── web/                    # Web 界面
-├── run_web.bat             # Windows 启动器
+├── web/                    # Web 界面（见 web/README.md）
+├── dev/                    # 调试页面
+├── docs/history/           # 历史设计文档
+├── run_web.bat / run_web.sh # Windows / macOS·Linux 启动器
 └── tests/                  # 单元、服务与启动器测试
 ```
 
@@ -115,19 +220,28 @@ paper-feed/
 ## 工作原理
 
 1. 从 `journals.dat` 的 RSS 源抓取论文元数据。
-2. 根据 `keywords.dat` 匹配标题和摘要元数据。
+2. 根据关键词规则匹配标题和摘要元数据，只保留命中的新论文。
 3. 使用 DOI、URL、来源标识等规范化信息确定稳定 `paper_id` 并写入 SQLite。
 4. 保留论文的历史观察记录和用户状态，增量更新新数据。
-5. 按配置调用 OpenAI 完成翻译、分类或总结；未配置时跳过这些功能。
-6. 从 SQLite 投影出 XML/JSON 兼容导出，供 RSS 阅读器或静态降级界面使用。
+5. 按配置调用 AI 完成翻译、分类或总结；未配置时跳过这些功能。
+6. 从 SQLite 投影出 XML/JSON 兼容导出，供 RSS 阅读器或自动化使用。
 
-## 高级配置与注意事项
+## 常见问题排查
 
-除 `config.json` 外，`RSS_JOURNALS`、`RSS_KEYWORDS`、`OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_PROXY` 可通过环境变量配置。`config.json` 中的值会覆盖对应 OpenAI 环境变量；项目不会自动加载 `.env`。
+- **`ModuleNotFoundError` / 缺少依赖**：确认使用的是 `.venv` 中的 Python，并重新执行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`。启动器提示找不到 `.venv\Scripts\python.exe` 时，说明还没有创建虚拟环境。
+- **端口被占用**：启动器发现 8000 端口被其他程序占用时会报错退出。关闭占用程序；若需换端口，请直接运行 `.\.venv\Scripts\python.exe server.py --port 8010`（或设置 `PAPER_FEED_PORT`，`run_web.sh` 也支持该变量；`run_web.bat` 固定使用 8000）。若占用者本身就是 Paper Feed，启动器会直接打开它。
+- **AI 功能被跳过 / 没有翻译**：通常是未配置 API Key，或仍是 `your-api-key-here` 这样的占位值。在 ⚙️ 设置中检查“已配置密钥”状态；也要检查环境变量里是否有一个错误的 `OPENAI_API_KEY`（环境变量优先于 `config.json`）。
+- **任务状态为 `partial_failed`**：任务整体完成，但部分条目失败（例如个别 RSS 源超时、少数 AI 请求出错）。任务结果中会列出失败数量和简短错误信息；通常稍后重试即可，不需要重置数据。
+- **期刊抓取失败**：部分期刊需要机构网络或 VPN；也可能是 RSS 链接已失效，可在期刊页替换。
+- **`get_RSS.py` 退出码**：`0` 已发布；`1` 所有 RSS 源都抓取失败；`2` `journals.dat` 或关键词为空。`run_web.bat` 遇到 1/2 会提示并打开已有数据；GitHub Actions 中会让运行显示为失败。
+- **分类领域不是营销**：可在 `web/categories.json` 中加一个可选的 `"domain"` 字段（如 `"Organizational Behavior"`），AI 分类提示词会使用它；分类失败时回退为已配置的类别或 `Unclassified`。
+- **关键词改了但旧论文还在**：这是预期行为，关键词只过滤新抓取的论文。不想看的旧论文可在待筛选中隐藏。
 
-1. OpenAI 调用可能产生费用；刷新间隔建议至少一小时，避免给期刊站点造成压力。
-2. 部分期刊可能需要机构网络或 VPN。
-3. `/api/fetch`、`/api/reanalyze`、`/api/summarize_favorites` 可能联网、写入或调用 OpenAI；测试和演示时不要无意触发。
+## 注意事项
+
+1. AI 调用可能产生费用；刷新间隔建议至少一小时，避免给期刊站点造成压力。
+2. `RSS_JOURNALS`、`RSS_KEYWORDS` 环境变量会覆盖 `journals.dat`、`keywords.dat`（多条用换行或 `;` 分隔）。
+3. `/api/fetch`、`/api/reanalyze`、`/api/summarize_favorites` 可能联网、写入或调用 AI；测试和演示时不要无意触发。
 4. 本地 API 无认证，尽管服务仅绑定 loopback，仍不应公开部署。
 
 ## 测试
@@ -144,10 +258,6 @@ paper-feed/
 ```
 
 浏览器测试若依赖 Playwright，需要单独安装浏览器依赖；常规测试不要使用真实密钥或触发有费用的后台 job。
-
-## 自动化部署
-
-`.github/workflows/rss_action.yaml` 可定时或手动运行 RSS 更新。该自动化应使用受控的密钥配置，并只提交明确需要的兼容导出；本地 SQLite 数据库不是自动化提交的真相源。
 
 ## 许可证与贡献
 

@@ -11,7 +11,7 @@ const document = {
   addEventListener() {}, createElement: () => element(), createDocumentFragment: () => element(), body: { appendChild() {} }
 };
 const context = { console, document, localStorage: { getItem: (k) => storage.get(k) || null, setItem: (k, v) => storage.set(k, v) },
-  Element: function Element() {}, Intl, Date, Set, Map, JSON, encodeURIComponent, alert() {}, setTimeout, clearTimeout,
+  Element: function Element() {}, Intl, Date, Set, Map, JSON, encodeURIComponent, URLSearchParams, alert() {}, setTimeout, clearTimeout,
   URL: { createObjectURL: () => "blob:test", revokeObjectURL() {} } };
 vm.createContext(context);
 vm.runInContext(source, context);
@@ -153,6 +153,87 @@ async function run() {
   assert.match(source, /isTypingTarget\(event\.target\)/);
   assert.match(source, /state\.filterMode !== "all" \|\| document\.querySelector\("dialog\[open\]"\)/);
   assert.match(source, /key === "arrowright"/);
+
+  // Buttons (tabs, toggles) must not swallow shortcuts; form fields still do.
+  const fakeTarget = (matches) => Object.assign(Object.create(context.Element.prototype), { closest: (selector) => (matches(selector) ? {} : null) });
+  context.buttonTarget = fakeTarget((selector) => /(^|,\s*)button(,|$)/.test(selector));
+  context.inputTarget = fakeTarget((selector) => selector.includes("input"));
+  assert.strictEqual(vm.runInContext("isTypingTarget(buttonTarget)", context), false);
+  assert.strictEqual(vm.runInContext("isTypingTarget(inputTarget)", context), true);
+
+  // Journal dropdown is rebuilt (no duplicates) and keeps the current selection.
+  const fakeSelect = () => {
+    const select = { options: [], _value: "", appendChild(option) { this.options.push(option); } };
+    Object.defineProperty(select, "textContent", { set() { select.options = []; }, get() { return ""; } });
+    Object.defineProperty(select, "value", {
+      get() { return select._value; },
+      set(v) { select._value = select.options.some((o) => o.value === v) ? v : ""; }
+    });
+    return select;
+  };
+  context.fakeJournalSelect = fakeSelect();
+  vm.runInContext(`
+    delete globalThis.populateJournals;
+  `, context);
+  vm.runInContext(source.match(/function populateJournals[\s\S]*?\n}\n/)[0], context);
+  vm.runInContext(`
+    elements.journalSelect = fakeJournalSelect;
+    populateJournals([{ journal: "B" }, { journal: "A" }]);
+    elements.journalSelect.value = "B";
+    populateJournals([{ journal: "B" }, { journal: "A" }, { journal: "C" }]);
+  `, context);
+  assert.deepStrictEqual(context.fakeJournalSelect.options.map((o) => o.value), ["", "A", "B", "C"]);
+  assert.strictEqual(context.fakeJournalSelect.value, "B");
+
+  // URL filters: `search` is an alias of `q`, view=all means every paper,
+  // any filter switches the inbox to list mode, and params are cleared once.
+  let replaced = null;
+  context.window = {
+    location: { search: "?search=nudge&view=all&from=report", pathname: "/index.html", hash: "" },
+    history: { replaceState: (_s, _t, url) => { replaced = url; } }
+  };
+  vm.runInContext(`
+    delete globalThis.applyUrlFilters;
+  `, context);
+  vm.runInContext(source.match(/function applyUrlFilters[\s\S]*?\n}\n/)[0], context);
+  vm.runInContext(`
+    elements.filterMethod = null; elements.filterTopic = null; elements.filterPreset = null;
+    elements.searchInput = { value: "" };
+    state.urlFiltersApplied = false; state.filterMode = "all"; state.inboxViewMode = "swipe";
+  `, context);
+  assert.strictEqual(vm.runInContext("applyUrlFilters()", context), true);
+  assert.strictEqual(vm.runInContext("elements.searchInput.value", context), "nudge");
+  assert.strictEqual(vm.runInContext("state.filterMode", context), "everything");
+  assert.strictEqual(vm.runInContext("state.inboxViewMode", context), "list");
+  assert.strictEqual(replaced, "/index.html");
+  assert.strictEqual(vm.runInContext("applyUrlFilters()", context), false); // applied only once
+
+  // List actions keep pagination, are undoable, and the undo history is capped
+  // instead of being wiped by a timer.
+  context.fetch = async () => ({ ok: true, json: async () => ({ interactions: null }) });
+  vm.runInContext(`
+    state.filterMode = "all"; state.inboxViewMode = "list"; state.swipeBusy = false; state.pendingWrites = 0;
+    state.interactions = { favorites: [], archived: [], hidden: [] };
+    state.items = Array.from({ length: 30 }, (_, i) => ({ paper_id: "lp-" + i }));
+    state.filtered = state.items.slice();
+    state.visibleLimit = 80; state.undoStack = [];
+    renderList = () => {};
+    for (let i = 0; i < 25; i++) performInteraction(state.filtered[0], i % 2 ? "hide" : "like");
+  `, context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.strictEqual(vm.runInContext("state.visibleLimit", context), 80);
+  assert.strictEqual(vm.runInContext("state.filtered.length", context), 5);
+  assert.strictEqual(vm.runInContext("state.undoStack.length", context), 20);
+  vm.runInContext("undoLastInteraction()", context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.strictEqual(vm.runInContext("state.filtered.length", context), 6);
+  assert.strictEqual(vm.runInContext("state.interactions.hidden.length", context), 12);
+  assert.strictEqual(vm.runInContext("state.interactions.favorites.length", context), 12);
+  assert.ok(!/UNDO_BAR_TIMEOUT_MS/.test(source));
+
+  // A title-only AI guess is labelled distinctly from a real AI summary.
+  assert.match(source, /基于标题推测/);
+  assert.match(source, /未读取摘要，仅根据标题推测/);
   console.log("frontend paper_id tests passed");
 }
 

@@ -10,6 +10,8 @@ import tempfile
 import threading
 import queue
 import uuid
+import errno
+import argparse
 from functools import partial
 from urllib.parse import parse_qs, urlparse
 from paper_feed.service import PaperFeedService, PaperNotFound, PaperReferenceError
@@ -17,28 +19,38 @@ from paper_feed.service import PaperFeedService, PaperNotFound, PaperReferenceEr
 # 导入 RSS 抓取逻辑
 # 确保 get_RSS.py 在同一目录下
 try:
-    from get_RSS import run_rss_flow, get_config, summarize_specific_papers
-except ImportError:
-    print("Error: Could not import run_rss_flow from get_RSS.py")
+    from get_RSS import (run_rss_flow, get_config, summarize_specific_papers, configure_stdio,
+                         fallback_label, preview_keywords, DEFAULT_OPENAI_MODEL)
+except ImportError as import_error:
+    missing = getattr(import_error, "name", None) or str(import_error)
+    print(f"Error: could not import get_RSS.py because a dependency is missing: {missing}")
+    print("Install the project requirements into the virtual environment, e.g.:")
+    print("  Windows: .venv\\Scripts\\python.exe -m pip install -r requirements.txt")
+    print("  macOS/Linux: .venv/bin/python -m pip install -r requirements.txt")
     sys.exit(1)
 
-PORT = 8000
-WEB_DIR = "web"
-CONFIG_FILE = "config.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PORT = 8000
+PORT = DEFAULT_PORT
+WEB_DIR = os.path.join(BASE_DIR, "web")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 INTERACTIONS_FILE = os.path.join(WEB_DIR, "interactions.json")
 FEED_FILE = os.path.join(WEB_DIR, "feed.json")
 REPORT_FILE = os.path.join(WEB_DIR, "preference_report.json")
 CATEGORIES_FILE = os.path.join(WEB_DIR, "categories.json")
 USER_CORRECTIONS_FILE = os.path.join(WEB_DIR, "user_corrections.json")
-JOURNALS_FILE = "journals.dat"
-JOURNALS_META_FILE = "journals_meta.json"
-RSS_LIST_FILE = "RSS list.md"
+JOURNALS_FILE = os.path.join(BASE_DIR, "journals.dat")
+KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.dat")
+JOURNALS_META_FILE = os.path.join(BASE_DIR, "journals_meta.json")
+RSS_LIST_FILE = os.path.join(BASE_DIR, "RSS list.md")
 FILE_LOCK = threading.RLock()
+MAX_LISTED_JOBS = 20
+CONFIG_SAVE_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
 
 
 def paper_service():
     """A request-scoped service; connections are never shared by HTTP threads."""
-    return PaperFeedService(".", os.environ.get("PAPER_FEED_DB"))
+    return PaperFeedService(BASE_DIR, os.environ.get("PAPER_FEED_DB"))
 
 
 def atomic_write_text(path, content, encoding="utf-8"):
@@ -68,6 +80,7 @@ class JobRunner:
     """One local worker prevents concurrent refresh/reanalysis writes."""
     def __init__(self):
         self._jobs = {}
+        self._order = []
         self._lock = threading.RLock()
         self._queue = queue.Queue()
         self._worker = threading.Thread(target=self._run, daemon=True, name="paper-feed-jobs")
@@ -80,16 +93,56 @@ class JobRunner:
                     return dict(job), True
             job_id = uuid.uuid4().hex
             job = {"id": job_id, "kind": kind, "status": "queued", "stage": "queued",
-                   "progress": 0, "message": "任务已排队", "started_at": None,
-                   "finished_at": None, "result": None}
+                   "progress": 0, "message": "任务已排队", "created_at": datetime.datetime.now().isoformat(),
+                   "started_at": None, "finished_at": None, "result": None}
             self._jobs[job_id] = job
+            self._order.append(job_id)
+            self._prune()
             self._queue.put((job_id, action))
             return dict(job), False
+
+    def _prune(self, keep=100):
+        """Forget the oldest finished jobs so a long-running server stays small."""
+        while len(self._order) > keep:
+            for index, job_id in enumerate(self._order):
+                if self._jobs[job_id]["status"] not in {"queued", "running"}:
+                    del self._jobs[job_id]
+                    del self._order[index]
+                    break
+            else:
+                return
 
     def get(self, job_id):
         with self._lock:
             job = self._jobs.get(job_id)
             return dict(job) if job else None
+
+    def list(self, limit=MAX_LISTED_JOBS):
+        """Most recent first, so a reloaded page can find a running job."""
+        with self._lock:
+            return [dict(self._jobs[job_id]) for job_id in reversed(self._order[-limit:])]
+
+    @staticmethod
+    def classify(result):
+        """Map an action result to (status, message)."""
+        if not isinstance(result, dict):
+            return "succeeded", "任务完成"
+        failed = result.get("failed") or 0
+        try:
+            failed = int(failed)
+        except (TypeError, ValueError):
+            failed = 0
+        if result.get("status") == "error":
+            return "failed", result.get("message") or "任务失败"
+        if result.get("published") is False and not result.get("successful_sources"):
+            return "failed", result.get("message") or "任务失败：所有来源均失败"
+        if "updated" in result and failed and not result.get("updated"):
+            return "failed", result.get("message") or f"任务失败：{failed} 项失败"
+        if result.get("failed_sources"):
+            return "partial_failed", "任务完成，部分来源失败"
+        if failed > 0:
+            return "partial_failed", f"任务完成，{failed} 项失败"
+        return "succeeded", "任务完成"
 
     def _run(self):
         while True:
@@ -100,16 +153,9 @@ class JobRunner:
                            message="任务正在执行", started_at=datetime.datetime.now().isoformat())
             try:
                 result = action() or {}
-                status = "succeeded"
-                if isinstance(result, dict) and result.get("status") == "error":
-                    status = "failed"
-                elif isinstance(result, dict) and result.get("published") is False and not result.get("successful_sources"):
-                    status = "failed"
-                elif isinstance(result, dict) and result.get("failed_sources"):
-                    status = "partial_failed"
+                status, message = self.classify(result)
                 with self._lock:
-                    job.update(status=status, stage="completed", progress=100,
-                               message="任务完成" if status == "succeeded" else "任务完成，部分来源失败",
+                    job.update(status=status, stage="completed", progress=100, message=message,
                                finished_at=datetime.datetime.now().isoformat(), result=result)
             except Exception as error:
                 with self._lock:
@@ -755,38 +801,140 @@ def save_journal_meta(meta):
     except:
         pass
 
-def load_rss_list_meta():
-    if not os.path.exists(RSS_LIST_FILE):
-        return {}
-    meta = {}
+def strip_tracking_params(url):
+    """Remove utm_* query parameters, leaving the rest of the URL byte-identical."""
+    if not isinstance(url, str):
+        return url
+    value = url.strip()
+    if "?" not in value:
+        return value
+    base, _, rest = value.partition("?")
+    query, hash_mark, fragment = rest.partition("#")
+    kept = [part for part in query.split("&")
+            if part and not part.split("=", 1)[0].lower().startswith("utm_")]
+    result = base + ("?" + "&".join(kept) if kept else "")
+    return result + (hash_mark + fragment if hash_mark else "")
+
+
+def parse_rss_catalog(path=None):
+    """Parse `RSS list.md` into [{name, url, subject, tags}] in file order.
+
+    Format: `## Subject`, then `- Journal name`, an optional `标签:`/`Tags:` line
+    (comma separated, full- or half-width), and an `RSS: \\`url\\`` line.
+    """
+    path = path or RSS_LIST_FILE
+    if not os.path.exists(path):
+        return []
+    items = []
     current_subject = ""
     pending_name = ""
+    pending_tags = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("## "):
+                current_subject = line[3:].strip()
+                pending_name, pending_tags = "", []
+                continue
+            if line.startswith("- "):
+                pending_name, pending_tags = line[2:].strip(), []
+                continue
+            tag_match = re.match(r"^(?:标签|tags?)\s*[:：]\s*(.*)$", line, re.IGNORECASE)
+            if tag_match:
+                pending_tags = [tag.strip() for tag in re.split(r"[，,;；]", tag_match.group(1)) if tag.strip()]
+                continue
+            if "RSS:" in line and "`" in line:
+                start = line.find("`")
+                end = line.rfind("`")
+                if start != -1 and end > start:
+                    url = line[start + 1:end].strip()
+                    if url and pending_name:
+                        items.append({"name": pending_name, "url": url,
+                                      "subject": current_subject, "tags": list(pending_tags)})
+                pending_name, pending_tags = "", []
+    return items
+
+
+def load_subscribed_journals():
+    if not os.path.exists(JOURNALS_FILE):
+        return []
     try:
-        with open(RSS_LIST_FILE, 'r', encoding='utf-8') as f:
-            for raw in f:
-                line = raw.strip()
-                if line.startswith("## "):
-                    current_subject = line[3:].strip()
-                    pending_name = ""
-                    continue
-                if line.startswith("- "):
-                    pending_name = line[2:].strip()
-                    continue
-                if "RSS:" in line and "`" in line:
-                    start = line.find("`")
-                    end = line.rfind("`")
-                    if start != -1 and end > start:
-                        url = line[start + 1:end].strip()
-                        if url and pending_name:
-                            entry = {}
-                            if current_subject:
-                                entry["subject"] = current_subject
-                            entry["name"] = pending_name
-                            meta[url] = entry
-                    pending_name = ""
-    except:
+        with open(JOURNALS_FILE, 'r', encoding='utf-8') as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    except Exception:
+        return []
+
+
+def journal_catalog():
+    subscribed = {strip_tracking_params(url) for url in load_subscribed_journals()}
+    items = []
+    for entry in parse_rss_catalog():
+        entry = dict(entry)
+        entry["subscribed"] = strip_tracking_params(entry["url"]) in subscribed
+        items.append(entry)
+    return {"items": items}
+
+
+def load_rss_list_meta():
+    meta = {}
+    try:
+        for entry in parse_rss_catalog():
+            item = {"name": entry["name"]}
+            if entry.get("subject"):
+                item["subject"] = entry["subject"]
+            meta[entry["url"]] = item
+    except Exception:
         return {}
     return meta
+
+
+def read_keywords_text():
+    if not os.path.exists(KEYWORDS_FILE):
+        return ""
+    with open(KEYWORDS_FILE, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def keywords_payload(text):
+    lines = [line.strip() for line in (text or "").splitlines()]
+    payload = {"text": text or "",
+               "keywords": [line for line in lines if line and not line.startswith("#")]}
+    # Extra, informational: GitHub Actions/CLI use RSS_KEYWORDS instead of the file.
+    payload["env_override"] = bool(os.environ.get("RSS_KEYWORDS", "").strip())
+    return payload
+
+
+def save_keywords_text(text):
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized and not normalized.endswith("\n"):
+        normalized += "\n"
+    with FILE_LOCK:
+        atomic_write_text(KEYWORDS_FILE, normalized)
+    return normalized
+
+
+def keyword_corpus():
+    """Stored SQLite papers as {paper_id, title, text} for keyword previews."""
+    from paper_feed.exporter import database_items
+    service = paper_service()
+    service._ensure_database()
+    papers = []
+    for item in database_items(service.database):
+        abstract = item.get("abstract") if isinstance(item.get("abstract"), dict) else {}
+        parts = [item.get("title") or "", item.get("summary") or "",
+                 abstract.get("raw_abstract") or "", abstract.get("abstract") or ""]
+        papers.append({"paper_id": item.get("paper_id"), "title": item.get("title") or "",
+                       "text": " ".join(part for part in parts if isinstance(part, str))})
+    return papers
+
+
+def keyword_preview(text):
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    queries = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    return preview_keywords(queries, keyword_corpus())
 
 def load_categories():
     if not os.path.exists(CATEGORIES_FILE):
@@ -865,13 +1013,57 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
 
     def send_json(self, status_code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         self.send_response(status_code)
-        self.send_header('Content-type', 'application/json')
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
-        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        self.wfile.write(body)
+
+    def send_error(self, code, message=None, explain=None):
+        # API clients always receive JSON; static files keep the default page.
+        if urlparse(self.path).path.startswith('/api/'):
+            try:
+                self.send_json(code, {"status": "error", "message": message or http.HTTPStatus(code).phrase})
+            except Exception:
+                pass
+            return
+        super().send_error(code, message, explain)
+
+    def read_json_body(self):
+        """Parse a JSON request body; a missing Content-Length means an empty body."""
+        raw_length = self.headers.get('Content-Length')
+        try:
+            length = int(raw_length) if raw_length else 0
+        except ValueError:
+            raise ValueError("Invalid Content-Length header")
+        if length <= 0:
+            return {}
+        data = self.rfile.read(length)
+        if not data.strip():
+            return {}
+        return json.loads(data.decode('utf-8'))
+
+    def _guarded(self, handler):
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as error:
+            print(f"Unhandled error for {self.command} {self.path}: {error}")
+            try:
+                self.send_json(500, {"status": "error", "message": str(error)[:400]})
+            except Exception:
+                pass
 
     def do_GET(self):
+        self._guarded(self._do_get)
+
+    def do_POST(self):
+        self._guarded(self._do_post)
+
+    def _do_get(self):
         # 解析路径，忽略 query parameters
         parsed = urlparse(self.path)
         path = parsed.path
@@ -893,20 +1085,29 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
         # 添加一个 API 来获取当前配置（用于回显到前端）
         if path == '/api/config':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Expires', '0')
-            self.end_headers()
-
             config = get_config()
+            has_key = bool(config.get("OPENAI_API_KEY"))
+            # Never return the key itself to the browser.
             safe_config = {
-                "api_key_configured": bool(config.get("OPENAI_API_KEY")),
+                "api_key_configured": has_key,
+                "has_api_key": has_key,
                 "OPENAI_BASE_URL": config.get("OPENAI_BASE_URL") or "",
-                "OPENAI_PROXY": config.get("OPENAI_PROXY") or ""
+                "OPENAI_PROXY": config.get("OPENAI_PROXY") or "",
+                "OPENAI_MODEL": config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
             }
-            self.wfile.write(json.dumps(safe_config).encode('utf-8'))
+            self.send_json(200, safe_config)
+            return
+
+        if path in ('/api/jobs', '/api/jobs/'):
+            self.send_json(200, {"jobs": JOB_RUNNER.list()})
+            return
+
+        if path == '/api/keywords':
+            self.send_json(200, keywords_payload(read_keywords_text()))
+            return
+
+        if path == '/api/journal_catalog':
+            self.send_json(200, journal_catalog())
             return
 
         if path.startswith('/api/jobs/'):
@@ -925,13 +1126,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Expires', '0')
             self.end_headers()
 
-            journals = []
-            if os.path.exists(JOURNALS_FILE):
-                try:
-                    with open(JOURNALS_FILE, 'r', encoding='utf-8') as f:
-                        journals = [line.strip() for line in f if line.strip()]
-                except:
-                    journals = []
+            journals = load_subscribed_journals()
             meta = load_journal_meta()
             meta = {k: v for k, v in meta.items() if k in set(journals)}
             rss_meta = load_rss_list_meta()
@@ -997,11 +1192,33 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(f.read())
                 return
 
+        if path.startswith('/api/'):
+            self.send_json(404, {"status": "error", "message": "Endpoint not found"})
+            return
+
         return super().do_GET()
 
-    def do_POST(self):
+    def _do_post(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == '/api/keywords':
+            try:
+                req_data = self.read_json_body()
+                if not isinstance(req_data, dict) or not isinstance(req_data.get("text"), str):
+                    raise ValueError('Body must be {"text": "..."}')
+                self.send_json(200, keywords_payload(save_keywords_text(req_data["text"])))
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+            return
+        if path == '/api/keywords/preview':
+            try:
+                req_data = self.read_json_body()
+                if not isinstance(req_data, dict) or not isinstance(req_data.get("text"), str):
+                    raise ValueError('Body must be {"text": "..."}')
+                self.send_json(200, keyword_preview(req_data["text"]))
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+            return
         if path == '/api/export_favorites_ris':
             try:
                 result = build_favorites_ris()
@@ -1021,7 +1238,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         if path.startswith('/api/papers/') and path.endswith('/review'):
             paper_id = path[len('/api/papers/'):-len('/review')].strip('/')
             try:
-                req_data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+                req_data = self.read_json_body()
                 item = paper_service().review(paper_id, req_data.get("action"))
                 self.send_json(200, {"status": "ok", "paper": item, "interactions": paper_service().interactions()})
             except PaperNotFound as error:
@@ -1029,11 +1246,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError) as error:
                 self.send_json(400, {"status": "error", "message": str(error)})
             return
-        if self.path == '/api/interactions':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/interactions':
             try:
-                req_data = json.loads(post_data.decode('utf-8'))
+                req_data = self.read_json_body()
                 data = apply_interaction_change(req_data)
                 self.send_json(200, data)
                 return
@@ -1045,32 +1260,25 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json(400, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/summarize_favorites':
+        if path == '/api/summarize_favorites':
             job, duplicate = JOB_RUNNER.enqueue("summarize", run_summarize_job)
             self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
-        if self.path == '/api/preference_report':
+        if path == '/api/preference_report':
             print("Received preference report request...")
             try:
                 result = generate_title_report()
                 status_code = 200 if result.get("status") == "ok" else 500
-                self.send_response(status_code)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode('utf-8'))
+                self.send_json(status_code, result)
             except Exception as e:
                 print(f"Preference report error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/update_abstract':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/update_abstract':
             try:
-                req_data = json.loads(post_data.decode('utf-8'))
+                req_data = self.read_json_body()
                 item_id = paper_service().resolve_reference(req_data)
                 new_abstract = req_data.get("abstract")
                 
@@ -1079,26 +1287,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 
                 paper_service().save_abstract(item_id, new_abstract)
                 
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Abstract updated"}).encode('utf-8'))
+                self.send_json(200, {"status": "ok", "message": "Abstract updated"})
             except PaperNotFound as e:
                 self.send_json(404, {"status": "error", "message": str(e)})
             except (PaperReferenceError, ValueError) as e:
                 self.send_json(400, {"status": "error", "message": str(e)})
             except Exception as e:
                 print(f"Update abstract error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/update_classification':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/update_classification':
             try:
-                req_data = json.loads(post_data.decode('utf-8'))
+                req_data = self.read_json_body()
                 item_id = paper_service().resolve_reference(req_data)
                 if not item_id:
                     raise ValueError("Missing id")
@@ -1119,56 +1320,52 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     "novelty_score": novelty_score,
                     "updated_at": datetime.datetime.now().isoformat(),
                 }
-                correction.update({"method": methods[0]["name"] if methods else "Qualitative",
-                                   "topic": topics[0]["name"] if topics else "Other Marketing",
+                categories = load_categories() or {}
+                method_names = [m.get("name") for m in categories.get("methods", []) if isinstance(m, dict)]
+                topic_names = [t.get("name") for t in categories.get("topics", []) if isinstance(t, dict)]
+                correction.update({"method": methods[0]["name"] if methods else fallback_label(method_names, "Qualitative"),
+                                   "topic": topics[0]["name"] if topics else fallback_label(topic_names, "Other Marketing"),
                                    "classification_source": "user", "user_corrected": True})
                 paper_service().save_classification(item_id, correction)
 
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Classification updated"}).encode('utf-8'))
+                self.send_json(200, {"status": "ok", "message": "Classification updated"})
             except PaperNotFound as e:
                 self.send_json(404, {"status": "error", "message": str(e)})
             except (PaperReferenceError, ValueError) as e:
                 self.send_json(400, {"status": "error", "message": str(e)})
             except Exception as e:
                 print(f"Update classification error: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/categories':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/categories':
             try:
-                req_data = json.loads(post_data.decode('utf-8'))
+                req_data = self.read_json_body()
                 if not isinstance(req_data, dict):
                     raise ValueError("Invalid categories payload")
                 save_categories(req_data)
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Categories saved"}).encode('utf-8'))
+                self.send_json(200, {"status": "ok", "message": "Categories saved"})
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/save_config':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/save_config':
             
             try:
-                new_config = json.loads(post_data.decode('utf-8'))
+                new_config = self.read_json_body()
+                if not isinstance(new_config, dict):
+                    raise ValueError("Config payload must be a JSON object")
                 # 读取旧配置以合并（如果有其他字段）
                 current_config = {}
                 if os.path.exists(CONFIG_FILE):
                     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                        current_config = json.load(f)
-                
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        current_config = loaded
+
+                for key in CONFIG_SAVE_KEYS:
+                    if isinstance(new_config.get(key), str):
+                        new_config[key] = new_config[key].strip()
                 # A blank password field means "keep the existing key" because
                 # read APIs deliberately never return secrets to the browser.
                 if not new_config.get("OPENAI_API_KEY"):
@@ -1180,22 +1377,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 with FILE_LOCK:
                     atomic_write_json(CONFIG_FILE, current_config)
                 
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "message": "Config saved"}).encode('utf-8'))
+                self.send_json(200, {"status": "ok", "message": "Config saved"})
                 
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/journals':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+        if path == '/api/journals':
             try:
-                req_data = json.loads(post_data.decode('utf-8'))
+                req_data = self.read_json_body()
                 journals = req_data.get("journals", [])
                 if not isinstance(journals, list):
                     raise ValueError("Invalid journals payload")
@@ -1206,7 +1396,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 for item in journals:
                     if not isinstance(item, str):
                         continue
-                    value = item.strip()
+                    value = strip_tracking_params(item.strip())
                     if value and value not in seen:
                         cleaned.append(value)
                         seen.add(value)
@@ -1218,7 +1408,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 if meta_payload is None:
                     meta = load_journal_meta()
                 elif isinstance(meta_payload, dict):
-                    for key, value in meta_payload.items():
+                    for raw_key, value in meta_payload.items():
+                        key = strip_tracking_params(raw_key)
                         if isinstance(value, str):
                             meta[key] = {"subject": value}
                         elif isinstance(value, dict):
@@ -1252,45 +1443,92 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         cleaned_meta[url] = meta_item
                 save_journal_meta(cleaned_meta)
 
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({
+                self.send_json(200, {
                     "status": "ok",
                     "journals": cleaned,
                     "meta": cleaned_meta
-                }).encode('utf-8'))
+                })
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
             return
 
-        if self.path == '/api/reanalyze':
+        if path == '/api/reanalyze':
             job, duplicate = JOB_RUNNER.enqueue("reanalyze", run_reanalysis_job)
             self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
-        if self.path == '/api/fetch':
+        if path == '/api/fetch':
             job, duplicate = JOB_RUNNER.enqueue("fetch", run_fetch_job)
             self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
         # 如果不是上述 API，返回 404
-        self.send_error(404, "Endpoint not found")
+        self.send_json(404, {"status": "error", "message": "Endpoint not found"})
         return
 
-def run_server():
-    # 允许地址重用，防止重启时端口被占
-    http.server.ThreadingHTTPServer.allow_reuse_address = True
-    with http.server.ThreadingHTTPServer(('127.0.0.1', PORT), CustomHandler) as httpd:
-        print(f"Server started at http://localhost:{PORT}")
+class PaperFeedHTTPServer(http.server.ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind an in-use port, which
+    # would silently split requests between two servers.  POSIX keeps it so a
+    # restart does not wait for TIME_WAIT.
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+
+def resolve_port(cli_port=None):
+    """--port > PAPER_FEED_PORT > 8000."""
+    if cli_port is not None:
+        return int(cli_port)
+    env_port = os.environ.get("PAPER_FEED_PORT", "").strip()
+    if env_port:
+        try:
+            port = int(env_port)
+            if 0 < port < 65536:
+                return port
+        except ValueError:
+            pass
+        print(f"Warning: ignoring invalid PAPER_FEED_PORT={env_port!r}; using {DEFAULT_PORT}.")
+    return DEFAULT_PORT
+
+
+def _is_address_in_use(error):
+    return (getattr(error, "errno", None) in {errno.EADDRINUSE, 10048}
+            or getattr(error, "winerror", None) in {10048, 10013})
+
+
+def run_server(port=None):
+    port = resolve_port(port) if port is None else int(port)
+    try:
+        httpd = PaperFeedHTTPServer(('127.0.0.1', port), CustomHandler)
+    except OSError as error:
+        if _is_address_in_use(error):
+            print(f"Error: port {port} is already in use on 127.0.0.1.")
+            print(f"  - If Paper Feed is already running, open http://127.0.0.1:{port}/ instead.")
+            print("  - Otherwise stop the other program, or choose another port with "
+                  "`python server.py --port 8001` or the PAPER_FEED_PORT environment variable.")
+            return 1
+        raise
+    with httpd:
+        print(f"Server started at http://127.0.0.1:{port}")
         print("Press Ctrl+C to stop.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nShutting down server...")
-            httpd.shutdown()
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Serve the Paper Feed web UI and local API on 127.0.0.1 (no authentication; "
+                    "do not expose it to a network).")
+    parser.add_argument("--port", type=int, default=None,
+                        help=f"TCP port to listen on (default: PAPER_FEED_PORT env var, else {DEFAULT_PORT}).")
+    args = parser.parse_args(argv)
+    if args.port is not None and not 0 < args.port < 65536:
+        parser.error("--port must be between 1 and 65535")
+    return run_server(resolve_port(args.port))
+
 
 if __name__ == "__main__":
-    run_server()
+    configure_stdio()
+    sys.exit(main())

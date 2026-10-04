@@ -281,12 +281,49 @@ async function loadJournals() {
     const meta = normalizeMeta(data.meta || {}, items);
     applyList(items, meta);
     setStatus(`已加载 ${items.length} 条期刊。`);
+    refreshCatalogSubscriptions();
   } catch (error) {
     setStatus("加载失败，请检查服务是否运行。");
   }
 }
 
+// 去除 utm_* 跟踪参数（后端也会处理，这里先在前端清理以便去重）。
+function stripTrackingParams(value) {
+  const trimmed = (value || "").trim();
+  if (!trimmed || !/utm_/i.test(trimmed)) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    const keys = Array.from(url.searchParams.keys());
+    let changed = false;
+    keys.forEach((key) => {
+      if (/^utm_/i.test(key)) {
+        url.searchParams.delete(key);
+        changed = true;
+      }
+    });
+    if (!changed) return trimmed;
+    let result = url.toString();
+    if (!url.search && result.endsWith("?")) result = result.slice(0, -1);
+    return result;
+  } catch (error) {
+    return trimmed;
+  }
+}
+
+function stripTrackingFromList() {
+  let changed = 0;
+  journals.forEach((item) => {
+    const cleaned = stripTrackingParams(item.value);
+    if (cleaned !== item.value.trim()) {
+      item.value = cleaned;
+      changed += 1;
+    }
+  });
+  return changed;
+}
+
 async function saveJournals() {
+  const stripped = stripTrackingFromList();
   const values = getCurrentValues();
   const meta = getCurrentMeta(values);
   try {
@@ -303,10 +340,241 @@ async function saveJournals() {
     const nextValues = normalizeList(data.journals || values);
     const nextMeta = normalizeMeta(data.meta || meta, nextValues);
     applyList(nextValues, nextMeta);
-    setStatus(`保存完成，共 ${values.length} 条。`);
+    const strippedNote = stripped ? `（已去除 ${stripped} 条链接中的 utm 跟踪参数）` : "";
+    setStatus(`保存完成，共 ${nextValues.length} 条。${strippedNote}`);
+    refreshCatalogSubscriptions();
+    return true;
   } catch (error) {
     setStatus("保存失败，请稍后重试。");
+    return false;
   }
+}
+
+// ---------- 从目录添加 ----------
+const catalogDetails = document.getElementById("catalogDetails");
+const catalogGroups = document.getElementById("catalogGroups");
+const catalogSearch = document.getElementById("catalogSearch");
+const catalogCount = document.getElementById("catalogCount");
+const btnCatalogAdd = document.getElementById("btnCatalogAdd");
+
+const catalogState = {
+  loaded: false,
+  loading: false,
+  unavailable: false,
+  items: [],
+  selected: new Set(),
+  filter: "",
+};
+
+function catalogKey(url) {
+  return stripTrackingParams(url || "").replace(/\/+$/, "").toLowerCase();
+}
+
+function getSubscribedKeys() {
+  return new Set(journals.map((item) => catalogKey(item.value)).filter(Boolean));
+}
+
+function isCatalogItemSubscribed(item, subscribedKeys) {
+  return Boolean(item.subscribed) || subscribedKeys.has(catalogKey(item.url));
+}
+
+async function loadCatalog() {
+  if (catalogState.loaded || catalogState.loading || !catalogGroups) return;
+  catalogState.loading = true;
+  catalogGroups.innerHTML = '<p class="panel-hint">正在加载期刊目录...</p>';
+  try {
+    const res = await fetch("/api/journal_catalog?t=" + Date.now(), { cache: "no-store" });
+    if (res.status === 404) {
+      catalogState.unavailable = true;
+      catalogGroups.innerHTML = '<p class="panel-hint">当前服务器版本不支持期刊目录，请更新后端后重试；也可以使用「导入 / 批量操作」手动添加。</p>';
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    catalogState.items = (Array.isArray(data.items) ? data.items : [])
+      .filter((item) => item && typeof item.url === "string" && item.url.trim())
+      .map((item) => ({
+        name: (item.name || "").trim(),
+        url: item.url.trim(),
+        subject: (item.subject || "").trim() || "未分类",
+        tags: Array.isArray(item.tags) ? item.tags.filter(Boolean) : [],
+        subscribed: Boolean(item.subscribed),
+      }));
+    catalogState.loaded = true;
+    renderCatalog();
+  } catch (error) {
+    catalogGroups.innerHTML = '<p class="panel-hint">期刊目录加载失败，请确认服务器运行中后重新展开。</p>';
+  } finally {
+    catalogState.loading = false;
+  }
+}
+
+function catalogMatchesFilter(item) {
+  if (!catalogState.filter) return true;
+  const needle = catalogState.filter.toLowerCase();
+  return [item.name, item.url, item.subject, ...item.tags].some((text) =>
+    (text || "").toLowerCase().includes(needle)
+  );
+}
+
+function updateCatalogFooter() {
+  const count = catalogState.selected.size;
+  if (btnCatalogAdd) {
+    btnCatalogAdd.disabled = count === 0;
+    btnCatalogAdd.textContent = count ? `添加所选（${count}）` : "添加所选";
+  }
+}
+
+function renderCatalog() {
+  if (!catalogGroups || !catalogState.loaded) return;
+  const subscribedKeys = getSubscribedKeys();
+  const visible = catalogState.items.filter(catalogMatchesFilter);
+  const subscribedTotal = catalogState.items.filter((item) => isCatalogItemSubscribed(item, subscribedKeys)).length;
+  if (catalogCount) {
+    catalogCount.textContent = `目录 ${catalogState.items.length} 本 · 已订阅 ${subscribedTotal} 本`;
+  }
+
+  catalogGroups.innerHTML = "";
+  if (!visible.length) {
+    const empty = document.createElement("p");
+    empty.className = "panel-hint";
+    empty.textContent = catalogState.items.length ? "没有匹配的目录条目。" : "目录为空。";
+    catalogGroups.appendChild(empty);
+    updateCatalogFooter();
+    return;
+  }
+
+  const groups = new Map();
+  visible.forEach((item) => {
+    if (!groups.has(item.subject)) groups.set(item.subject, []);
+    groups.get(item.subject).push(item);
+  });
+
+  const fragment = document.createDocumentFragment();
+  Array.from(groups.keys())
+    .sort((a, b) => a.localeCompare(b, "zh-CN"))
+    .forEach((subject) => {
+      const items = groups.get(subject);
+      const group = document.createElement("details");
+      group.className = "catalog-group";
+      if (catalogState.filter || groups.size <= 3) group.open = true;
+
+      const summary = document.createElement("summary");
+      const subscribedCount = items.filter((item) => isCatalogItemSubscribed(item, subscribedKeys)).length;
+      summary.textContent = `${subject}（${items.length}，已订阅 ${subscribedCount}）`;
+      group.appendChild(summary);
+
+      items.forEach((item) => {
+        const subscribed = isCatalogItemSubscribed(item, subscribedKeys);
+        const key = catalogKey(item.url);
+        const row = document.createElement("label");
+        row.className = "catalog-item" + (subscribed ? " catalog-item--subscribed" : "");
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.dataset.key = key;
+        checkbox.checked = subscribed || catalogState.selected.has(key);
+        checkbox.disabled = subscribed;
+
+        const name = document.createElement("span");
+        name.className = "catalog-item__name";
+        name.textContent = item.name || item.url;
+
+        row.appendChild(checkbox);
+        row.appendChild(name);
+
+        if (subscribed) {
+          const tag = document.createElement("span");
+          tag.className = "catalog-tag catalog-tag--subscribed";
+          tag.textContent = "已订阅";
+          row.appendChild(tag);
+        }
+        item.tags.forEach((tagText) => {
+          const tag = document.createElement("span");
+          tag.className = "catalog-tag";
+          tag.textContent = tagText;
+          row.appendChild(tag);
+        });
+
+        const url = document.createElement("span");
+        url.className = "catalog-item__url";
+        url.textContent = item.url;
+        row.appendChild(url);
+
+        group.appendChild(row);
+      });
+      fragment.appendChild(group);
+    });
+  catalogGroups.appendChild(fragment);
+  updateCatalogFooter();
+}
+
+function refreshCatalogSubscriptions() {
+  if (!catalogState.loaded) return;
+  const subscribedKeys = getSubscribedKeys();
+  catalogState.items.forEach((item) => {
+    if (subscribedKeys.has(catalogKey(item.url))) catalogState.selected.delete(catalogKey(item.url));
+  });
+  renderCatalog();
+}
+
+async function addSelectedFromCatalog() {
+  if (!catalogState.selected.size) return;
+  const subscribedKeys = getSubscribedKeys();
+  const toAdd = catalogState.items.filter(
+    (item) => catalogState.selected.has(catalogKey(item.url)) && !subscribedKeys.has(catalogKey(item.url))
+  );
+  if (!toAdd.length) {
+    catalogState.selected.clear();
+    renderCatalog();
+    setStatus("所选期刊均已在订阅列表中。");
+    return;
+  }
+  // 合并到现有列表（新条目放在末尾），再走原有的保存流程。
+  const added = new Set();
+  toAdd.forEach((item) => {
+    const url = stripTrackingParams(item.url);
+    const key = catalogKey(url);
+    if (added.has(key)) return;
+    added.add(key);
+    journals.push(createJournalItem(url, item.subject === "未分类" ? "" : item.subject, item.name));
+  });
+  renderList();
+  if (btnCatalogAdd) btnCatalogAdd.disabled = true;
+  const ok = await saveJournals();
+  if (ok) {
+    catalogState.selected.clear();
+    refreshCatalogSubscriptions();
+    setStatus(`已从目录添加 ${added.size} 本期刊并保存，共 ${journals.length} 条。`);
+  } else {
+    updateCatalogFooter();
+  }
+}
+
+if (catalogDetails) {
+  catalogDetails.addEventListener("toggle", () => {
+    if (catalogDetails.open) loadCatalog();
+  });
+}
+if (catalogGroups) {
+  catalogGroups.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!target || target.type !== "checkbox" || target.disabled) return;
+    const key = target.dataset.key;
+    if (!key) return;
+    if (target.checked) catalogState.selected.add(key);
+    else catalogState.selected.delete(key);
+    updateCatalogFooter();
+  });
+}
+if (catalogSearch) {
+  catalogSearch.addEventListener("input", (event) => {
+    catalogState.filter = event.target.value.trim();
+    renderCatalog();
+  });
+}
+if (btnCatalogAdd) {
+  btnCatalogAdd.addEventListener("click", addSelectedFromCatalog);
 }
 
 function addRow() {

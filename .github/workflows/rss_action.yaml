@@ -32,6 +32,11 @@ jobs:
     - name: Run RSS Script
       env: 
         RSS_KEYWORDS: ${{ secrets.RSS_KEYWORDS }}
+        # Optional AI enrichment. Unset secrets expand to empty strings, which
+        # the scripts treat as "not configured" (AI translation is skipped).
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
       run: |
         # SQLite is an ephemeral CI cache. get_RSS.py bootstraps it from the
         # committed XML/JSON compatibility exports when it is absent.

@@ -1,0 +1,38 @@
+# Paper Feed 关键词示例（消费者行为研究方向）
+# 使用方法：复制为 keywords.dat，或在网页“🔑 关键词”编辑器中粘贴后预览、保存。
+#
+# 语法说明：
+# - 每行一条规则；多行之间是“或”关系，命中任意一行即保留论文
+# - 用 AND 连接多个词：同一行的所有词都必须出现在标题或摘要中
+# - 词前加 - 或 NOT 表示排除，例如  AI AND NOT agriculture
+# - 不区分大小写，按“词首”匹配：consum 能匹配 consumer / consumption，ai 不会匹配 said
+# - 多词短语用英文双引号，例如  "word of mouth"
+# - 以 # 开头的行是注释
+# - 修改关键词只影响之后新抓取的论文，不会删除已入库的论文
+
+# 情绪与自我意识
+embarrassment
+shame AND consum
+guilt AND consum
+nostalgia
+
+# 亲社会与慈善
+fundraising
+charit AND donat
+prosocial AND consum
+
+# 数字与 AI 消费
+"artificial intelligence" AND consumer
+algorithm AND aversion
+chatbot
+"social media" AND marketing
+influencer
+
+# 决策与判断
+"choice overload"
+scarcity AND consum
+"mental accounting"
+
+# 品牌与口碑
+"word of mouth"
+brand AND anthropomorph

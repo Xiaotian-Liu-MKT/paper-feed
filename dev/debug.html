@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
     <meta charset="utf-8">
     <title>Debug - Classification Check</title>
@@ -27,9 +27,22 @@
     </table>
 
     <script>
+        // 开发调试页：不由 server.py 提供（其静态根目录是 web/）。
+        // 用法：在仓库根目录运行 `python -m http.server`，然后打开 /dev/debug.html。
+        const FEED_CANDIDATES = ['../web/feed.json', '/feed.json'];
+
+        async function loadFeedJson() {
+            for (const url of FEED_CANDIDATES) {
+                try {
+                    const res = await fetch(url + '?nocache=' + Date.now());
+                    if (res.ok) return await res.json();
+                } catch (e) { /* try next */ }
+            }
+            throw new Error('feed.json not found');
+        }
+
         async function debug() {
-            const response = await fetch('feed.json?nocache=' + Date.now());
-            const data = await response.json();
+            const data = await loadFeedJson();
             const items = data.items;
 
             // Count classifications

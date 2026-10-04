@@ -96,6 +96,17 @@ function normalizeInteractions() {
   };
 }
 
+// /api/interactions 返回 paper_id；兼容旧数据中的 link / legacy id。
+function itemInSet(set, item) {
+  if (!set || !item) return false;
+  return (
+    (item.paperId && set.has(item.paperId)) ||
+    (item.link && set.has(item.link)) ||
+    (item.legacyId && set.has(item.legacyId)) ||
+    false
+  );
+}
+
 function getPositiveSet() {
   return new Set([
     ...(statsState.interactions.favorites || []),
@@ -209,8 +220,8 @@ function isWithinRange(item, fromDate, toDate) {
 
 function computeStats(items, favorites, hidden) {
   const total = items.length;
-  const liked = items.filter((item) => favorites.has(item.link)).length;
-  const disliked = items.filter((item) => hidden.has(item.link)).length;
+  const liked = items.filter((item) => itemInSet(favorites, item)).length;
+  const disliked = items.filter((item) => itemInSet(hidden, item)).length;
   const neutral = Math.max(0, total - liked - disliked);
   const ratioBase = total || 1;
   const likePct = liked / ratioBase;
@@ -448,8 +459,8 @@ function renderOverview(items, fromDate, toDate) {
     const ratioText = document.createElement("div");
     ratioText.className = "overview-ratio-text";
     ratioText.textContent = row.stats.total
-      ? `${percentFormatter.format(row.stats.likePct)} 喜欢`
-      : "0% 喜欢";
+      ? `${percentFormatter.format(row.stats.likePct)} 收藏`
+      : "0% 收藏";
 
     ratioWrap.appendChild(ratioBar);
     ratioWrap.appendChild(ratioText);
@@ -501,6 +512,8 @@ async function loadFeed() {
     const payload = await response.json();
     statsState.items = (payload.items || []).map((item) => ({
       journal: cleanJournalName(item.journal) || "未知期刊",
+      paperId: item.paper_id || "",
+      legacyId: item.id || "",
       link: item.link,
       date: item.pub_date ? new Date(item.pub_date) : null,
       topic: item.topic,
@@ -709,6 +722,15 @@ function formatTopLabels(entries, limit) {
   return entries.slice(0, limit).map((entry) => entry.label).join(" / ");
 }
 
+const FIT_SCORE_HELP = "匹配度 = (收藏占比 − 不感兴趣占比) × 100，范围 −100 ~ +100；>0 表示你更常收藏该期刊的文章";
+const CONFIDENCE_HELP = "按样本量计算 log(n+1)/log(51)，约 4 篇为中等、15 篇为高、50 篇达到 100%";
+const STRUCTURE_HELP = "结构匹配 = 0.7 × Topic 分布余弦相似度 + 0.3 × Method 分布余弦相似度（×100）";
+
+function buildJournalFilterLink(journal) {
+  const params = new URLSearchParams({ journal, view: "all", from: "stats" });
+  return `index.html?${params.toString()}`;
+}
+
 function describeConfidence(confidence) {
   if (confidence >= 0.7) return { label: "高置信", tone: "high" };
   if (confidence >= 0.4) return { label: "中等置信", tone: "mid" };
@@ -761,7 +783,7 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
 
     const meta = document.createElement("div");
     meta.className = "fit-journal-meta";
-    meta.textContent = `样本 ${row.stats.total} · 喜欢 ${row.stats.liked} · 不喜欢 ${row.stats.disliked} · 未反馈 ${row.stats.neutral}`;
+    meta.textContent = `样本 ${row.stats.total} · 收藏 ${row.stats.liked} · 不感兴趣 ${row.stats.disliked} · 未反馈 ${row.stats.neutral}`;
 
     info.appendChild(title);
     info.appendChild(meta);
@@ -774,6 +796,7 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
     score.dataset.tone = scoreTone;
     const scoreValue = row.fitScore ? Math.round(row.fitScore) : 0;
     score.textContent = `${scoreValue >= 0 ? "+" : ""}${scoreValue}`;
+    score.title = FIT_SCORE_HELP;
 
     header.appendChild(info);
     header.appendChild(score);
@@ -784,9 +807,11 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
     const confidenceBadge = document.createElement("span");
     confidenceBadge.className = `fit-chip fit-chip--${confidenceInfo.tone}`;
     confidenceBadge.textContent = confidenceInfo.label;
+    confidenceBadge.title = `置信度 ${Math.round(row.confidence * 100)}%：${CONFIDENCE_HELP}`;
 
     const structureBadge = document.createElement("span");
     structureBadge.className = "fit-chip";
+    structureBadge.title = STRUCTURE_HELP;
     structureBadge.textContent = baselineReady
       ? `结构匹配 ${Math.round(row.structureScore * 100)}`
       : "结构匹配 -";
@@ -852,7 +877,7 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
     actions.className = "fit-journal-actions";
     const link = document.createElement("a");
     link.className = "fit-match-filter";
-    link.href = `index.html?journal=${encodeURIComponent(row.journal)}`;
+    link.href = buildJournalFilterLink(row.journal);
     link.textContent = "筛选";
     actions.appendChild(link);
 
@@ -919,7 +944,7 @@ function renderFitProfile(fromDate, toDate) {
     baselineLabel = compareJournal ? `对比：${compareJournal}` : "对比期刊";
   } else {
     baselineItems = statsState.items.filter(
-      (item) => favorites.has(item.link) && isWithinRange(item, fromDate, toDate)
+      (item) => itemInSet(favorites, item) && isWithinRange(item, fromDate, toDate)
     );
     baselineLabel = "我的收藏";
   }
@@ -1010,7 +1035,8 @@ function renderMatchResults(results, queryMatches) {
 
     const detail = document.createElement("div");
     detail.className = "fit-match-detail";
-    detail.textContent = `结构匹配 ${(result.structureScore * 100).toFixed(0)} · 置信 ${result.confidence.toFixed(2)} · 匹配度 ${result.fitScore.toFixed(0)}`;
+    detail.textContent = `结构匹配 ${(result.structureScore * 100).toFixed(0)} · 置信度 ${Math.round(result.confidence * 100)}% · 匹配度 ${result.fitScore.toFixed(0)}`;
+    detail.title = "综合得分 = 结构匹配 × 置信度；详见页面顶部「指标说明」";
 
     const explain = document.createElement("div");
     explain.className = "fit-match-explain";
@@ -1020,7 +1046,7 @@ function renderMatchResults(results, queryMatches) {
 
     const link = document.createElement("a");
     link.className = "fit-match-filter";
-    link.href = `index.html?journal=${encodeURIComponent(result.journal)}`;
+    link.href = buildJournalFilterLink(result.journal);
     link.textContent = "筛选";
 
     card.appendChild(header);
@@ -1203,7 +1229,7 @@ function renderTopicRadar(items) {
   const favorites = getPositiveSet();
   const counts = new Map();
   items.forEach((item) => {
-    if (!favorites.has(item.link)) return;
+    if (!itemInSet(favorites, item)) return;
     extractTopicLabels(item).forEach((label) => {
       counts.set(label, (counts.get(label) || 0) + 1);
     });

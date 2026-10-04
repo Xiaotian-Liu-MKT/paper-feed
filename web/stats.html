@@ -3,19 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Paper Feed · 统计</title>
-    <link rel="stylesheet" href="styles.css?v=2.0" />
+    <title>Paper Feed · 期刊统计</title>
+    <link rel="stylesheet" href="styles.css?v=2.2" />
+    <link rel="stylesheet" href="pages.css?v=1.0" />
   </head>
   <body class="stats-page">
     <header class="hero">
       <div class="hero__bg"></div>
-      <div class="hero__actions">
-        <a class="btn btn--secondary" href="index.html">🏠 返回主页</a>
-      </div>
+      <nav id="site-nav" class="hero__actions" aria-label="站点导航"></nav>
       <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
         <h1>期刊统计看板</h1>
-        <p class="subhead">查看单一期刊的发刊频率与我喜欢/不喜欢的占比。</p>
+        <p class="subhead">查看各期刊的发刊频率，以及我收藏/不感兴趣的占比。</p>
       </div>
     </header>
 
@@ -35,6 +34,22 @@
         </button>
       </div>
 
+      <details class="report-details metric-explainer" style="margin-bottom: 16px;">
+        <summary>指标说明</summary>
+        <dl>
+          <dt>收藏 / 不感兴趣 / 未反馈</dt>
+          <dd>该期刊在当前时间范围内的文章中，被你收藏（含归档）、标为不感兴趣、以及尚未处理的篇数与占比。</dd>
+          <dt>匹配度</dt>
+          <dd><code>(收藏占比 − 不感兴趣占比) × 100</code>，范围 −100 ~ +100。≥ +20 显示为高匹配，≤ −20 为低匹配。</dd>
+          <dt>置信度</dt>
+          <dd><code>log(n + 1) / log(51)</code>，n 为该期刊的样本篇数，上限 100%。约 4 篇以上为「中等置信」（≥ 40%），约 15 篇以上为「高置信」（≥ 70%），50 篇达到 100%。样本少时匹配度波动大，仅供参考。</dd>
+          <dt>结构匹配</dt>
+          <dd><code>0.7 × Topic 分布余弦相似度 + 0.3 × Method 分布余弦相似度</code>，显示为 0–100。对比基准默认是「我的收藏」，也可换成另一本期刊。</dd>
+          <dt>摘要匹配得分</dt>
+          <dd>「研究摘要匹配」中按 <code>结构匹配 × 置信度</code> 排序：先从你粘贴的文字中识别 Topic/Method 关键词，再与各期刊的分布比对。</dd>
+        </dl>
+      </details>
+
       <div class="tab-panel is-active" data-tab-panel="overview" role="tabpanel">
         <section class="panel">
         <div class="panel-title-row">
@@ -44,8 +59,8 @@
               <span>排序</span>
               <select id="overviewSort">
                 <option value="total_desc">总篇数（高→低）</option>
-                <option value="like_desc">喜欢占比（高→低）</option>
-                <option value="dislike_desc">不喜欢占比（高→低）</option>
+                <option value="like_desc">收藏占比（高→低）</option>
+                <option value="dislike_desc">不收藏占比（高→低）</option>
                 <option value="last_desc">最近发布（最新→最旧）</option>
                 <option value="name_asc">期刊名称（A→Z）</option>
               </select>
@@ -61,8 +76,8 @@
                 <th>期刊</th>
                 <th class="overview-spacer"></th>
                 <th>总篇数</th>
-                <th>喜欢</th>
-                <th>不喜欢</th>
+                <th>收藏</th>
+                <th>不感兴趣</th>
                 <th>未反馈</th>
                 <th>占比</th>
                 <th>最近发布</th>
@@ -127,7 +142,7 @@
         </section>
 
         <section class="panel">
-          <h3 class="panel-title">我喜欢/不喜欢占比</h3>
+          <h3 class="panel-title">我的收藏/不感兴趣占比</h3>
           <div class="ratio-bar" aria-hidden="true">
             <div id="ratioLikeBar" class="ratio-fill ratio-fill--like"></div>
             <div id="ratioDislikeBar" class="ratio-fill ratio-fill--dislike"></div>
@@ -137,14 +152,14 @@
             <div class="ratio-item">
               <span class="ratio-dot ratio-dot--like"></span>
               <div>
-                <div class="ratio-label">喜欢</div>
+                <div class="ratio-label">收藏</div>
                 <div class="ratio-value" id="ratioLikeText">-</div>
               </div>
             </div>
             <div class="ratio-item">
               <span class="ratio-dot ratio-dot--dislike"></span>
               <div>
-                <div class="ratio-label">不喜欢</div>
+                <div class="ratio-label">不感兴趣</div>
                 <div class="ratio-value" id="ratioDislikeText">-</div>
               </div>
             </div>
@@ -202,7 +217,7 @@
               <span class="panel-note" id="fitOverviewCount"></span>
             </div>
           </div>
-          <p class="panel-hint">基于收藏/归档/隐藏/未操作计算匹配度与置信度，可对照下方基准画像理解结构差异。</p>
+          <p class="panel-hint">基于收藏/归档/不感兴趣/未操作计算匹配度与置信度，可对照下方基准画像理解结构差异。</p>
           <div class="fit-journal-list" id="fitJournalList"></div>
         </section>
 
@@ -272,6 +287,7 @@
       </div>
     </main>
 
-    <script src="stats.js?v=1.0"></script>
+    <script src="nav.js?v=1.0"></script>
+    <script src="stats.js?v=1.1"></script>
   </body>
 </html>

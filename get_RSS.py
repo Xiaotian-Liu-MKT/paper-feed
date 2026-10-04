@@ -1,11 +1,13 @@
 import feedparser
 import re
 import os
+import sys
 import datetime
 import time
 import json
 import hashlib
 import tempfile
+import functools
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rfeed import Item, Feed, Guid
@@ -15,8 +17,11 @@ from paper_feed.ingestion import ingest_fetch_results, ensure_database, save_tra
 from paper_feed.exporter import database_items, export_items
 
 # --- 配置区域 ---
-OUTPUT_FILE = "filtered_feed.xml"
-WEB_DIR = "web"
+# All project files resolve relative to this file, never the current directory,
+# so `python E:\...\get_RSS.py` behaves the same from any working directory.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(BASE_DIR, "filtered_feed.xml")
+WEB_DIR = os.path.join(BASE_DIR, "web")
 FEED_JSON = os.path.join(WEB_DIR, "feed.json")
 JOURNAL_HASH_FILE = os.path.join(WEB_DIR, "journals.hash")
 TRANSLATIONS_CACHE = os.path.join(WEB_DIR, "translations.json")
@@ -30,8 +35,28 @@ AI_ANALYSIS_WORKERS = 5
 ABSTRACT_FETCH_WORKERS = 5
 CLASSIFICATION_VERSION = "v2"
 
+JOURNALS_FILE = os.path.join(BASE_DIR, "journals.dat")
+KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.dat")
+
 # OpenAI 配置
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+CONFIG_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+CONFIG_DEFAULTS = {"OPENAI_MODEL": DEFAULT_OPENAI_MODEL}
+OPENAI_RETRY_ATTEMPTS = 3
+OPENAI_RETRY_BASE_DELAY = 2.0
+MAX_REPORTED_ERRORS = 20
+UNCLASSIFIED_LABEL = "Unclassified"
+DEFAULT_CLASSIFICATION_DOMAIN = "Business & Marketing"
+
+
+def configure_stdio():
+    """Avoid UnicodeEncodeError on legacy Windows consoles (GBK/cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def atomic_write(path, content, encoding="utf-8"):
@@ -56,26 +81,100 @@ def atomic_write(path, content, encoding="utf-8"):
             pass
         raise
 
+def is_usable_config_value(value):
+    """Empty values and template placeholders (e.g. "your-api-key-here") are unset."""
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return True
+    text = value.strip()
+    return bool(text) and not text.lower().startswith("your-")
+
+
 def get_config():
-    config = {
-        "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
-        "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL"),
-        "OPENAI_PROXY": os.environ.get("OPENAI_PROXY")
-    }
+    """Resolve settings: non-empty env var > usable config.json value > default."""
+    local_config = {}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                local_config = json.load(f)
-                config.update(local_config)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                local_config = loaded
         except Exception as e:
             print(f"Error reading config file: {e}")
-    
-    # Clean up empty strings to None
-    for key in ["OPENAI_BASE_URL", "OPENAI_PROXY"]:
-        if config.get(key) == "":
-            config[key] = None
-            
+
+    # Unknown keys are preserved for forward compatibility.
+    config = {key: value for key, value in local_config.items() if key not in CONFIG_KEYS}
+    for key in CONFIG_KEYS:
+        env_value = os.environ.get(key)
+        file_value = local_config.get(key)
+        if is_usable_config_value(env_value):
+            config[key] = env_value.strip()
+        elif is_usable_config_value(file_value):
+            config[key] = file_value.strip() if isinstance(file_value, str) else file_value
+        else:
+            config[key] = CONFIG_DEFAULTS.get(key)
     return config
+
+
+def config_model(config):
+    return (config or {}).get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+
+
+def add_error(report, message):
+    """Record a failure in a job report; the error list is capped for the UI."""
+    if report is None:
+        return
+    errors = report.setdefault("errors", [])
+    if len(errors) < MAX_REPORTED_ERRORS:
+        errors.append(str(message)[:300])
+
+
+def make_openai_client(api_key, base_url=None, proxy=None):
+    """Create an OpenAI client.  httpx>=0.28 accepts only `proxy=`, not `proxies=`."""
+    from openai import OpenAI
+    import httpx
+
+    http_client = httpx.Client(proxy=proxy) if proxy else None
+    return OpenAI(api_key=api_key, base_url=base_url or None, http_client=http_client)
+
+
+def is_retryable_openai_error(error):
+    try:
+        import openai
+    except ImportError:
+        return False
+    retryable = tuple(cls for cls in (getattr(openai, "RateLimitError", None),
+                                      getattr(openai, "APIConnectionError", None)) if cls)
+    if retryable and isinstance(error, retryable):
+        return True
+    status_error = getattr(openai, "APIStatusError", None)
+    if status_error and isinstance(error, status_error):
+        return (getattr(error, "status_code", 0) or 0) >= 500
+    return False
+
+
+def chat_completion_with_retry(client, attempts=None, **kwargs):
+    """Call chat.completions.create with exponential backoff on transient errors."""
+    attempts = max(1, attempts or OPENAI_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if attempt >= attempts or not is_retryable_openai_error(error):
+                raise
+            delay = OPENAI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"OpenAI transient error ({type(error).__name__}); retrying in {delay:.0f}s "
+                  f"(attempt {attempt}/{attempts})...")
+            time.sleep(delay)
+
+
+def fallback_label(configured_names, preferred):
+    """Legacy default when configured (or nothing configured), otherwise Unclassified."""
+    names = [name for name in (configured_names or []) if name]
+    if not names or preferred in names:
+        return preferred
+    return UNCLASSIFIED_LABEL
 
 # ----------------
 
@@ -154,58 +253,54 @@ def get_abstract_from_semantic_scholar(title):
 
     return None
 
-def generate_abstract_with_gpt(title, journal, api_key, base_url=None, proxy=None):
-    """使用 GPT 基于标题生成研究方向说明"""
+def generate_abstract_with_gpt(title, journal, api_key, base_url=None, proxy=None, model=None, errors=None):
+    """使用 GPT 基于标题推测研究方向（仅标题，未读原文，属于推测）"""
     if not title or not api_key:
         return None
 
     try:
-        from openai import OpenAI
-        import httpx
+        client = make_openai_client(api_key, base_url, proxy)
 
-        http_client = None
-        if proxy:
-            http_client = httpx.Client(proxies=proxy)
+        prompt = f"""Only the title and journal of an academic paper are available below. You have NOT read the paper or its abstract.
+Write a short (about 120 words) Chinese note that GUESSES what the study may investigate, based on the title only.
 
-        client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
-
-        prompt = f"""Based on the following academic paper title and journal, generate a concise 150-word research summary in Chinese. Describe what the study likely investigates, potential methods, and significance. Keep it academic and objective.
+Rules:
+- This is a speculative guess, not a summary. Use hedged wording such as "可能"、"推测"、"或许" throughout.
+- Do not invent specific findings, sample sizes, effect directions, statistics, or study counts.
+- Start the note with "【基于标题推测，未读原文】".
+- No HTML tags or angle brackets.
 
 Title: {title}
 Journal: {journal}
 
-Provide a structured summary covering: 研究主题、可能的研究方法、预期贡献。"""
+Cover briefly: 可能的研究主题、可能的研究方法、可能的贡献。"""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = chat_completion_with_retry(
+            client,
+            model=model or DEFAULT_OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are an academic research assistant. Generate concise, academic-style research summaries in Chinese."},
+                {"role": "system", "content": "You are a careful academic research assistant. When information is missing you say so and only speculate with explicit hedging, in Chinese."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=300,
-            temperature=0.7
+            temperature=0.2
         )
 
         return response.choices[0].message.content.strip()
 
     except Exception as e:
         print(f"GPT abstract generation error: {e}")
+        if errors is not None:
+            errors.append(f"{type(e).__name__}: {e}")
         return None
 
-def summarize_abstract_with_gpt(abstract, title, api_key, base_url=None, proxy=None):
+def summarize_abstract_with_gpt(abstract, title, api_key, base_url=None, proxy=None, model=None, errors=None):
     """使用 GPT 基于已有摘要生成中文学术总结"""
     if not abstract or not api_key:
         return None
 
     try:
-        from openai import OpenAI
-        import httpx
-
-        http_client = None
-        if proxy:
-            http_client = httpx.Client(proxies=proxy)
-
-        client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        client = make_openai_client(api_key, base_url, proxy)
 
         prompt = f"""Summarize the following academic abstract in Chinese (120-150 words). Keep it academic, concise, and objective. Avoid any HTML tags or angle brackets.
 
@@ -214,8 +309,9 @@ Abstract: {abstract}
 
 Provide a structured summary covering: 研究主题、可能的研究方法、主要贡献。"""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = chat_completion_with_retry(
+            client,
+            model=model or DEFAULT_OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are an academic research assistant. Generate concise, academic-style research summaries in Chinese."},
                 {"role": "user", "content": prompt}
@@ -228,6 +324,8 @@ Provide a structured summary covering: 研究主题、可能的研究方法、�
 
     except Exception as e:
         print(f"GPT abstract summary error: {e}")
+        if errors is not None:
+            errors.append(f"{type(e).__name__}: {e}")
         return None
 
 def fetch_abstract_with_fallback(entry, api_key=None, base_url=None, proxy=None):
@@ -336,25 +434,39 @@ def pick_primary(entries, fallback=""):
         return entries[0].get("name", "") or fallback
     return fallback
 
-def batch_analyze_papers(titles, api_key, base_url=None, proxy=None):
+def batch_analyze_papers(titles, api_key, base_url=None, proxy=None, model=None, report=None):
+    """Translate/classify titles.  Returns {title: analysis}.
+
+    Failures never raise: when *report* is a dict, ``report["failed"]`` is
+    incremented by the number of titles that could not be analysed and short
+    messages are appended to ``report["errors"]``.
+    """
+    if report is not None:
+        report.setdefault("failed", 0)
+        report.setdefault("errors", [])
     if not titles or not api_key:
         return {}
-    
-    from openai import OpenAI
-    import httpx
-    
-    http_client = None
+
     if proxy:
         print(f"Using proxy: {proxy}")
-        http_client = httpx.Client(proxies=proxy)
+    try:
+        client = make_openai_client(api_key, base_url, proxy)
+    except Exception as e:
+        # A bad proxy URL or missing dependency must not abort the RSS refresh.
+        print(f"Could not create OpenAI client; skipping AI analysis: {e}")
+        if report is not None:
+            report["failed"] += len(titles)
+        add_error(report, f"OpenAI client error: {type(e).__name__}: {e}")
+        return {}
+    model = model or DEFAULT_OPENAI_MODEL
 
-    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
-    
     analysis_results = {}
     chunk_size = 10
     chunks = [titles[i:i + chunk_size] for i in range(0, len(titles), chunk_size)]
-    
+
     categories = load_categories() or {}
+    domain = categories.get("domain") if isinstance(categories.get("domain"), str) else ""
+    domain = domain.strip() or DEFAULT_CLASSIFICATION_DOMAIN
     method_defs = categories.get("methods", [])
     topic_defs = categories.get("topics", [])
     theory_defs = categories.get("theories", [])
@@ -374,8 +486,12 @@ def batch_analyze_papers(titles, api_key, base_url=None, proxy=None):
     methods_text = "\n".join([f"- {m.get('name')}: {', '.join(m.get('keywords', [])[:6])}" for m in method_defs if isinstance(m, dict)])
     topics_text = "\n".join([f"- {t.get('name')}: {', '.join(t.get('keywords', [])[:8])}" for t in topic_defs if isinstance(t, dict)])
 
+    method_fallback = fallback_label(method_names, "Qualitative")
+    topic_fallback = fallback_label(topic_names, "Other Marketing")
+
     def analyze_chunk(chunk):
-        prompt = f"""You are a research classification expert in Business & Marketing.
+        """Return (pairs, error_message); error_message is None on success."""
+        prompt = f"""You are a research classification expert in {domain}.
 For each paper title, provide:
 1. "zh": Chinese translation (academic style). DO NOT use any HTML tags or angle brackets.
 2. "methods": 1-2 items, each with {{ "name": <method>, "confidence": 0-1 }}.
@@ -409,8 +525,9 @@ Example:
         user_content = "Titles:\n" + "\n".join([f"{j+1}. {t}" for j, t in enumerate(chunk)])
 
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
+            response = chat_completion_with_retry(
+                client,
+                model=model,
                 messages=[
                     {"role": "system", "content": "You are a JSON-only API. You must return valid JSON."},
                     {"role": "user", "content": prompt + "\n\n" + user_content}
@@ -420,34 +537,44 @@ Example:
             content = response.choices[0].message.content
             data = json.loads(content)
             result_list = data.get("results", [])
-            
+
             # Fallback/Validation
             if len(result_list) != len(chunk):
-                print(f"Warning: GPT returned {len(result_list)} items for {len(chunk)} titles.")
-                return []
+                message = f"GPT returned {len(result_list)} items for {len(chunk)} titles"
+                print(f"Warning: {message}.")
+                return [], message
 
-            return list(zip(chunk, result_list))
+            return list(zip(chunk, result_list)), None
         except Exception as e:
             print(f"Analysis error for chunk: {e}")
-            return []
+            return [], f"{type(e).__name__}: {e}"
 
     worker_count = min(AI_ANALYSIS_WORKERS, len(chunks))
-    print(f"Starting concurrent analysis with {worker_count} workers for {len(chunks)} chunks...")
+    print(f"Starting concurrent analysis with {worker_count} workers for {len(chunks)} chunks (model: {model})...")
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_to_chunk = {executor.submit(analyze_chunk, chunk): chunk for chunk in chunks}
 
         completed = 0
         for future in as_completed(future_to_chunk):
-            chunk_results = future.result()
+            try:
+                chunk_results, chunk_error = future.result()
+            except Exception as e:
+                chunk_results, chunk_error = [], f"{type(e).__name__}: {e}"
+            if chunk_error:
+                if report is not None:
+                    report["failed"] += len(future_to_chunk[future])
+                add_error(report, chunk_error)
             valid_methods = set(method_names)
             valid_topics = set(topic_names)
             for original_title, data in chunk_results:
+                if not isinstance(data, dict):
+                    data = {}
                 methods = normalize_label_entries(data.get("methods", data.get("method", "")), valid_methods)
                 topics = normalize_label_entries(data.get("topics", data.get("topic", "")), valid_topics)
                 if not methods:
-                    methods = [{"name": "Qualitative", "confidence": 0.4}]
+                    methods = [{"name": method_fallback, "confidence": 0.4}]
                 if not topics:
-                    topics = [{"name": "Other Marketing", "confidence": 0.4}]
+                    topics = [{"name": topic_fallback, "confidence": 0.4}]
                 analysis_results[original_title] = {
                     "zh": data.get("zh", original_title),
                     "methods": methods,
@@ -465,24 +592,136 @@ Example:
             
     return analysis_results
 
+def _config_lines(lines):
+    """Strip blank lines and whole-line `#` comments."""
+    return [line.strip() for line in lines if line.strip() and not line.strip().startswith('#')]
+
+
 def load_config(filename, env_var_name=None):
-    """(保持你之前的 load_config 代码不变)"""
-    # ... 请保留你之前为了隐私修改过的 load_config 函数 ...
-    # 这里为了篇幅省略，请直接复用你现在的 load_config
-    if env_var_name and os.environ.get(env_var_name):
-        print(f"Loading config from environment variable: {env_var_name}")
+    """Load a line-based list (journals.dat / keywords.dat).
+
+    A non-empty environment variable (e.g. RSS_KEYWORDS in GitHub Actions)
+    overrides the file entirely; lines are separated by newlines or `;`.
+    """
+    if env_var_name and os.environ.get(env_var_name, "").strip():
         content = os.environ[env_var_name]
-        if '\n' in content:
-            return [line.strip() for line in content.split('\n') if line.strip()]
-        else:
-            return [line.strip() for line in content.split(';') if line.strip()]
-            
+        separator = '\n' if '\n' in content else ';'
+        values = _config_lines(content.split(separator))
+        print(f"NOTE: environment variable {env_var_name} is set and OVERRIDES "
+              f"{os.path.basename(filename)} ({len(values)} entries). Unset it to use the file.")
+        return values
+
     if os.path.exists(filename):
         print(f"Loading config from local file: {filename}")
         with open(filename, 'r', encoding='utf-8') as f:
-            return [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            
+            return _config_lines(f)
+
     return []
+
+
+# --- Keyword rules -------------------------------------------------------------
+# One rule per line; lines are OR'd.  Inside a line, `AND` (any case, whole word)
+# joins terms that must all match.  A term prefixed with `-` or `NOT ` must NOT
+# match.  Terms are case-insensitive and anchored at a word start (`\bterm`), so
+# `ai` does not match "said" while `consum` still matches "consumer".  Wrap a
+# phrase in double quotes to keep a literal "and" inside it.  Lines starting
+# with `#` are comments.  A line with only exclusions matches nothing.
+_AND_SPLIT = re.compile(r'\s+AND\s+', re.IGNORECASE)
+_NEGATION = re.compile(r'^(?:-\s*|NOT\s+)', re.IGNORECASE)
+
+
+def _split_rule_terms(rule):
+    """Split on AND, ignoring any AND inside double-quoted phrases."""
+    quoted = []
+
+    def stash(match):
+        quoted.append(match.group(0))
+        return f"\x00{len(quoted) - 1}\x00"
+
+    masked = re.sub(r'"[^"]*"', stash, rule)
+    parts = _AND_SPLIT.split(masked)
+    restored = [re.sub(r'\x00(\d+)\x00', lambda m: quoted[int(m.group(1))], part) for part in parts]
+    return [part.strip() for part in restored if part.strip()]
+
+
+def _term_pattern(term):
+    words = term.split()
+    body = r'\s+'.join(re.escape(word) for word in words)
+    # Anchor ASCII terms at a word start; CJK text has no word boundaries.
+    prefix = r'(?<![A-Za-z0-9_])' if re.match(r'[A-Za-z0-9_]', term) else ''
+    return re.compile(prefix + body, re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=512)
+def parse_keyword_rule(rule):
+    """Return {"include": [(term, regex)], "exclude": [(term, regex)]} for one line."""
+    include, exclude = [], []
+    text = (rule or "").strip()
+    if not text or text.startswith('#'):
+        return {"include": [], "exclude": []}
+    for raw_term in _split_rule_terms(text):
+        negated = False
+        term = raw_term
+        match = _NEGATION.match(term)
+        if match and len(term) > match.end():
+            negated = True
+            term = term[match.end():].strip()
+        term = term.strip().strip('"').strip()
+        if not term:
+            continue
+        (exclude if negated else include).append((term, _term_pattern(term)))
+    return {"include": include, "exclude": exclude}
+
+
+def keyword_rules(queries):
+    return [parse_keyword_rule(query) for query in (queries or []) if query and query.strip()]
+
+
+def match_text(text, queries):
+    """True when any rule has all include terms and none of its exclude terms."""
+    text = text or ""
+    for rule in keyword_rules(queries):
+        if not rule["include"]:
+            continue
+        if all(pattern.search(text) for _, pattern in rule["include"]) and \
+                not any(pattern.search(text) for _, pattern in rule["exclude"]):
+            return True
+    return False
+
+
+def keyword_display_terms(queries):
+    """Positive terms for display (feed.json `keywords`)."""
+    terms = []
+    for rule in keyword_rules(queries):
+        terms.extend(term for term, _ in rule["include"])
+    return sorted(set(terms), key=str.lower)
+
+
+def preview_keywords(queries, papers, sample_limit=10):
+    """Evaluate keyword rules against stored papers ({paper_id, title, text})."""
+    rules = keyword_rules(queries)
+    term_patterns = {}
+    for rule in rules:
+        for term, pattern in rule["include"]:
+            term_patterns.setdefault(term, pattern)
+    term_counts = {term: 0 for term in term_patterns}
+    matched = 0
+    samples = []
+    for paper in papers:
+        text = paper.get("text") or paper.get("title") or ""
+        for term, pattern in term_patterns.items():
+            if pattern.search(text):
+                term_counts[term] += 1
+        if match_text(text, queries):
+            matched += 1
+            if len(samples) < sample_limit:
+                samples.append({"paper_id": paper.get("paper_id"), "title": paper.get("title") or ""})
+    return {
+        "total_papers": len(papers),
+        "matched": matched,
+        "terms": [{"term": term, "count": count} for term, count in term_counts.items()],
+        "samples": samples,
+    }
 
 def strip_tags(text):
     """移除所有 HTML 标签和尖括号内容"""
@@ -702,25 +941,16 @@ def get_existing_items():
         return [] # 如果旧文件读不了，就当做第一次运行
 
 def match_entry(entry, queries):
-    # (保持不变)
-    text_to_search = (entry['title'] + " " + entry.get('summary', '')).lower()
-    for query in queries:
-        keywords = [k.strip().lower() for k in query.split('AND')]
-        match = True
-        for keyword in keywords:
-            if keyword not in text_to_search:
-                match = False
-                break
-        if match:
-            return True
-    return False
+    """Apply keyword rules (see parse_keyword_rule) to an entry's title + summary."""
+    text_to_search = (entry.get('title') or '') + " " + (entry.get('summary') or '')
+    return match_text(text_to_search, queries)
 
 def generate_rss_xml(items, queries):
     """生成 RSS 2.0 XML 文件 (已加入非法字符清洗)"""
     # RSS jobs hand this function durable DB records.  Keep the legacy signature
     # for callers and tests, but never rebuild job history from XML/cache files.
     if items and items[0].get("paper_id"):
-        export_items(items, OUTPUT_FILE, FEED_JSON, queries, limit=MAX_ITEMS, atomic_write=atomic_write)
+        export_items(items, OUTPUT_FILE, FEED_JSON, keyword_display_terms(queries), limit=MAX_ITEMS, atomic_write=atomic_write)
         print(f"Successfully generated {OUTPUT_FILE} with {min(len(items), MAX_ITEMS)} items.")
         return
     rss_items = []
@@ -812,10 +1042,13 @@ def write_feed_json(items, queries):
             if needs_upgrade and api_key:
                 titles_to_analyze.append(raw_title)
 
+    if not api_key:
+        print("AI analysis skipped: no OPENAI_API_KEY configured (set it in config.json or the environment).")
+
     # 执行分析
     if titles_to_analyze:
         print(f"Analyzing {len(titles_to_analyze)} papers (Translation + Classification)...")
-        new_results = batch_analyze_papers(titles_to_analyze, api_key, base_url, proxy)
+        new_results = batch_analyze_papers(titles_to_analyze, api_key, base_url, proxy, model=config_model(config))
         if new_results:
             translation_cache.update(new_results)
             save_translations(translation_cache)
@@ -884,8 +1117,8 @@ def write_feed_json(items, queries):
             classification_source = "user"
             user_corrected = True
 
-        primary_method = pick_primary(methods, "Qualitative")
-        primary_topic = pick_primary(topics, "Other Marketing")
+        primary_method = pick_primary(methods, fallback_label(valid_methods, "Qualitative"))
+        primary_topic = pick_primary(topics, fallback_label(valid_topics, "Other Marketing"))
 
         data.append({
             "paper_id": item.get("paper_id"),
@@ -912,13 +1145,7 @@ def write_feed_json(items, queries):
             "pub_date": item['pub_date'].isoformat()
         })
 
-    keywords = []
-    for query in queries:
-        parts = [p.strip() for p in query.split('AND')]
-        for part in parts:
-            if part:
-                keywords.append(part)
-    keywords = sorted(set(keywords), key=str.lower)
+    keywords = keyword_display_terms(queries)
 
     payload = {
         "generated_at": datetime.datetime.now().isoformat(),
@@ -934,29 +1161,45 @@ def compute_journal_hash(journals):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def analyze_database_items(database, items, config=None):
-    """Run GPT only for missing/stale durable translations and store by paper_id."""
+def analyze_database_items(database, items, config=None, report=None):
+    """Run GPT only for missing/stale durable translations and store by paper_id.
+
+    Returns the number of saved analyses; failures are added to *report*.
+    """
+    if report is not None:
+        report.setdefault("failed", 0)
+        report.setdefault("errors", [])
     config = config or get_config()
     api_key = config.get("OPENAI_API_KEY")
-    if not api_key:
-        return 0
     stale = [item for item in items if not isinstance(item.get("translation"), dict)
              or item["translation"].get("classification_version") != CLASSIFICATION_VERSION]
     if not stale:
         return 0
+    if not api_key:
+        print(f"AI analysis skipped for {len(stale)} papers: no OPENAI_API_KEY configured "
+              "(set it in config.json or the environment).")
+        return 0
     titles = list(dict.fromkeys(item["title"] for item in stale))
-    results = batch_analyze_papers(titles, api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY")) or {}
+    results = batch_analyze_papers(titles, api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
+                                   model=config_model(config), report=report) or {}
     durable = {item["paper_id"]: results[item["title"]] for item in stale if item["title"] in results}
     return save_db_translations(database, durable)
 
+def _database_path():
+    return ensure_database(BASE_DIR, os.environ.get("PAPER_FEED_DB") or None)
+
 def run_rss_flow():
     # 请确保这里的调用参数与你目前的 secrets 配置一致
-    rss_urls = load_config('journals.dat', 'RSS_JOURNALS')
-    queries = load_config('keywords.dat', 'RSS_KEYWORDS')
-    
+    rss_urls = load_config(JOURNALS_FILE, 'RSS_JOURNALS')
+    queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
+
     if not rss_urls or not queries:
-        print("Error: Configuration files are empty or missing.")
-        return {"successful_sources": [], "failed_sources": [], "new_items": 0, "published": False}
+        missing = " and ".join(name for name, values in (("journals.dat", rss_urls), ("keywords.dat", queries)) if not values)
+        message = f"Configuration is empty or missing: {missing} (or RSS_JOURNALS/RSS_KEYWORDS)."
+        print(f"Error: {message}")
+        return {"status": "error", "message": message, "config_error": True,
+                "successful_sources": [], "failed_sources": [], "new_items": 0, "published": False,
+                "failed": 0, "errors": [message]}
 
     os.makedirs(WEB_DIR, exist_ok=True)
     journal_hash = compute_journal_hash(rss_urls)
@@ -985,18 +1228,25 @@ def run_rss_flow():
 
     successful_sources = [result["url"] for result in fetched_by_index if result and result["success"]]
     failed_sources = [result["url"] for result in fetched_by_index if not result or not result["success"]]
+    report = {"failed": 0, "errors": []}
+    for result in fetched_by_index:
+        if not result or not result["success"]:
+            add_error(report, f"RSS source failed: {(result or {}).get('url')} ({(result or {}).get('error') or 'unknown error'})")
     # Bootstrap only when no local DB exists (notably GitHub Actions), then log
     # every fetch outcome and ingest successful source entries in one transaction.
-    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
-    ingestion = ingest_fetch_results(fetched_by_index, ".", database, predicate=lambda entry: match_entry(entry, queries))
+    database = _database_path()
+    ingestion = ingest_fetch_results(fetched_by_index, BASE_DIR, database, predicate=lambda entry: match_entry(entry, queries))
     if not successful_sources:
         print("All RSS sources failed; keeping existing feed outputs unchanged.")
         return {
             "run_id": ingestion["run_id"], "status": ingestion["status"],
+            "message": "All RSS sources failed.",
             "successful_sources": successful_sources,
             "failed_sources": failed_sources,
             "new_items": 0,
             "published": False,
+            "failed": len(failed_sources),
+            "errors": report["errors"],
         }
 
     # A successful fetch authorizes publication, including runs where no matching
@@ -1008,7 +1258,16 @@ def run_rss_flow():
     # would make a changed RSS_KEYWORDS secret erase previously published papers
     # from the compatibility exports (and from CI's legacy bootstrap).
     all_entries = database_items(database)
-    analyze_database_items(database, all_entries)
+    ai_report = {"failed": 0, "errors": []}
+    try:
+        analyze_database_items(database, all_entries, report=ai_report)
+    except Exception as e:
+        # AI enrichment is optional; never lose a successful fetch because of it.
+        print(f"AI analysis failed; publishing without new analyses: {e}")
+        ai_report["failed"] += 1
+        add_error(ai_report, f"AI analysis error: {type(e).__name__}: {e}")
+    for message in ai_report["errors"]:
+        add_error(report, message)
     all_entries = database_items(database)
     new_count = ingestion["new_observations"]
     print(f"Added {new_count} fetched matching entries.")
@@ -1019,6 +1278,9 @@ def run_rss_flow():
         "failed_sources": failed_sources,
         "new_items": new_count,
         "published": True,
+        "ai_failed": ai_report["failed"],
+        "failed": len(failed_sources) + ai_report["failed"],
+        "errors": report["errors"],
     }
 
 def run_reanalysis_flow():
@@ -1026,16 +1288,22 @@ def run_reanalysis_flow():
     print("Starting AI Re-analysis...")
     config = get_config()
     if not config.get("OPENAI_API_KEY"):
-        return {"status": "error", "message": "No API Key configured."}
-    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
-    queries = load_config('keywords.dat', 'RSS_KEYWORDS')
+        print("AI re-analysis skipped: no OPENAI_API_KEY configured.")
+        return {"status": "error", "message": "No API Key configured.", "failed": 0, "errors": []}
+    database = _database_path()
+    queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
     # Reanalysis enriches every durable paper; current fetch keywords do not
     # redefine the already accepted historical collection.
     items = database_items(database)
-    saved = analyze_database_items(database, items, config)
+    report = {"failed": 0, "errors": []}
+    saved = analyze_database_items(database, items, config, report=report)
     items = database_items(database)
     generate_rss_xml(items, queries)
-    return {"status": "ok", "message": f"Updated {saved} paper analyses.", "updated": saved}
+    message = f"Updated {saved} paper analyses."
+    if report["failed"]:
+        message += f" {report['failed']} failed."
+    return {"status": "ok", "message": message, "updated": saved,
+            "failed": report["failed"], "errors": report["errors"]}
 
 def summarize_specific_papers(target_ids):
     """Summarize requested durable records, then regenerate compatibility exports."""
@@ -1043,8 +1311,11 @@ def summarize_specific_papers(target_ids):
     config = get_config()
     api_key = config.get("OPENAI_API_KEY")
     if not api_key:
-        return {"status": "error", "message": "No API Key configured."}
-    database = ensure_database(".", os.environ.get("PAPER_FEED_DB") or None)
+        print("AI summary skipped: no OPENAI_API_KEY configured.")
+        return {"status": "error", "message": "No API Key configured.", "failed": 0, "errors": []}
+    model = config_model(config)
+    report = {"failed": 0, "errors": []}
+    database = _database_path()
     item_map = {}
     for item in database_items(database):
         for key in (item["paper_id"], item.get("id"), *item.get("legacy_ids", [])):
@@ -1061,23 +1332,57 @@ def summarize_specific_papers(target_ids):
         if existing.get("source") in {"gpt_summarized", "gpt_generated"}:
             continue
         raw = existing.get("raw_abstract") or (existing.get("abstract") if existing.get("source") in {"crossref", "semantic_scholar"} else None)
+        call_errors = []
         if raw:
-            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
+            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
+                                                  model=model, errors=call_errors)
             source = "gpt_summarized"
         else:
-            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
+            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
+                                                 model=model, errors=call_errors)
             source = "gpt_generated"
         if summary:
             payload = {"abstract": summary, "source": source, "fetched_at": datetime.datetime.now().isoformat()}
             if raw:
                 payload["raw_abstract"] = raw
             updates[item["paper_id"]] = payload
+        else:
+            report["failed"] += 1
+            reason = call_errors[0] if call_errors else "empty response"
+            add_error(report, f"{(item.get('title') or '')[:60]}: {reason}")
     updated_count = save_db_abstracts(database, updates)
-    queries = load_config('keywords.dat', 'RSS_KEYWORDS')
+    queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
     # Summarizing selected papers must regenerate the complete durable history,
     # regardless of later changes to the fetch keyword configuration.
     generate_rss_xml(database_items(database), queries)
-    return {"status": "ok", "message": f"Successfully summarized {updated_count} papers.", "updated": updated_count}
+    message = f"Successfully summarized {updated_count} papers."
+    if report["failed"]:
+        message += f" {report['failed']} failed."
+    return {"status": "ok", "message": message, "updated": updated_count,
+            "failed": report["failed"], "errors": report["errors"]}
+
+
+def main(argv=None):
+    """CLI entry point.  Exit codes: 0 published, 1 all sources failed, 2 config error."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Fetch RSS journals (journals.dat), keep entries matching keywords.dat, "
+                    "store them in SQLite and regenerate filtered_feed.xml / web/feed.json.",
+        epilog="Exit codes: 0 = published (possibly with some failed sources), "
+               "1 = every RSS source failed (nothing published), "
+               "2 = journals.dat or keywords.dat is empty/missing.")
+    parser.parse_args(argv)
+    outcome = run_rss_flow() or {}
+    if outcome.get("published"):
+        failed = outcome.get("failed_sources") or []
+        if failed:
+            print(f"Finished with {len(failed)} failed source(s); available data was published.")
+        return 0
+    if outcome.get("config_error"):
+        return 2
+    return 1
+
 
 if __name__ == '__main__':
-    run_rss_flow()
+    configure_stdio()
+    sys.exit(main())

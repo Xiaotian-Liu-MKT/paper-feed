@@ -4,19 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.0" />
+    <link rel="stylesheet" href="styles.css?v=2.2" />
   </head>
   <body>
+    <div id="offlineBanner" class="offline-banner" role="status" hidden>
+      ⚠ 离线模式：操作仅保存在本浏览器
+    </div>
     <header class="hero">
       <div class="hero__bg"></div>
+      <nav id="site-nav" class="hero__nav" aria-label="站点导航">
+        <a class="btn btn--secondary" href="index.html" aria-current="page">📰 Feed</a>
+        <a class="btn btn--secondary" href="report.html">📈 偏好报告</a>
+        <a class="btn btn--secondary" href="stats.html">📊 期刊统计</a>
+        <a class="btn btn--secondary" href="journals.html">📚 期刊管理</a>
+      </nav>
         <div class="hero__actions">
-          <a class="btn btn--secondary" href="stats.html">📊 统计</a>
-          <a class="btn btn--secondary" href="report.html">🧭 偏好报告</a>
-          <a class="btn btn--secondary" href="journals.html">📚 期刊管理</a>
-          <button id="btnCategories" class="btn btn--secondary" type="button">🏷️ 分类管理</button>
-          <button id="btnReanalyze" class="btn btn--secondary" type="button" title="强制重新分析所有文章分类">🧠 AI 分析</button>
-          <button id="btnSettings" class="btn btn--secondary" type="button">⚙️ 设置</button>
-          <button id="btnRefresh" class="btn btn--primary" type="button">🔄 立即更新</button>
+          <button id="btnKeywords" class="btn btn--secondary" type="button" title="编辑 RSS 抓取关键词">🔑 关键词</button>
+          <button id="btnSettings" class="btn btn--secondary" type="button" title="API 设置">⚙️ 设置</button>
+          <button id="btnRefresh" class="btn btn--primary" type="button" title="从 RSS 源抓取新论文">🔄 立即更新</button>
+          <details id="moreMenu" class="more-menu">
+            <summary class="btn btn--secondary" aria-label="更多功能">更多 ▾</summary>
+            <div class="more-menu__panel">
+              <button id="btnCategories" class="btn btn--secondary" type="button">🏷️ 分类管理</button>
+              <button id="btnReanalyze" class="btn btn--secondary" type="button" title="对尚未分析或分类版本已过期的论文进行 AI 翻译与分类（消耗 API 额度）">🧠 AI 分析</button>
+              <button id="btnShortcuts" class="btn btn--secondary" type="button">⌨️ 快捷键 (?)</button>
+            </div>
+          </details>
         </div>
       <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
@@ -25,21 +38,24 @@
       </div>
     </header>
 
-    <div class="filters">
-      <button class="filter-btn active" data-filter="all">待筛选 <span id="countInbox" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button class="filter-btn" data-filter="favorites">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
-      <button class="filter-btn" data-filter="archived">已归档 <span id="countArchived" class="badge badge--muted" style="margin-left:4px; font-weight:normal; font-size:0.8em;"></span></button>
+    <div class="filters" role="group" aria-label="文章视图">
+      <button class="filter-btn active" type="button" data-filter="all" aria-pressed="true">待筛选 <span id="countInbox" class="badge badge--muted filter-count"></span></button>
+      <button class="filter-btn" type="button" data-filter="favorites" aria-pressed="false">❤️ 我的收藏 <span id="countFavorites" class="badge badge--muted filter-count"></span></button>
+      <button class="filter-btn" type="button" data-filter="archived" aria-pressed="false">已归档 <span id="countArchived" class="badge badge--muted filter-count"></span></button>
+      <button class="filter-btn" type="button" data-filter="hidden" aria-pressed="false">已隐藏 <span id="countHidden" class="badge badge--muted filter-count"></span></button>
+      <button class="filter-btn" type="button" data-filter="everything" aria-pressed="false">全部 <span id="countAll" class="badge badge--muted filter-count"></span></button>
       <div id="inboxViewToggle" class="view-toggle" role="group" aria-label="待筛选视图">
         <button class="view-toggle__btn is-active" type="button" data-inbox-view="swipe" aria-pressed="true">刷卡</button>
         <button class="view-toggle__btn" type="button" data-inbox-view="list" aria-pressed="false">列表</button>
       </div>
-      <button id="btnExportFavorites" class="btn btn--secondary" type="button" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">📄 导出 RIS</button>
-      <button id="btnSummarizeFavorites" class="btn btn--secondary" style="display:none; margin-left: 12px; font-size: 0.9em; padding: 6px 12px;">✨ 生成 AI 总结</button>
+      <button id="btnExportFavorites" class="btn btn--secondary btn--small" type="button" hidden>📄 导出 RIS</button>
+      <button id="btnSummarizeFavorites" class="btn btn--secondary btn--small" type="button" hidden>✨ 生成 AI 总结</button>
     </div>
 
     <main id="feed-container">
 
       <section class="panel">
+        <a id="backLink" class="back-link" href="report.html" hidden>← 返回报告</a>
         <div class="controls">
           <label class="control">
             <span>搜索</span>
@@ -62,15 +78,13 @@
               <option value="">全部方法</option>
             </select>
           </label>
-          
+
           <label class="control">
             <span>研究主题</span>
             <select id="filterTopic" class="select--compact-multi" multiple size="1">
               <option value="">全部主题</option>
             </select>
           </label>
-
-          
 
           <label class="control">
             <span>方法逻辑</span>
@@ -125,11 +139,15 @@
           </label>
         </div>
 
+        <div id="filterChips" class="filter-chips" hidden></div>
+
         <div class="status">
           <span id="countLabel">加载中...</span>
-          <span class="keyboard-hint">刷卡：← 跳过 · → 收藏 · A 归档 · Z 撤销</span>
+          <span id="statusMessage" class="status-message" role="status" aria-live="polite"></span>
+          <span id="keyboardHint" class="keyboard-hint">刷卡：← 不感兴趣 · → 收藏 · A 归档 · Z 撤销 · ? 快捷键</span>
           <span id="generatedAt"></span>
         </div>
+        <div id="jobStatus" class="job-status" aria-live="polite" hidden></div>
         <div id="topicCloudWrap" class="topic-cloud-wrap is-hidden">
           <div class="topic-cloud__title">主题云</div>
           <div id="topicCloud" class="topic-cloud"></div>
@@ -152,7 +170,8 @@
         <div class="card__fields"></div>
         <div class="card__abstract"></div>
         <div class="card__edit-area" style="display:none; margin-top:10px;">
-            <textarea style="width:100%; height:150px; padding:8px; border:1px solid #ddd; border-radius:4px; font-family:inherit;" placeholder="在此粘贴或输入摘要..."></textarea>
+            <textarea class="card__edit-textarea" aria-label="摘要内容" placeholder="在此粘贴或输入摘要...（留空保存即清除摘要）"></textarea>
+            <p class="form-error card__edit-error" role="alert" hidden></p>
             <div style="margin-top:8px; display:flex; gap:8px;">
                 <button type="button" class="btn btn--primary btn--small btn-save-abstract">保存</button>
                 <button type="button" class="btn btn--secondary btn--small btn-cancel-abstract">取消</button>
@@ -164,33 +183,106 @@
     </template>
 
     <!-- Fixed Undo Bar Container -->
-    <div id="undoContainer" class="undo-container"></div>
+    <div id="undoContainer" class="undo-container" role="status" aria-live="polite"></div>
+    <!-- Toast notifications -->
+    <div id="toastContainer" class="toast-container" aria-live="assertive"></div>
 
     <dialog id="settingsModal" class="modal">
       <form id="settingsForm" method="dialog">
         <h3>⚙️ 设置 API</h3>
-        <p class="modal__desc">配置 OpenAI / DeepSeek 接口以启用翻译和摘要生成。</p>
-        
+        <p class="modal__desc">配置 OpenAI / DeepSeek 等兼容接口以启用翻译、分类和摘要生成。保存后立即用于下次 AI 任务。</p>
+        <p id="apiKeyStatus" class="api-key-status">API Key 状态：读取中…</p>
+
         <label class="control">
           <span>API Key</span>
           <input name="OPENAI_API_KEY" type="password" placeholder="sk-..." autocomplete="off">
         </label>
-        
+
+        <label class="control">
+          <span>模型 (OPENAI_MODEL)</span>
+          <input name="OPENAI_MODEL" type="text" placeholder="gpt-4o-mini" autocomplete="off">
+        </label>
+
         <label class="control">
           <span>Base URL (可选)</span>
           <input name="OPENAI_BASE_URL" type="text" placeholder="https://api.openai.com/v1">
         </label>
-        
+
         <label class="control">
           <span>Proxy (可选)</span>
           <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890">
         </label>
 
+        <p id="settingsError" class="form-error" role="alert" hidden></p>
         <div class="modal__actions">
           <button id="btnCancel" class="btn btn--secondary" type="button">取消</button>
-          <button class="btn btn--primary" type="submit">保存</button>
+          <button id="btnSaveSettings" class="btn btn--primary" type="submit">保存</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="keywordsModal" class="modal modal--wide">
+      <form id="keywordsForm" method="dialog">
+        <h3>🔑 抓取关键词</h3>
+        <p class="modal__desc">关键词只用于筛选<strong>之后新抓取</strong>的论文，不会删除或隐藏已入库的论文。</p>
+        <details class="keywords-help" open>
+          <summary>语法说明</summary>
+          <ul>
+            <li>每行一条规则，多行之间是“或”关系。</li>
+            <li><code>AND</code>（不区分大小写，需为独立单词）连接需要同时满足的词，例如 <code>consumer AND ai</code>。</li>
+            <li>词前加 <code>-</code> 或 <code>NOT </code> 表示排除，例如 <code>brand AND -luxury</code>。</li>
+            <li>不区分大小写，从词首开始匹配：<code>ai</code> 不会匹配 “said”，但 <code>consum</code> 能匹配 “consumer”。</li>
+            <li>用双引号表示多词短语，例如 <code>"social media"</code>；以 <code>#</code> 开头的行为注释。</li>
+          </ul>
+        </details>
+        <label class="control">
+          <span>关键词规则</span>
+          <textarea id="keywordsText" class="keywords-textarea" rows="12" spellcheck="false" placeholder="consumer&#10;&quot;social media&quot; AND brand&#10;# 注释行"></textarea>
+        </label>
+        <div id="keywordsPreview" class="keywords-preview" aria-live="polite"></div>
+        <p id="keywordsError" class="form-error" role="alert" hidden></p>
+        <div class="modal__actions">
+          <button id="btnPreviewKeywords" class="btn btn--secondary" type="button">预览匹配</button>
+          <button id="btnCancelKeywords" class="btn btn--secondary" type="button">取消</button>
+          <button id="btnSaveKeywords" class="btn btn--primary" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="shortcutsModal" class="modal">
+      <h3>⌨️ 键盘快捷键</h3>
+      <div class="shortcut-groups">
+        <div>
+          <h4>刷卡模式（待筛选）</h4>
+          <dl class="shortcut-list">
+            <dt><kbd>←</kbd></dt><dd>不感兴趣（可在“已隐藏”恢复）</dd>
+            <dt><kbd>→</kbd></dt><dd>收藏</dd>
+            <dt><kbd>A</kbd> / <kbd>L</kbd></dt><dd>归档</dd>
+            <dt><kbd>O</kbd></dt><dd>打开原文</dd>
+          </dl>
+        </div>
+        <div>
+          <h4>列表模式（待筛选）</h4>
+          <dl class="shortcut-list">
+            <dt><kbd>J</kbd> / <kbd>K</kbd></dt><dd>选择下一篇 / 上一篇（高亮卡片）</dd>
+            <dt><kbd>F</kbd></dt><dd>收藏</dd>
+            <dt><kbd>A</kbd> / <kbd>L</kbd></dt><dd>归档</dd>
+            <dt><kbd>X</kbd></dt><dd>不感兴趣</dd>
+            <dt><kbd>O</kbd></dt><dd>打开原文</dd>
+          </dl>
+        </div>
+        <div>
+          <h4>通用</h4>
+          <dl class="shortcut-list">
+            <dt><kbd>Z</kbd></dt><dd>撤销上一步操作</dd>
+            <dt><kbd>?</kbd></dt><dd>显示 / 关闭本帮助</dd>
+            <dt><kbd>Esc</kbd></dt><dd>关闭对话框</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="modal__actions">
+        <button id="btnCloseShortcuts" class="btn btn--primary" type="button">知道了</button>
+      </div>
     </dialog>
 
 
@@ -269,7 +361,7 @@
           </div>
           <div>
             <div class="classify-title">新颖性评分</div>
-            <select id="classificationNovelty">
+            <select id="classificationNovelty" aria-label="新颖性评分">
               <option value="">未设置</option>
               <option value="1">1</option>
               <option value="2">2</option>
@@ -283,14 +375,15 @@
           <span>自定义标签 (逗号分隔)</span>
           <input id="classificationCustom" type="text" placeholder="可补充额外理论或情境标签" />
         </label>
+        <p id="classificationError" class="form-error" role="alert" hidden></p>
         <div class="modal__actions">
           <button class="btn btn--secondary" type="button" id="btnCancelClassification">取消</button>
-          <button class="btn btn--primary" type="submit">保存</button>
+          <button id="btnSaveClassification" class="btn btn--primary" type="submit">保存</button>
         </div>
       </form>
     </dialog>
 
-    <script src="app.js?v=2.1"></script>
+    <script src="nav.js" defer></script>
+    <script src="app.js?v=2.2"></script>
   </body>
 </html>
-

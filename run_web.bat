@@ -43,9 +43,11 @@ if /I "%MODE%"=="refresh" (
   echo Running RSS refresh before opening Paper Feed...
   "%PYTHON%" "%~dp0get_RSS.py"
   if errorlevel 1 (
-    echo Error: Refresh failed. No browser was opened.
-    pause
-    exit /b 1
+    echo.
+    echo Warning: Refresh did not publish new data ^(see the messages above^).
+    echo Exit code 1 = every RSS source failed; 2 = journals.dat or keywords.dat is empty.
+    echo Opening Paper Feed with the existing local data instead.
+    echo.
   )
 )
 
@@ -63,7 +65,7 @@ if "%EXISTING_PAPER_FEED%"=="1" (
 
 rem Delay opening the browser until the local server has had time to bind.
 start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:8000/?t=%CACHE_BUSTER%'"
-"%PYTHON%" "%~dp0server.py"
+"%PYTHON%" "%~dp0server.py" --port 8000
 set "SERVER_EXIT=%ERRORLEVEL%"
 pause
 exit /b %SERVER_EXIT%

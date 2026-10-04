@@ -1,2 +1,9 @@
+# Paper Feed 关键词规则（每行一条规则，多行之间为“或”关系）
+# - 用 AND 连接多个词：所有词都要出现，例如  social media AND marketing
+# - 词前加 - 或 NOT 表示排除，例如  AI AND NOT agriculture
+# - 匹配不区分大小写，从词首开始匹配：consum 能匹配 consumer，ai 不会匹配 said
+# - 多词短语可加引号，例如  "word of mouth"
+# - 以 # 开头的行是注释；关键词只用于过滤之后新抓取的论文
+
 embarrassment
-foundraising
+fundraising

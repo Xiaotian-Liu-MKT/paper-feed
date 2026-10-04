@@ -42,6 +42,7 @@ const reportElements = {
   missingFavLinks: document.getElementById("reportMissingFavLinks"),
   missingHiddenLinks: document.getElementById("reportMissingHiddenLinks"),
   warnings: document.getElementById("reportWarnings"),
+  stale: document.getElementById("reportStale"),
   insightsSummary: document.getElementById("insightsSummary"),
   methodFavBar: document.getElementById("methodFavBar"),
   methodHidBar: document.getElementById("methodHidBar"),
@@ -200,6 +201,15 @@ function renderTable(container, items, columns) {
     const cell = document.createElement("div");
     cell.className = "report-cell";
     cell.textContent = col.label;
+    if (col.help) {
+      const help = document.createElement("span");
+      help.className = "metric-help";
+      help.textContent = "ⓘ";
+      help.title = col.help;
+      help.setAttribute("aria-label", col.help);
+      help.tabIndex = 0;
+      cell.appendChild(help);
+    }
     header.appendChild(cell);
   });
   container.appendChild(header);
@@ -246,13 +256,16 @@ function renderLinkList(listEl, links) {
   listEl.appendChild(fragment);
 }
 
-function buildFilterLink(type, value) {
+// view: "favorites" 用于偏好（收藏）相关条目，其余为 "all"。
+function buildFilterLink(type, value, view = "all") {
   const params = new URLSearchParams();
   params.set(type, value);
+  params.set("view", view);
+  params.set("from", "report");
   return `index.html?${params.toString()}`;
 }
 
-function createFilterLink(type, value) {
+function createFilterLink(type, value, view = "all") {
   if (!value) {
     const empty = document.createElement("span");
     empty.textContent = "-";
@@ -260,14 +273,48 @@ function createFilterLink(type, value) {
   }
   const link = document.createElement("a");
   link.className = "report-filter-link";
-  link.href = buildFilterLink(type, value);
+  link.href = buildFilterLink(type, value, view);
   link.textContent = "筛选";
+  link.title = view === "favorites" ? "在「我的收藏」中筛选" : "在全部文章中筛选";
   return link;
+}
+
+const LIFT_HELP = "1.8 = 在收藏中出现的概率是不感兴趣中的 1.8 倍；>1 偏好，<1 回避";
+const CONFIDENCE_HELP = "置信度：结合 Wilson 95% 置信区间宽度与出现次数，越高越可靠；低于 40% 仅供参考";
+
+function liftColumn() {
+  return { label: "偏好倍数", help: LIFT_HELP, value: (item) => formatLift(item.lift) };
+}
+
+function confidenceColumn() {
+  return { label: "置信度", help: CONFIDENCE_HELP, render: (item) => createConfidenceBar(item.confidence) };
+}
+
+function countsColumn() {
+  return { label: "收藏/不感兴趣", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` };
+}
+
+// 后端文案中的术语统一替换为页面用语。
+function humanizeMetricText(text) {
+  return String(text ?? "")
+    .replace(/lift\s*值/gi, "偏好倍数")
+    .replace(/lift\s*=\s*/gi, "偏好倍数 ")
+    .replace(/\blift\b/gi, "偏好倍数")
+    .replace(/不喜欢/g, "不感兴趣")
+    .replace(/隐藏/g, "不感兴趣");
+}
+
+function formatLift(value) {
+  if (value == null || value === "") return "-";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return `${num.toFixed(2)}×`;
 }
 
 function renderReport(report) {
   if (!report) {
-    setStatus("暂无报告，请点击生成报告。");
+    setStatus("尚未生成，点击「重新计算」。");
+    setStaleNotice("");
     reportElements.generatedAt.textContent = "";
     clearValue(reportElements.favCount);
     clearValue(reportElements.hiddenCount);
@@ -339,10 +386,10 @@ function renderReport(report) {
   const bigrams = report.title_bigrams || {};
 
   renderSummary(reportElements.topFavSummary, terms.top_favorites, "收藏/归档高频词集中在 ");
-  renderSummary(reportElements.topHiddenSummary, terms.top_hidden, "不喜欢高频词集中在 ");
-  renderSummary(reportElements.preferredSummary, terms.preferred, "更可能喜欢的词集中在 ");
+  renderSummary(reportElements.topHiddenSummary, terms.top_hidden, "不感兴趣高频词集中在 ");
+  renderSummary(reportElements.preferredSummary, terms.preferred, "更可能收藏的词集中在 ");
   renderSummary(reportElements.avoidedSummary, terms.avoided, "更可能避开的词集中在 ");
-  renderSummary(reportElements.preferredBigramsSummary, bigrams.preferred, "更可能喜欢的双词组合集中在 ");
+  renderSummary(reportElements.preferredBigramsSummary, bigrams.preferred, "更可能收藏的双词组合集中在 ");
   renderSummary(reportElements.avoidedBigramsSummary, bigrams.avoided, "更可能避开的双词组合集中在 ");
 
   const topicPos = scoreCategories(terms.preferred || terms.top_favorites || [], CATEGORY_MAP.topic);
@@ -381,27 +428,27 @@ function renderReport(report) {
   ]);
   renderTable(reportElements.preferredTerms, terms.preferred, [
     { label: "词", render: (item) => createTermLink(item.term || item.label || "-") },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-    { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+    liftColumn(),
+    confidenceColumn(),
+    countsColumn()
   ]);
   renderTable(reportElements.avoidedTerms, terms.avoided, [
     { label: "词", render: (item) => createTermLink(item.term || item.label || "-") },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-    { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+    liftColumn(),
+    confidenceColumn(),
+    countsColumn()
   ]);
   renderTable(reportElements.preferredBigrams, bigrams.preferred, [
     { label: "短语", render: (item) => createTermLink(item.term || item.label || "-") },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-    { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+    liftColumn(),
+    confidenceColumn(),
+    countsColumn()
   ]);
   renderTable(reportElements.avoidedBigrams, bigrams.avoided, [
     { label: "短语", render: (item) => createTermLink(item.term || item.label || "-") },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-    { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+    liftColumn(),
+    confidenceColumn(),
+    countsColumn()
   ]);
 
   const sourceJournal = report.source_journal || {};
@@ -416,54 +463,55 @@ function renderReport(report) {
   }
 
   renderSummary(reportElements.journalTopFavSummary, journalData.top_favorites, "收藏/归档高频期刊集中在 ");
-  renderSummary(reportElements.journalTopHiddenSummary, journalData.top_hidden, "不喜欢高频期刊集中在 ");
-  renderSummary(reportElements.journalPreferredSummary, journalData.preferred, "更可能喜欢的期刊集中在 ");
+  renderSummary(reportElements.journalTopHiddenSummary, journalData.top_hidden, "不感兴趣高频期刊集中在 ");
+  renderSummary(reportElements.journalPreferredSummary, journalData.preferred, "更可能收藏的期刊集中在 ");
   renderSummary(reportElements.journalAvoidedSummary, journalData.avoided, "更可能避开的期刊集中在 ");
   renderSummary(reportElements.sourceTopFavSummary, sourceData.top_favorites, "收藏/归档高频来源集中在 ");
-  renderSummary(reportElements.sourceTopHiddenSummary, sourceData.top_hidden, "不喜欢高频来源集中在 ");
-  renderSummary(reportElements.sourcePreferredSummary, sourceData.preferred, "更可能喜欢的来源集中在 ");
+  renderSummary(reportElements.sourceTopHiddenSummary, sourceData.top_hidden, "不感兴趣高频来源集中在 ");
+  renderSummary(reportElements.sourcePreferredSummary, sourceData.preferred, "更可能收藏的来源集中在 ");
   renderSummary(reportElements.sourceAvoidedSummary, sourceData.avoided, "更可能避开的来源集中在 ");
 
+  const labelOf = (item) => item.term || item.label || "";
   renderTable(reportElements.journalTopFavTerms, journalData.top_favorites, [
-    { label: "期刊", value: (item) => item.term || item.label || "-" },
+    { label: "期刊", value: (item) => labelOf(item) || "-" },
     { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", item.term || item.label || "") }
+    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "favorites") }
   ]);
   renderTable(reportElements.journalTopHiddenTerms, journalData.top_hidden, [
-    { label: "期刊", value: (item) => item.term || item.label || "-" },
+    { label: "期刊", value: (item) => labelOf(item) || "-" },
     { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", item.term || item.label || "") }
+    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "all") }
   ]);
   renderTable(reportElements.journalPreferredTerms, journalData.preferred, [
-    { label: "期刊", value: (item) => item.term || item.label || "-" },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", item.term || item.label || "") }
+    { label: "期刊", value: (item) => labelOf(item) || "-" },
+    liftColumn(),
+    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "favorites") }
   ]);
   renderTable(reportElements.journalAvoidedTerms, journalData.avoided, [
-    { label: "期刊", value: (item) => item.term || item.label || "-" },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", item.term || item.label || "") }
+    { label: "期刊", value: (item) => labelOf(item) || "-" },
+    liftColumn(),
+    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "all") }
   ]);
 
   renderTable(reportElements.sourceTopFavTerms, sourceData.top_favorites, [
-    { label: "来源", value: (item) => item.term || item.label || "-" },
+    { label: "来源", value: (item) => labelOf(item) || "-" },
     { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("source", item.term || item.label || "") }
+    { label: "筛选", render: (item) => createFilterLink("source", labelOf(item), "favorites") }
   ]);
   renderTable(reportElements.sourceTopHiddenTerms, sourceData.top_hidden, [
-    { label: "来源", value: (item) => item.term || item.label || "-" },
+    { label: "来源", value: (item) => labelOf(item) || "-" },
     { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("source", item.term || item.label || "") }
+    { label: "筛选", render: (item) => createFilterLink("source", labelOf(item), "all") }
   ]);
   renderTable(reportElements.sourcePreferredTerms, sourceData.preferred, [
-    { label: "来源", value: (item) => item.term || item.label || "-" },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("source", item.term || item.label || "") }
+    { label: "来源", value: (item) => labelOf(item) || "-" },
+    liftColumn(),
+    { label: "筛选", render: (item) => createFilterLink("source", labelOf(item), "favorites") }
   ]);
   renderTable(reportElements.sourceAvoidedTerms, sourceData.avoided, [
-    { label: "来源", value: (item) => item.term || item.label || "-" },
-    { label: "lift", value: (item) => item.lift ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("source", item.term || item.label || "") }
+    { label: "来源", value: (item) => labelOf(item) || "-" },
+    liftColumn(),
+    { label: "筛选", render: (item) => createFilterLink("source", labelOf(item), "all") }
   ]);
 
   const missing = report.missing_links_sample || {};
@@ -474,6 +522,46 @@ function renderReport(report) {
   renderLinkList(reportElements.missingFavLinks, missingFavLinks);
   renderLinkList(reportElements.missingHiddenLinks, missing.hidden || []);
   setStatus("报告已加载");
+  checkStaleness(report);
+}
+
+function setStaleNotice(text) {
+  const el = reportElements.stale;
+  if (!el) return;
+  if (!text) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.textContent = text;
+  el.hidden = false;
+}
+
+// 比较报告中的样本量与当前收藏/不感兴趣数量，提示报告是否已过期。
+// 注：/api/papers 目前不返回 state_changed_at，因此按数量差估算（同时一增一减会互相抵消）。
+async function checkStaleness(report) {
+  setStaleNotice("");
+  if (!report || !report.counts) return;
+  try {
+    const res = await fetch("/api/interactions?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    const hidden = new Set(data.hidden || []);
+    const positives = new Set(
+      [...(data.favorites || []), ...(data.archived || [])].filter((id) => !hidden.has(id))
+    );
+    const counts = report.counts || {};
+    const reportPositive = Number(counts.favorites ?? 0);
+    const reportHidden = Number(counts.hidden ?? 0);
+    const delta = Math.abs(positives.size - reportPositive) + Math.abs(hidden.size - reportHidden);
+    if (delta > 0) {
+      setStaleNotice(
+        `报告生成后新增约 ${delta} 条收藏/不感兴趣操作（当前收藏 ${positives.size}、不感兴趣 ${hidden.size}；报告中为 ${reportPositive}、${reportHidden}），建议点击「重新计算」。`
+      );
+    }
+  } catch (error) {
+    // 静默失败：过期提示只是辅助信息
+  }
 }
 
 async function readJsonSafely(res) {
@@ -492,8 +580,10 @@ async function loadReport() {
     const res = await fetch("/api/preference_report?t=" + Date.now(), { cache: "no-store" });
     const data = await readJsonSafely(res);
     if (!res.ok) {
-      setStatus(data?.message || `加载失败(${res.status})`);
       renderReport(null);
+      if (res.status !== 404) {
+        setStatus(data?.message || `加载失败(${res.status})`);
+      }
       return;
     }
     if (data?.status === "error") {
@@ -501,6 +591,10 @@ async function loadReport() {
       return;
     }
     const report = data?.report || data;
+    if (!report || (typeof report === "object" && !report.counts && !report.generated_at)) {
+      renderReport(null);
+      return;
+    }
     renderReport(report);
   } catch (error) {
     setStatus("加载失败，请确认服务器运行中。");
@@ -508,25 +602,25 @@ async function loadReport() {
 }
 
 async function generateReport() {
-  setStatus("生成中...");
+  setStatus("计算中...");
   if (reportElements.btnGenerate) {
     reportElements.btnGenerate.disabled = true;
-    reportElements.btnGenerate.textContent = "生成中...";
+    reportElements.btnGenerate.textContent = "计算中...";
   }
   try {
     const res = await fetch("/api/preference_report", { method: "POST" });
     const data = await readJsonSafely(res);
     if (!res.ok || data?.status !== "ok") {
-      setStatus(data?.message || `生成失败(${res.status})`);
+      setStatus(data?.message || `计算失败(${res.status})`);
       return;
     }
     renderReport(data.report || data);
   } catch (error) {
-    setStatus("生成失败，请确认服务器运行中。");
+    setStatus("计算失败，请确认服务器运行中。");
   } finally {
     if (reportElements.btnGenerate) {
       reportElements.btnGenerate.disabled = false;
-      reportElements.btnGenerate.textContent = "生成报告";
+      reportElements.btnGenerate.textContent = "重新计算";
     }
   }
 }
@@ -544,7 +638,7 @@ function renderWarnings(dataQuality) {
     warnings.forEach(warn => {
         const div = document.createElement('div');
         div.className = `alert alert--${warn.severity}`;
-        div.textContent = warn.message;
+        div.textContent = humanizeMetricText(warn.message);
         fragment.appendChild(div);
     });
     container.appendChild(fragment);
@@ -570,7 +664,7 @@ function renderInsightsSummary(insights) {
 
         const content = document.createElement('p');
         content.className = 'insight-content';
-        content.textContent = insight.content;
+        content.textContent = humanizeMetricText(insight.content);
 
         card.appendChild(title);
         card.appendChild(content);
@@ -611,7 +705,8 @@ function createConfidenceBar(confidence) {
 function createTermLink(term) {
     const link = document.createElement('a');
     link.className = 'term-link';
-    link.href = `index.html?search=${encodeURIComponent(term)}`;
+    const params = new URLSearchParams({ q: term, view: "all", from: "report" });
+    link.href = `index.html?${params.toString()}`;
     link.textContent = term;
     link.title = `点击查看包含"${term}"的论文`;
     return link;
@@ -643,9 +738,9 @@ function renderMethodTopicViz(report) {
 
     renderTable(reportElements.methodTable, methods.preferred || [], [
         { label: "方法", value: (item) => item.label || "-" },
-        { label: "lift", value: (item) => item.lift ?? "-" },
-        { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-        { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+        liftColumn(),
+        confidenceColumn(),
+        countsColumn()
     ]);
 
     // 渲染Topic分布
@@ -658,9 +753,9 @@ function renderMethodTopicViz(report) {
 
     renderTable(reportElements.topicTable, topics.preferred || [], [
         { label: "主题", value: (item) => item.label || "-" },
-        { label: "lift", value: (item) => item.lift ?? "-" },
-        { label: "置信度", render: (item) => createConfidenceBar(item.confidence) },
-        { label: "喜欢/不喜欢", value: (item) => `${item.fav ?? 0}/${item.hidden ?? 0}` }
+        liftColumn(),
+        confidenceColumn(),
+        countsColumn()
     ]);
 }
 
@@ -702,7 +797,7 @@ function renderTrendChart(trends) {
         const hidBar = document.createElement('div');
         hidBar.className = 'trend-bar-segment trend-bar-segment--hid';
         hidBar.style.height = `${(1 - item.fav_rate) * 100}%`;
-        hidBar.title = `隐藏: ${item.hidden}`;
+        hidBar.title = `不感兴趣: ${item.hidden}`;
 
         barContainer.appendChild(favBar);
         barContainer.appendChild(hidBar);
