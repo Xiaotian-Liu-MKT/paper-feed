@@ -8,6 +8,8 @@ import json
 import hashlib
 import tempfile
 import functools
+import html
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rfeed import Item, Feed, Guid
@@ -45,6 +47,16 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 CONFIG_DEFAULTS = {"OPENAI_MODEL": DEFAULT_OPENAI_MODEL}
 OPENAI_RETRY_ATTEMPTS = 3
 OPENAI_RETRY_BASE_DELAY = 2.0
+# Per-request ceiling.  Timeouts are not retried and a shared CircuitBreaker
+# stops a job after repeated timeouts, so a hung endpoint costs ~1-2 timeouts.
+OPENAI_TIMEOUT_SECONDS = 60
+OPENAI_BREAKER_THRESHOLD = 2
+# Free abstract sources (no tokens): short timeouts, never raise to callers.
+ABSTRACT_HTTP_TIMEOUT = (5, 10)
+ABSTRACT_MIN_LENGTH = 100
+ABSTRACT_SOURCE_BREAKER_THRESHOLD = 3
+FETCHED_ABSTRACT_SOURCES = ("crossref", "openalex", "semantic_scholar")
+ABSTRACT_USER_AGENT = "Paper-Feed/1.0 (+https://github.com/Xiaotian-Liu-MKT/paper-feed)"
 MAX_REPORTED_ERRORS = 20
 UNCLASSIFIED_LABEL = "Unclassified"
 DEFAULT_CLASSIFICATION_DOMAIN = "Business & Marketing"
@@ -131,18 +143,72 @@ def add_error(report, message):
 
 
 def make_openai_client(api_key, base_url=None, proxy=None):
-    """Create an OpenAI client.  httpx>=0.28 accepts only `proxy=`, not `proxies=`."""
+    """Create an OpenAI client.  httpx>=0.28 accepts only `proxy=`, not `proxies=`.
+
+    The SDK's own retries are disabled (``max_retries=0``) so that
+    ``chat_completion_with_retry`` is the single retry mechanism, and every
+    request is bounded by ``OPENAI_TIMEOUT_SECONDS``.
+    """
     from openai import OpenAI
     import httpx
 
     http_client = httpx.Client(proxy=proxy) if proxy else None
-    return OpenAI(api_key=api_key, base_url=base_url or None, http_client=http_client)
+    return OpenAI(api_key=api_key, base_url=base_url or None, http_client=http_client,
+                  timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
+
+
+class CircuitBreaker:
+    """Stop calling an endpoint that keeps timing out / refusing connections.
+
+    One breaker is shared by all calls of a job (thread-safe).  After
+    *threshold* consecutive network failures it opens and every later call
+    fails fast, so a hung endpoint costs roughly one timeout per worker
+    instead of one timeout per paper.
+    """
+
+    def __init__(self, threshold=2, name="service"):
+        self.threshold = max(1, threshold)
+        self.name = name
+        self._failures = 0
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self):
+        with self._lock:
+            return self._failures >= self.threshold
+
+    def record_success(self):
+        with self._lock:
+            self._failures = 0
+
+    def record_failure(self):
+        with self._lock:
+            self._failures += 1
+
+
+class CircuitOpenError(RuntimeError):
+    """Raised instead of calling an endpoint whose circuit breaker is open."""
+
+
+def is_timeout_like_openai_error(error):
+    """Timeouts and connection failures: the endpoint is hung or unreachable."""
+    try:
+        import openai
+    except ImportError:
+        return False
+    connection = getattr(openai, "APIConnectionError", None)
+    return bool(connection and isinstance(error, connection))
 
 
 def is_retryable_openai_error(error):
     try:
         import openai
     except ImportError:
+        return False
+    # A timed-out request already waited OPENAI_TIMEOUT_SECONDS; retrying it
+    # would multiply the time a hung endpoint can block a job.
+    timeout_error = getattr(openai, "APITimeoutError", None)
+    if timeout_error and isinstance(error, timeout_error):
         return False
     retryable = tuple(cls for cls in (getattr(openai, "RateLimitError", None),
                                       getattr(openai, "APIConnectionError", None)) if cls)
@@ -154,19 +220,31 @@ def is_retryable_openai_error(error):
     return False
 
 
-def chat_completion_with_retry(client, attempts=None, **kwargs):
-    """Call chat.completions.create with exponential backoff on transient errors."""
+def chat_completion_with_retry(client, attempts=None, breaker=None, **kwargs):
+    """Call chat.completions.create with exponential backoff on transient errors.
+
+    This is the only retry layer (the SDK client is built with max_retries=0).
+    When a shared *breaker* is open the call fails fast with CircuitOpenError.
+    """
     attempts = max(1, attempts or OPENAI_RETRY_ATTEMPTS)
     for attempt in range(1, attempts + 1):
+        if breaker is not None and breaker.is_open:
+            raise CircuitOpenError(f"{breaker.name} is not responding; skipped remaining requests")
         try:
-            return client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
         except Exception as error:
+            if breaker is not None and is_timeout_like_openai_error(error):
+                breaker.record_failure()
             if attempt >= attempts or not is_retryable_openai_error(error):
                 raise
             delay = OPENAI_RETRY_BASE_DELAY * (2 ** (attempt - 1))
             print(f"OpenAI transient error ({type(error).__name__}); retrying in {delay:.0f}s "
                   f"(attempt {attempt}/{attempts})...")
             time.sleep(delay)
+        else:
+            if breaker is not None:
+                breaker.record_success()
+            return response
 
 
 def fallback_label(configured_names, preferred):
@@ -205,28 +283,119 @@ def extract_doi(link, entry_id=''):
 
     return None
 
-def get_abstract_from_crossref(doi):
-    """从 Crossref API 获取摘要"""
-    if not doi or doi.startswith('pii:'):
-        return None
+def clean_abstract_text(text):
+    """Plain text from a Crossref/JATS/HTML abstract (tags, entities, 'Abstract' heading removed)."""
+    if not text:
+        return ""
+    text = str(text)
+    # A JATS/HTML heading that only says "Abstract" is not part of the abstract.
+    text = re.sub(r'<(?:jats:)?title[^>]*>\s*(?:abstract|summary)\s*[.:]?\s*</(?:jats:)?title>', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'<(?:jats:)?(?:p|sec|title|list-item)\b[^>]*>', ' ', text, flags=re.IGNORECASE)
+    text = strip_tags(text)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^(?:abstract|summary)\s*[.:]?\s+', '', text, flags=re.IGNORECASE)
+    return text.strip()
 
+
+def openalex_mailto(config=None):
+    """Optional polite-pool contact for OpenAlex (OPENALEX_MAILTO env var or config.json)."""
+    value = os.environ.get("OPENALEX_MAILTO")
+    if not is_usable_config_value(value):
+        if config is None:
+            try:
+                config = get_config()
+            except Exception:
+                config = {}
+        value = (config or {}).get("OPENALEX_MAILTO")
+    return value.strip() if is_usable_config_value(value) and isinstance(value, str) else None
+
+
+def _abstract_api_get(url, source, params=None, breaker=None):
+    """GET JSON from a free metadata API; returns dict or None and never raises."""
+    if breaker is not None and breaker.is_open:
+        return None
     try:
-        url = f"https://api.crossref.org/works/{doi}"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            abstract = data['message'].get('abstract', '')
-            # Crossref 的摘要可能包含 HTML 标签
-            if abstract:
-                abstract = re.sub(r'<[^>]+>', '', abstract)
-                return abstract.strip()
+        response = requests.get(url, params=params, timeout=ABSTRACT_HTTP_TIMEOUT,
+                                headers={"User-Agent": ABSTRACT_USER_AGENT, "Accept": "application/json"})
+    except Exception as e:
+        print(f"{source} request failed: {type(e).__name__}: {e}")
+        if breaker is not None:
+            breaker.record_failure()
+        return None
+    status = getattr(response, "status_code", None)
+    if status == 429 or (isinstance(status, int) and status >= 500):
+        if breaker is not None:
+            breaker.record_failure()
+        return None
+    if breaker is not None:
+        breaker.record_success()
+    if status != 200:
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _usable_doi(doi):
+    return bool(doi) and not str(doi).startswith('pii:')
+
+
+def get_abstract_from_crossref(doi, breaker=None):
+    """从 Crossref API 获取摘要 (JATS tags stripped).  Never raises."""
+    if not _usable_doi(doi):
+        return None
+    try:
+        data = _abstract_api_get(f"https://api.crossref.org/works/{doi}", "Crossref", breaker=breaker)
+        message = (data or {}).get('message') or {}
+        return clean_abstract_text(message.get('abstract')) if isinstance(message, dict) else None
     except Exception as e:
         print(f"Crossref API error for DOI {doi}: {e}")
+        return None
 
-    return None
 
-def get_abstract_from_semantic_scholar(title):
-    """从 Semantic Scholar API 获取摘要和额外信息"""
+def reconstruct_inverted_index(inverted_index):
+    """Rebuild OpenAlex `abstract_inverted_index` ({word: [positions]}) into text."""
+    if not isinstance(inverted_index, dict):
+        return ""
+    positions = []
+    for word, indexes in inverted_index.items():
+        if not isinstance(indexes, list):
+            continue
+        for index in indexes:
+            if isinstance(index, int) and index >= 0:
+                positions.append((index, str(word)))
+    positions.sort()
+    return " ".join(word for _, word in positions)
+
+
+def get_abstract_from_openalex(doi, mailto=None, breaker=None):
+    """从 OpenAlex 获取摘要（由 abstract_inverted_index 还原）.  Never raises."""
+    if not _usable_doi(doi):
+        return None
+    try:
+        params = {"mailto": mailto} if mailto else None
+        data = _abstract_api_get(f"https://api.openalex.org/works/https://doi.org/{doi}", "OpenAlex",
+                                 params=params, breaker=breaker)
+        return clean_abstract_text(reconstruct_inverted_index((data or {}).get("abstract_inverted_index"))) or None
+    except Exception as e:
+        print(f"OpenAlex API error for DOI {doi}: {e}")
+        return None
+
+
+def get_abstract_from_semantic_scholar(title, doi=None, breaker=None):
+    """从 Semantic Scholar API 获取摘要.  With a DOI the exact record is used (abstract only);
+    without one the legacy title search is used (TL;DR + abstract).  Never raises."""
+    if _usable_doi(doi):
+        try:
+            data = _abstract_api_get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}", "Semantic Scholar",
+                                     params={"fields": "abstract"}, breaker=breaker)
+            return clean_abstract_text((data or {}).get("abstract")) or None
+        except Exception as e:
+            print(f"Semantic Scholar API error for DOI {doi}: {e}")
+            return None
     if not title:
         return None
 
@@ -237,23 +406,21 @@ def get_abstract_from_semantic_scholar(title):
             'limit': 1,
             'fields': 'abstract,tldr,citationCount,influentialCitationCount'
         }
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('data') and len(data['data']) > 0:
-                paper = data['data'][0]
-                abstract = paper.get('abstract', '')
-                # 优先使用 TL;DR（更简洁）
-                tldr = paper.get('tldr', {})
-                if tldr and tldr.get('text'):
-                    return f"{tldr['text']}\n\n{abstract}" if abstract else tldr['text']
-                return abstract
+        data = _abstract_api_get(url, "Semantic Scholar", params=params, breaker=breaker)
+        if data and data.get('data') and len(data['data']) > 0:
+            paper = data['data'][0]
+            abstract = clean_abstract_text(paper.get('abstract') or '')
+            # 优先使用 TL;DR（更简洁）
+            tldr = paper.get('tldr') or {}
+            if tldr and tldr.get('text'):
+                return f"{tldr['text']}\n\n{abstract}" if abstract else tldr['text']
+            return abstract
     except Exception as e:
         print(f"Semantic Scholar API error for title '{title[:50]}...': {e}")
 
     return None
 
-def generate_abstract_with_gpt(title, journal, api_key, base_url=None, proxy=None, model=None, errors=None):
+def generate_abstract_with_gpt(title, journal, api_key, base_url=None, proxy=None, model=None, errors=None, breaker=None):
     """使用 GPT 基于标题推测研究方向（仅标题，未读原文，属于推测）"""
     if not title or not api_key:
         return None
@@ -277,6 +444,7 @@ Cover briefly: 可能的研究主题、可能的研究方法、可能的贡献�
 
         response = chat_completion_with_retry(
             client,
+            breaker=breaker,
             model=model or DEFAULT_OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a careful academic research assistant. When information is missing you say so and only speculate with explicit hedging, in Chinese."},
@@ -294,7 +462,7 @@ Cover briefly: 可能的研究主题、可能的研究方法、可能的贡献�
             errors.append(f"{type(e).__name__}: {e}")
         return None
 
-def summarize_abstract_with_gpt(abstract, title, api_key, base_url=None, proxy=None, model=None, errors=None):
+def summarize_abstract_with_gpt(abstract, title, api_key, base_url=None, proxy=None, model=None, errors=None, breaker=None):
     """使用 GPT 基于已有摘要生成中文学术总结"""
     if not abstract or not api_key:
         return None
@@ -311,6 +479,7 @@ Provide a structured summary covering: 研究主题、可能的研究方法、�
 
         response = chat_completion_with_retry(
             client,
+            breaker=breaker,
             model=model or DEFAULT_OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are an academic research assistant. Generate concise, academic-style research summaries in Chinese."},
@@ -328,30 +497,56 @@ Provide a structured summary covering: 研究主题、可能的研究方法、�
             errors.append(f"{type(e).__name__}: {e}")
         return None
 
-def fetch_abstract_with_fallback(entry, api_key=None, base_url=None, proxy=None):
-    """混合策略获取摘要：Crossref -> Semantic Scholar -> GPT 生成"""
-    title = entry.get('title', '')
-    link = entry.get('link', '')
-    entry_id = entry.get('id', '')
-    journal = entry.get('journal', '')
+def abstract_breakers():
+    """One breaker per free source, shared by every lookup of a job."""
+    return {source: CircuitBreaker(ABSTRACT_SOURCE_BREAKER_THRESHOLD, source) for source in FETCHED_ABSTRACT_SOURCES}
 
-    # 策略 1: 尝试从 Crossref 获取（基于 DOI）
-    doi = extract_doi(link, entry_id)
-    if doi:
-        print(f"  Found DOI: {doi}")
-        abstract = get_abstract_from_crossref(doi)
-        if abstract and len(abstract) > 100:
-            print(f"  [OK] Got abstract from Crossref ({len(abstract)} chars)")
-            return abstract, 'crossref', abstract
 
-    # 策略 2: 尝试从 Semantic Scholar 获取（PII 来源跳过以加速）
-    if not (doi and doi.startswith('pii:')):
-        abstract = get_abstract_from_semantic_scholar(title)
-        if abstract and len(abstract) > 100:
-            print(f"  [OK] Got abstract from Semantic Scholar ({len(abstract)} chars)")
-            return abstract, 'semantic_scholar', abstract
+def entry_doi(entry):
+    """Normalized DOI from an explicit `doi` field, the link, or the RSS id (None for PII-only)."""
+    from paper_feed.identity import normalize_doi
+    for value in (entry.get('doi'), entry.get('link'), entry.get('id')):
+        doi = normalize_doi(value) if value else None
+        if doi:
+            return doi
+    doi = extract_doi(entry.get('link') or '', entry.get('id') or '')
+    return doi if _usable_doi(doi) else None
 
-    print(f"  [SKIP] No abstract available")
+
+def fetch_abstract_with_fallback(entry, api_key=None, base_url=None, proxy=None, *,
+                                 mailto=None, breakers=None, allow_title_search=False):
+    """Free (token-less) abstract lookup: Crossref -> OpenAlex -> Semantic Scholar.
+
+    Returns ``(abstract, source, raw_abstract)`` with source in
+    FETCHED_ABSTRACT_SOURCES, or ``(None, None, None)``.  Never raises.
+    ``api_key``/``base_url``/``proxy`` are accepted for backward compatibility
+    only: this function never calls the AI model.  A title-only Semantic
+    Scholar search can match the wrong paper, so it is opt-in.
+    """
+    try:
+        title = entry.get('title', '')
+        doi = entry_doi(entry)
+        breakers = breakers or {}
+        lookups = []
+        if doi:
+            lookups = [
+                ('crossref', lambda: get_abstract_from_crossref(doi, breaker=breakers.get('crossref'))),
+                ('openalex', lambda: get_abstract_from_openalex(doi, mailto=mailto, breaker=breakers.get('openalex'))),
+                ('semantic_scholar', lambda: get_abstract_from_semantic_scholar(title, doi=doi, breaker=breakers.get('semantic_scholar'))),
+            ]
+        elif allow_title_search and title:
+            lookups = [('semantic_scholar', lambda: get_abstract_from_semantic_scholar(title, breaker=breakers.get('semantic_scholar')))]
+        for source, lookup in lookups:
+            try:
+                abstract = lookup()
+            except Exception as e:  # defensive: lookups already swallow errors
+                print(f"  {source} lookup failed: {e}")
+                abstract = None
+            if abstract and len(abstract) >= ABSTRACT_MIN_LENGTH:
+                print(f"  [OK] Got abstract from {source} ({len(abstract)} chars)")
+                return abstract, source, abstract
+    except Exception as e:
+        print(f"  Abstract lookup failed: {type(e).__name__}: {e}")
     return None, None, None
 
 # ----------------
@@ -434,6 +629,42 @@ def pick_primary(entries, fallback=""):
         return entries[0].get("name", "") or fallback
     return fallback
 
+def _result_index(result, size):
+    """1-based `index` echoed by the model, or None when missing/invalid."""
+    if not isinstance(result, dict):
+        return None
+    value = result.get("index")
+    if isinstance(value, bool):
+        return None
+    try:
+        index = int(str(value).strip().rstrip("."))
+    except (TypeError, ValueError):
+        return None
+    return index if 1 <= index <= size else None
+
+
+def align_batch_results(chunk, result_list):
+    """Pair titles with model results; returns [(title, result)] for aligned items only.
+
+    Results are matched by their echoed 1-based ``index``.  Old-format
+    responses without indexes are accepted only when the count matches (then
+    order is trusted).  Items that cannot be aligned are dropped so their
+    titles stay stale and are retried on the next run.
+    """
+    size = len(chunk)
+    results = list(result_list or [])
+    indexes = [_result_index(result, size) for result in results]
+    positional_ok = len(results) == size and all(
+        index is None or index == position + 1 for position, index in enumerate(indexes))
+    if positional_ok:
+        return list(zip(chunk, results))
+    aligned = {}
+    for result, index in zip(results, indexes):
+        if index is not None and index not in aligned:
+            aligned[index] = result
+    return [(chunk[index - 1], aligned[index]) for index in sorted(aligned)]
+
+
 def batch_analyze_papers(titles, api_key, base_url=None, proxy=None, model=None, report=None):
     """Translate/classify titles.  Returns {title: analysis}.
 
@@ -489,10 +720,13 @@ def batch_analyze_papers(titles, api_key, base_url=None, proxy=None, model=None,
     method_fallback = fallback_label(method_names, "Qualitative")
     topic_fallback = fallback_label(topic_names, "Other Marketing")
 
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "OpenAI endpoint")
+
     def analyze_chunk(chunk):
-        """Return (pairs, error_message); error_message is None on success."""
+        """Return (pairs, error_message, failed_count); error_message is None on full success."""
         prompt = f"""You are a research classification expert in {domain}.
 For each paper title, provide:
+0. "index": the number of the title in the input list (1-based), copied exactly.
 1. "zh": Chinese translation (academic style). DO NOT use any HTML tags or angle brackets.
 2. "methods": 1-2 items, each with {{ "name": <method>, "confidence": 0-1 }}.
 3. "topics": 1-3 items, each with {{ "name": <topic>, "confidence": 0-1 }}.
@@ -516,10 +750,10 @@ Topic hints:
 Rules:
 - Output must be valid JSON.
 - If uncertain, choose broader topics and keep confidence low (<=0.6).
-- Keep the original order of titles in "results".
+- Return exactly one result per title, in the original order, each with its "index".
 
 Example:
-{{ "results": [{{ "zh": "示例标题", "methods": [{{"name": "{method_names[0] if method_names else 'Experiment'}", "confidence": 0.8}}], "topics": [{{"name": "{topic_names[0] if topic_names else 'Other Marketing'}", "confidence": 0.7}}], "theories": [], "context": [], "subjects": [], "novelty_score": null }}] }}
+{{ "results": [{{ "index": 1, "zh": "示例标题", "methods": [{{"name": "{method_names[0] if method_names else 'Experiment'}", "confidence": 0.8}}], "topics": [{{"name": "{topic_names[0] if topic_names else 'Other Marketing'}", "confidence": 0.7}}], "theories": [], "context": [], "subjects": [], "novelty_score": null }}] }}
 """
         
         user_content = "Titles:\n" + "\n".join([f"{j+1}. {t}" for j, t in enumerate(chunk)])
@@ -527,6 +761,7 @@ Example:
         try:
             response = chat_completion_with_retry(
                 client,
+                breaker=breaker,
                 model=model,
                 messages=[
                     {"role": "system", "content": "You are a JSON-only API. You must return valid JSON."},
@@ -536,18 +771,22 @@ Example:
             )
             content = response.choices[0].message.content
             data = json.loads(content)
-            result_list = data.get("results", [])
+            result_list = data.get("results", []) if isinstance(data, dict) else []
+            if not isinstance(result_list, list):
+                result_list = []
 
-            # Fallback/Validation
-            if len(result_list) != len(chunk):
-                message = f"GPT returned {len(result_list)} items for {len(chunk)} titles"
+            pairs = align_batch_results(chunk, result_list)
+            missing = len(chunk) - len(pairs)
+            if missing:
+                # Aligned items are kept; the rest stay stale for the next run.
+                message = (f"GPT returned {len(result_list)} items for {len(chunk)} titles; "
+                           f"kept {len(pairs)}, {missing} left for the next run")
                 print(f"Warning: {message}.")
-                return [], message
-
-            return list(zip(chunk, result_list)), None
+                return pairs, message, missing
+            return pairs, None, 0
         except Exception as e:
             print(f"Analysis error for chunk: {e}")
-            return [], f"{type(e).__name__}: {e}"
+            return [], f"{type(e).__name__}: {e}", len(chunk)
 
     worker_count = min(AI_ANALYSIS_WORKERS, len(chunks))
     print(f"Starting concurrent analysis with {worker_count} workers for {len(chunks)} chunks (model: {model})...")
@@ -557,12 +796,12 @@ Example:
         completed = 0
         for future in as_completed(future_to_chunk):
             try:
-                chunk_results, chunk_error = future.result()
+                chunk_results, chunk_error, chunk_failed = future.result()
             except Exception as e:
-                chunk_results, chunk_error = [], f"{type(e).__name__}: {e}"
+                chunk_results, chunk_error, chunk_failed = [], f"{type(e).__name__}: {e}", len(future_to_chunk[future])
             if chunk_error:
                 if report is not None:
-                    report["failed"] += len(future_to_chunk[future])
+                    report["failed"] += chunk_failed
                 add_error(report, chunk_error)
             valid_methods = set(method_names)
             valid_topics = set(topic_names)
@@ -1312,66 +1551,172 @@ def run_reanalysis_flow():
 
 def pending_summary_items(database, target_ids):
     """Resolve *target_ids* (paper_id / RSS id / legacy id) to items still lacking an AI summary."""
+    return [item for item in _resolve_items(database, target_ids)
+            if (item.get("abstract") or {}).get("source") not in {"gpt_summarized", "gpt_generated"}]
+
+
+def existing_raw_abstract(item):
+    """Raw (non-AI) abstract text already stored for *item*, if any."""
+    existing = item.get("abstract") or {}
+    if existing.get("raw_abstract"):
+        return existing["raw_abstract"]
+    if existing.get("source") in (*FETCHED_ABSTRACT_SOURCES, "user_provided"):
+        return existing.get("abstract") or None
+    return None
+
+
+def _fetch_raw_abstracts(database, items, config=None):
+    """Free lookups for *items* lacking a raw abstract.  Returns (payloads_by_id, stats).
+
+    Never calls the AI model and never raises; nothing is saved here.
+    """
+    from paper_feed.ingestion import paper_dois
+    stats = {"fetched": 0, "failed": 0, "skipped": 0}
+    try:
+        dois = paper_dois(database, [item["paper_id"] for item in items])
+    except Exception as e:
+        print(f"Could not read stored DOIs: {e}")
+        dois = {}
+    jobs = []
+    for item in items:
+        if existing_raw_abstract(item):
+            stats["skipped"] += 1
+            continue
+        doi = dois.get(item["paper_id"]) or entry_doi(item)
+        if not doi:
+            stats["skipped"] += 1
+            continue
+        jobs.append((item, doi))
+    payloads = {}
+    if not jobs:
+        return payloads, stats
+    mailto = openalex_mailto(config)
+    breakers = abstract_breakers()
+    print(f"Looking up {len(jobs)} abstracts (Crossref -> OpenAlex -> Semantic Scholar)...")
+
+    def lookup(job):
+        item, doi = job
+        return fetch_abstract_with_fallback({**item, "doi": doi}, mailto=mailto, breakers=breakers)
+
+    with ThreadPoolExecutor(max_workers=min(ABSTRACT_FETCH_WORKERS, len(jobs))) as executor:
+        for (item, doi), result in zip(jobs, executor.map(lookup, jobs)):
+            abstract, source, raw = result if result else (None, None, None)
+            if abstract and source:
+                payloads[item["paper_id"]] = {"abstract": raw or abstract, "raw_abstract": raw or abstract, "source": source,
+                                              "doi": doi, "fetched_at": datetime.datetime.now().isoformat()}
+            else:
+                stats["failed"] += 1
+    return payloads, stats
+
+
+def _resolve_items(database, references):
+    """Map paper_ids (or RSS / legacy ids) to durable items, de-duplicated, in order."""
     item_map = {}
     for item in database_items(database):
         for key in (item["paper_id"], item.get("id"), *item.get("legacy_ids", [])):
             if key:
                 item_map[str(key)] = item
-    pending = []
-    visited = set()
-    for target in dict.fromkeys(str(target) for target in target_ids):
-        item = item_map.get(target)
-        if not item or item["paper_id"] in visited:
-            continue
-        visited.add(item["paper_id"])
-        if (item.get("abstract") or {}).get("source") in {"gpt_summarized", "gpt_generated"}:
-            continue
-        pending.append(item)
-    return pending
+    resolved, seen = [], set()
+    for reference in dict.fromkeys(str(reference) for reference in references):
+        item = item_map.get(reference)
+        if item and item["paper_id"] not in seen:
+            seen.add(item["paper_id"])
+            resolved.append(item)
+    return resolved
+
+
+def fetch_missing_abstracts(paper_ids=None, view='favorite'):
+    """Fetch raw abstracts for free (Crossref -> OpenAlex -> Semantic Scholar); no AI, no tokens.
+
+    Targets *paper_ids* (paper_id / RSS id / legacy id) or, when None, every
+    paper in review state *view* (``'all'`` for the whole store).  Only papers
+    with a DOI and no stored raw abstract are looked up; results are saved as
+    ``analysis_kind='abstract'`` with ``source`` = crossref/openalex/semantic_scholar.
+    Returns ``{"fetched", "failed", "skipped", "status", "message", "errors"}``.
+    """
+    from paper_feed.ingestion import paper_ids_in_view
+    database = _database_path()
+    references = list(paper_ids) if paper_ids is not None else paper_ids_in_view(database, view)
+    items = _resolve_items(database, references)
+    payloads, stats = _fetch_raw_abstracts(database, items, get_config())
+    saved = save_db_abstracts(database, payloads) if payloads else 0
+    # A protected/raced row is not an error, just nothing to do.
+    stats["skipped"] += len(payloads) - saved
+    stats["fetched"] = saved
+    if saved:
+        generate_rss_xml(database_items(database), load_config(KEYWORDS_FILE, 'RSS_KEYWORDS'))
+    message = f"Fetched {saved} abstracts; {stats['failed']} not found; {stats['skipped']} skipped."
+    print(message)
+    return {"status": "ok", "message": message, "fetched": saved, "failed": stats["failed"],
+            "skipped": stats["skipped"], "errors": []}
 
 
 def summarize_specific_papers(target_ids):
-    """Summarize requested durable records, then regenerate compatibility exports."""
+    """Summarize requested durable records, then regenerate compatibility exports.
+
+    Papers without a raw abstract but with a DOI first get a free lookup
+    (Crossref -> OpenAlex -> Semantic Scholar); a found abstract is saved as
+    the raw abstract and summarized (``gpt_summarized``) instead of a
+    title-only guess (``gpt_generated``).  Without an API key the free
+    lookups still run and AI is skipped.
+    """
     print(f"Request to summarize {len(target_ids)} papers...")
     config = get_config()
     api_key = config.get("OPENAI_API_KEY")
+    database = _database_path()
+    pending = pending_summary_items(database, target_ids)
+    fetched_payloads, fetch_stats = _fetch_raw_abstracts(database, pending, config)
+    fetched_count = save_db_abstracts(database, fetched_payloads) if fetched_payloads else 0
+    queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
     if not api_key:
         print("AI summary skipped: no OPENAI_API_KEY configured.")
-        return {"status": "error", "message": "No API Key configured.", "failed": 0, "errors": []}
+        if fetched_count:
+            generate_rss_xml(database_items(database), queries)
+            return {"status": "ok", "message": f"Fetched {fetched_count} abstracts; AI summary skipped: No API Key configured.",
+                    "updated": 0, "fetched": fetched_count, "ai_skipped": True, "failed": 0, "errors": []}
+        return {"status": "error", "message": "No API Key configured.", "fetched": 0, "failed": 0, "errors": []}
     model = config_model(config)
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "OpenAI endpoint")
     report = {"failed": 0, "errors": []}
-    database = _database_path()
     updates = {}
-    for item in pending_summary_items(database, target_ids):
+    for item in pending:
         existing = item.get("abstract") or {}
-        raw = existing.get("raw_abstract") or (existing.get("abstract") if existing.get("source") in {"crossref", "semantic_scholar"} else None)
+        fetched = fetched_payloads.get(item["paper_id"])
+        raw = existing_raw_abstract(item) or (fetched or {}).get("raw_abstract")
+        raw_source = existing.get("source") if existing_raw_abstract(item) else (fetched or {}).get("source")
         call_errors = []
         if raw:
             summary = summarize_abstract_with_gpt(raw, item["title"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
-                                                  model=model, errors=call_errors)
+                                                  model=model, errors=call_errors, breaker=breaker)
             source = "gpt_summarized"
         else:
             summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
-                                                 model=model, errors=call_errors)
+                                                 model=model, errors=call_errors, breaker=breaker)
             source = "gpt_generated"
         if summary:
             payload = {"abstract": summary, "source": source, "fetched_at": datetime.datetime.now().isoformat()}
             if raw:
                 payload["raw_abstract"] = raw
+                if raw_source:
+                    payload["raw_source"] = raw_source
             updates[item["paper_id"]] = payload
         else:
             report["failed"] += 1
             reason = call_errors[0] if call_errors else "empty response"
             add_error(report, f"{(item.get('title') or '')[:60]}: {reason}")
+    # save_abstracts never replaces a user_provided abstract edited meanwhile.
     updated_count = save_db_abstracts(database, updates)
-    queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
     # Summarizing selected papers must regenerate the complete durable history,
     # regardless of later changes to the fetch keyword configuration.
     generate_rss_xml(database_items(database), queries)
     message = f"Successfully summarized {updated_count} papers."
+    if fetched_count:
+        message += f" Fetched {fetched_count} abstracts for free."
+    if len(updates) > updated_count:
+        message += f" {len(updates) - updated_count} kept user-edited abstracts."
     if report["failed"]:
         message += f" {report['failed']} failed."
-    return {"status": "ok", "message": message, "updated": updated_count,
+    return {"status": "ok", "message": message, "updated": updated_count, "fetched": fetched_count,
             "failed": report["failed"], "errors": report["errors"]}
 
 

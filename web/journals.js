@@ -17,11 +17,31 @@ const btnCopy = document.getElementById("btnCopy");
 const btnImportOpen = document.getElementById("btnImportOpen");
 const btnImportClose = document.getElementById("btnImportClose");
 const importModal = document.getElementById("importModal");
+const dirtyIndicator = document.getElementById("dirtyIndicator");
 
 let journalId = 0;
 let journals = [];
 let filterText = "";
 let filterTextLower = "";
+// Unsaved edits on this page; drives the indicator and the beforeunload guard.
+let dirty = false;
+// Per-row「测试」results keyed by row id; cleared when that row's URL changes.
+const testResults = new Map();
+
+function setDirty(value) {
+  dirty = Boolean(value);
+  if (dirtyIndicator) dirtyIndicator.hidden = !dirty;
+}
+
+window.addEventListener("beforeunload", (event) => {
+  if (!dirty) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+function confirmDiscard(message) {
+  return !dirty || window.confirm(message);
+}
 
 function setFilter(value) {
   filterText = value;
@@ -37,15 +57,18 @@ function setStatus(message) {
   statusText.textContent = message;
 }
 
+// De-duplicates with the same normalisation as the catalog (catalogKey):
+// utm_* parameters, trailing slashes and letter case do not make a new feed.
 function normalizeList(items) {
   const cleaned = [];
   const seen = new Set();
   items.forEach((item) => {
     if (typeof item !== "string") return;
     const value = item.trim();
-    if (!value || seen.has(value)) return;
+    const key = catalogKey(value);
+    if (!value || seen.has(key)) return;
     cleaned.push(value);
-    seen.add(value);
+    seen.add(key);
   });
   return cleaned;
 }
@@ -82,12 +105,13 @@ function getValidationState(value) {
   }
 }
 
+// Returns the catalogKey()s that occur more than once.
 function getDuplicateSet() {
   const counts = new Map();
   journals.forEach((item) => {
-    const value = item.value.trim();
-    if (!value) return;
-    counts.set(value, (counts.get(value) || 0) + 1);
+    const key = catalogKey(item.value.trim());
+    if (!key) return;
+    counts.set(key, (counts.get(key) || 0) + 1);
   });
   const duplicates = new Set();
   counts.forEach((count, value) => {
@@ -142,6 +166,7 @@ function renderList() {
       row.className = "journal-row";
       const trimmed = item.value.trim();
       const validation = getValidationState(trimmed);
+      if (validation === "invalid") row.classList.add("journal-row--invalid");
 
       const input = document.createElement("input");
       input.className = "journal-input";
@@ -180,7 +205,9 @@ function renderList() {
         const badge = document.createElement("span");
         badge.className = "badge badge--danger";
         badge.textContent = "无效";
+        badge.title = "URL 必须以 http:// 或 https:// 开头";
         badges.appendChild(badge);
+        input.setAttribute("aria-invalid", "true");
       }
 
       if (validation === "empty") {
@@ -190,24 +217,47 @@ function renderList() {
         badges.appendChild(badge);
       }
 
-      if (trimmed && duplicates.has(trimmed)) {
+      if (trimmed && duplicates.has(catalogKey(trimmed))) {
         const badge = document.createElement("span");
         badge.className = "badge badge--warn";
         badge.textContent = "重复";
         badges.appendChild(badge);
       }
 
+      const test = document.createElement("button");
+      test.className = "btn btn--secondary btn--small";
+      test.type = "button";
+      test.dataset.id = String(item.id);
+      test.dataset.action = "test";
+      test.textContent = "测试";
+      test.title = "抓取一次该 RSS 源，检查能否解析";
+      test.disabled = validation !== "valid";
+
       const remove = document.createElement("button");
       remove.className = "btn btn--danger btn--small";
       remove.type = "button";
       remove.dataset.id = String(item.id);
+      remove.dataset.action = "delete";
       remove.textContent = "删除";
+      remove.title = "从订阅列表移除（已入库论文不会被删除）";
 
       row.appendChild(name);
       row.appendChild(input);
       row.appendChild(subject);
       row.appendChild(badges);
+      row.appendChild(test);
       row.appendChild(remove);
+
+      const result = testResults.get(item.id);
+      if (result) {
+        const resultEl = document.createElement("p");
+        resultEl.className = "journal-test-result";
+        resultEl.dataset.state = result.state;
+        resultEl.setAttribute("role", "status");
+        resultEl.textContent = result.text;
+        if (result.title) resultEl.title = result.title;
+        row.appendChild(resultEl);
+      }
       listEl.appendChild(row);
     });
   }
@@ -222,13 +272,21 @@ function renderListPreserveFocus() {
   let activeField = null;
   let selectionStart = null;
   let selectionEnd = null;
+  let activeAction = null;
   if (active && active.classList && (active.classList.contains("journal-input") || active.classList.contains("journal-subject") || active.classList.contains("journal-name"))) {
     activeId = active.dataset.id;
     activeField = active.dataset.field;
     selectionStart = active.selectionStart;
     selectionEnd = active.selectionEnd;
+  } else if (active && active.dataset && active.dataset.action && listEl.contains(active)) {
+    activeId = active.dataset.id;
+    activeAction = active.dataset.action;
   }
   renderList();
+  if (activeId && activeAction) {
+    const nextButton = listEl.querySelector(`button[data-id="${activeId}"][data-action="${activeAction}"]`);
+    if (nextButton) nextButton.focus();
+  }
   if (activeId && activeField) {
     const next = listEl.querySelector(`[data-id="${activeId}"][data-field="${activeField}"]`);
     if (next) {
@@ -279,7 +337,9 @@ async function loadJournals() {
     const data = await res.json();
     const items = normalizeList(data.journals || []);
     const meta = normalizeMeta(data.meta || {}, items);
+    testResults.clear();
     applyList(items, meta);
+    setDirty(false);
     setStatus(`已加载 ${items.length} 条期刊。`);
     refreshCatalogSubscriptions();
   } catch (error) {
@@ -322,7 +382,16 @@ function stripTrackingFromList() {
   return changed;
 }
 
+function countInvalidRows() {
+  return journals.filter((item) => getValidationState(item.value.trim()) === "invalid").length;
+}
+
 async function saveJournals() {
+  const invalid = countInvalidRows();
+  if (invalid) {
+    setStatus(`有 ${invalid} 条 URL 无效（必须以 http:// 或 https:// 开头），请修正或删除后再保存。可点击分组中的「无效」快速定位。`);
+    return false;
+  }
   const stripped = stripTrackingFromList();
   const values = getCurrentValues();
   const meta = getCurrentMeta(values);
@@ -333,21 +402,62 @@ async function saveJournals() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ journals: values, meta }),
     });
-    const data = await res.json();
-    if (data.status !== "ok") {
-      throw new Error(data.message || "保存失败");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.status !== "ok") {
+      throw new Error(data.message || `HTTP ${res.status}`);
     }
     const nextValues = normalizeList(data.journals || values);
     const nextMeta = normalizeMeta(data.meta || meta, nextValues);
+    testResults.clear();
     applyList(nextValues, nextMeta);
+    setDirty(false);
     const strippedNote = stripped ? `（已去除 ${stripped} 条链接中的 utm 跟踪参数）` : "";
     setStatus(`保存完成，共 ${nextValues.length} 条。${strippedNote}`);
     refreshCatalogSubscriptions();
     return true;
   } catch (error) {
-    setStatus("保存失败，请稍后重试。");
+    setStatus(`保存失败：${error.message || "请稍后重试"}。修改仍保留在页面上。`);
     return false;
   }
+}
+
+async function testJournal(id) {
+  const item = journals.find((entry) => entry.id === id);
+  if (!item) return;
+  const url = item.value.trim();
+  if (getValidationState(url) !== "valid") {
+    testResults.set(id, { state: "error", text: "✗ URL 无效，必须以 http:// 或 https:// 开头。" });
+    renderList();
+    return;
+  }
+  testResults.set(id, { state: "pending", text: "正在测试该 RSS 源…" });
+  renderListPreserveFocus();
+  let result;
+  try {
+    const res = await fetch("/api/journals/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (res.status === 404 || res.status === 501) throw new Error("当前服务器不支持测试 RSS 源，请更新后端。");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
+    const titles = Array.isArray(data.latest_titles) ? data.latest_titles.filter(Boolean) : [];
+    const feedTitle = data.feed_title ? `「${data.feed_title}」` : "";
+    const latest = titles.length ? ` · 最新：${titles[0]}` : "";
+    result = {
+      state: "ok",
+      text: `✓ 可用${feedTitle}，共 ${Number(data.entries) || 0} 条${latest}`,
+      title: titles.length ? `最新条目：\n${titles.join("\n")}` : "",
+    };
+  } catch (error) {
+    result = { state: "error", text: `✗ 测试失败：${error.message || "网络错误"}` };
+  }
+  // The row may have been edited or deleted while the request was running.
+  const current = journals.find((entry) => entry.id === id);
+  if (!current || current.value.trim() !== url) return;
+  testResults.set(id, result);
+  renderListPreserveFocus();
 }
 
 // ---------- 从目录添加 ----------
@@ -520,6 +630,9 @@ function refreshCatalogSubscriptions() {
 
 async function addSelectedFromCatalog() {
   if (!catalogState.selected.size) return;
+  if (dirty && !window.confirm("订阅列表还有未保存的修改。添加所选期刊会立即保存整个列表，这些修改也会一并保存。继续吗？")) {
+    return;
+  }
   const subscribedKeys = getSubscribedKeys();
   const toAdd = catalogState.items.filter(
     (item) => catalogState.selected.has(catalogKey(item.url)) && !subscribedKeys.has(catalogKey(item.url))
@@ -539,6 +652,7 @@ async function addSelectedFromCatalog() {
     added.add(key);
     journals.push(createJournalItem(url, item.subject === "未分类" ? "" : item.subject, item.name));
   });
+  setDirty(true);
   renderList();
   if (btnCatalogAdd) btnCatalogAdd.disabled = true;
   const ok = await saveJournals();
@@ -583,6 +697,7 @@ function addRow() {
     searchInput.value = "";
   }
   journals.unshift(createJournalItem(""));
+  setDirty(true);
   renderList();
 }
 
@@ -644,13 +759,13 @@ function normalizeEntries(entries) {
   entries.forEach((entry) => {
     if (!entry || typeof entry.value !== "string") return;
     const value = entry.value.trim();
-    if (!value || seen.has(value)) return;
+    if (!value || seen.has(catalogKey(value))) return;
     cleaned.push({
       value,
       subject: (entry.subject || "").trim(),
       name: (entry.name || "").trim(),
     });
-    seen.add(value);
+    seen.add(catalogKey(value));
   });
   return cleaned;
 }
@@ -679,6 +794,7 @@ function mergeImport() {
     }
   });
   applyList(mergedValues, normalizeMeta(metaMap, mergedValues));
+  setDirty(true);
   const added = Math.max(0, mergedValues.length - current.length);
   setStatus(`合并完成，新增 ${added} 条，当前 ${mergedValues.length} 条。`);
 }
@@ -687,6 +803,9 @@ function replaceImport() {
   const incoming = normalizeEntries(parseImportText(importText.value));
   if (!incoming.length) {
     setStatus("导入内容为空。");
+    return;
+  }
+  if (!confirmDiscard("替换导入会用导入内容覆盖当前列表，当前未保存的修改将丢失。确定吗？")) {
     return;
   }
   const values = incoming.map((item) => item.value);
@@ -698,8 +817,10 @@ function replaceImport() {
       meta[item.value] = { subject, name };
     }
   });
+  testResults.clear();
   applyList(values, meta);
-  setStatus(`替换完成，当前 ${values.length} 条。`);
+  setDirty(true);
+  setStatus(`替换完成，当前 ${values.length} 条（尚未保存）。`);
 }
 
 function handleFileImport(event) {
@@ -768,28 +889,44 @@ listEl.addEventListener("input", (event) => {
     const id = Number(target.dataset.id);
     const item = journals.find((entry) => entry.id === id);
     if (item) item.value = target.value;
+    testResults.delete(id);
+    setDirty(true);
     renderListPreserveFocus();
   }
   if (target.classList.contains("journal-subject")) {
     const id = Number(target.dataset.id);
     const item = journals.find((entry) => entry.id === id);
     if (item) item.subject = target.value;
+    setDirty(true);
     renderListPreserveFocus();
   }
   if (target.classList.contains("journal-name")) {
     const id = Number(target.dataset.id);
     const item = journals.find((entry) => entry.id === id);
     if (item) item.name = target.value;
+    setDirty(true);
     renderListPreserveFocus();
   }
 });
 
 listEl.addEventListener("click", (event) => {
-  const target = event.target;
-  if (target.classList.contains("btn--danger")) {
-    const id = Number(target.dataset.id);
+  const target = event.target.closest ? event.target.closest("button[data-action]") : null;
+  if (!target) return;
+  const id = Number(target.dataset.id);
+  if (target.dataset.action === "test") {
+    testJournal(id);
+    return;
+  }
+  if (target.dataset.action === "delete") {
+    const removed = journals.find((entry) => entry.id === id);
     journals = journals.filter((entry) => entry.id !== id);
+    testResults.delete(id);
+    if (removed && removed.value.trim()) setDirty(true);
     renderList();
+    if (removed && removed.value.trim()) {
+      const label = removed.name || removed.value.trim();
+      setStatus(`已从列表移除「${label}」，保存后生效。已入库论文不会被删除。`);
+    }
   }
 });
 
@@ -815,7 +952,10 @@ searchInput.addEventListener("input", (event) => {
 
 btnAdd.addEventListener("click", addRow);
 btnSave.addEventListener("click", saveJournals);
-btnReload.addEventListener("click", loadJournals);
+btnReload.addEventListener("click", () => {
+  if (!confirmDiscard("有未保存的修改，重新加载会丢弃这些修改。确定吗？")) return;
+  loadJournals();
+});
 btnExport.addEventListener("click", exportFile);
 btnMerge.addEventListener("click", mergeImport);
 btnReplace.addEventListener("click", replaceImport);

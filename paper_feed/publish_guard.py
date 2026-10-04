@@ -73,7 +73,7 @@ def json_item_ids(path: Path) -> list[str]:
 
 
 def _validate_rolling_projection(baseline_ids: list[str], candidate_ids: list[str], limit: int) -> None:
-    """Permit only newest-item replacement of the oldest tail at a full cap."""
+    """Permit only newest-item replacement of the oldest tail at a full cap (order-insensitive)."""
     baseline_set, candidate_set = set(baseline_ids), set(candidate_ids)
     missing = baseline_set - candidate_set
     added = candidate_set - baseline_set
@@ -93,10 +93,8 @@ def _validate_rolling_projection(baseline_ids: list[str], candidate_ids: list[st
         expected_tail = baseline_ids[-len(missing):]
         if set(expected_tail) != missing:
             raise PublishGuardError("Refusing to publish because a non-oldest baseline identity was removed.")
-    retained_baseline = [identifier for identifier in baseline_ids if identifier in candidate_set]
-    retained_candidate = [identifier for identifier in candidate_ids if identifier in baseline_set]
-    if retained_candidate != retained_baseline:
-        raise PublishGuardError("Refusing to publish because retained baseline identities changed order.")
+    # Retained identities are compared as a set: publishers revise publication
+    # dates, so a retained item may legitimately move within the projection.
 
 
 def validate_exports(xml_path: Path, json_path: Path, baseline_xml: Path | None = None,

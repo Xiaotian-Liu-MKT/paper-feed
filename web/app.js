@@ -607,6 +607,94 @@ function getSelectedFilterValues(container) {
     .filter(Boolean);
 }
 
+// --- Checkbox popover used for the method / topic filters ---
+// The container holds one checkbox per category plus a "全部" checkbox with an
+// empty value.  Choosing 全部 clears the others; clearing every specific
+// choice falls back to 全部, mirroring the old <select multiple> semantics.
+
+function updateMultiFilterSummary(container) {
+  if (!container || container.tagName === "SELECT" || !container.id) return;
+  const summary = document.getElementById(`${container.id}Summary`);
+  if (!summary) return;
+  const values = getSelectedFilterValues(container);
+  const allLabel = (container.dataset && container.dataset.allLabel) || "全部";
+  if (!values.length) summary.textContent = allLabel;
+  else if (values.length <= 2) summary.textContent = values.join("、");
+  else summary.textContent = `已选 ${values.length} 项`;
+  summary.title = values.length ? values.join("、") : allLabel;
+}
+
+function normalizeCheckboxFilter(container, changedInput) {
+  if (!container || container.tagName === "SELECT" || typeof container.querySelectorAll !== "function") return;
+  const inputs = Array.from(container.querySelectorAll("input[type='checkbox']"));
+  const allInput = inputs.find((input) => input.value === "");
+  const others = inputs.filter((input) => input.value !== "");
+  if (changedInput && changedInput.value === "") {
+    others.forEach((input) => { input.checked = false; });
+    if (allInput) allInput.checked = true;
+  } else if (allInput) {
+    allInput.checked = !others.some((input) => input.checked);
+  }
+  updateMultiFilterSummary(container);
+}
+
+function buildFilterCheckboxes(container, entries, selected) {
+  if (!container) return;
+  container.textContent = "";
+  const fragment = document.createDocumentFragment();
+  const allLabel = (container.dataset && container.dataset.allLabel) || "全部";
+  const makeOption = (value, text) => {
+    const label = document.createElement("label");
+    label.className = value === "" ? "multi-filter__option multi-filter__option--all" : "multi-filter__option";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = value;
+    input.checked = value === "" ? selected.size === 0 : selected.has(value);
+    const span = document.createElement("span");
+    span.textContent = text;
+    label.append(input, span);
+    fragment.appendChild(label);
+  };
+  makeOption("", allLabel);
+  entries.forEach((entry) => makeOption(entry.value, entry.text));
+  container.appendChild(fragment);
+  normalizeCheckboxFilter(container, null);
+}
+
+function setupMultiFilterDropdowns() {
+  const dropdowns = Array.from(document.querySelectorAll(".multi-filter"));
+  if (!dropdowns.length) return;
+  dropdowns.forEach((dropdown) => {
+    dropdown.addEventListener("toggle", () => {
+      if (!dropdown.open) return;
+      dropdowns.forEach((other) => { if (other !== dropdown) other.open = false; });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    dropdowns.forEach((dropdown) => {
+      if (dropdown.open && event.target instanceof Element && !dropdown.contains(event.target)) dropdown.open = false;
+    });
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    dropdowns.forEach((dropdown) => {
+      if (!dropdown.open) return;
+      const hadFocus = dropdown.contains(document.activeElement);
+      dropdown.open = false;
+      const summary = dropdown.querySelector("summary");
+      if (hadFocus && summary) summary.focus();
+    });
+  });
+}
+
+// Selects and checkboxes keep focus after a change, which would make the
+// browser (not the triage shortcuts) handle ←/→ next.  Text fields keep focus.
+function releaseFilterFocus(target) {
+  if (!target || typeof target.blur !== "function") return;
+  const isCheckbox = target.tagName === "INPUT" && (target.type === "checkbox" || target.type === "radio");
+  if (target.tagName === "SELECT" || isCheckbox) target.blur();
+}
+
 function setFilterSelections(container, values) {
   if (!container) return;
   if (container.tagName === "SELECT") {
@@ -633,6 +721,7 @@ function setFilterSelections(container, values) {
   container.querySelectorAll("input[type='checkbox']").forEach((input) => {
     input.checked = selected.has(input.value);
   });
+  normalizeCheckboxFilter(container, null);
 }
 
 function getCategoryMap(type) {
@@ -805,11 +894,70 @@ function updateFilterCounts() {
 const ABSTRACT_SOURCE_BADGES = {
   crossref: { key: "crossref", label: "📚 Crossref", color: "#2196F3" },
   semantic_scholar: { key: "semantic_scholar", label: "🔬 Semantic Scholar", color: "#9C27B0" },
+  openalex: { key: "openalex", label: "📖 OpenAlex", color: "#0F766E" },
   gpt_generated: { key: "gpt_generated", label: "⚠ 基于标题推测", color: "#78716c", tooltip: "未读取摘要，仅根据标题推测" },
   gpt_summarized: { key: "gpt_summarized", label: "🤖 AI 总结", color: "#FF9800" },
   user_provided: { key: "user_provided", label: "✏️ 用户补充", color: "#4CAF50" }
 };
 const ABSTRACT_SOURCE_DEFAULT = { key: "default", label: "📄 摘要", color: "#757575" };
+
+function abstractSourceOf(item) {
+  return ABSTRACT_SOURCE_BADGES[item && item.abstract_source] || ABSTRACT_SOURCE_DEFAULT;
+}
+
+function createAbstractSourceBadge(item) {
+  const source = abstractSourceOf(item);
+  const badge = document.createElement("span");
+  badge.className = `abstract-badge abstract-badge--${source.key}`;
+  badge.style.background = source.color;
+  badge.textContent = source.label;
+  if (source.tooltip) badge.title = source.tooltip;
+  return badge;
+}
+
+// Accepts bare DOIs as well as doi: / https://doi.org/ forms.
+function normalizeDoi(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^doi:\s*/i, "").replace(/^https?:\/\/(dx\.)?doi\.org\//i, "").trim();
+}
+
+function createDoiLink(item) {
+  const doi = normalizeDoi(item && item.doi);
+  if (!doi) return null;
+  const link = document.createElement("a");
+  link.className = "doi-link";
+  link.href = `https://doi.org/${encodeURIComponent(doi).replace(/%2F/gi, "/")}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "DOI";
+  link.title = `DOI: ${doi}`;
+  link.setAttribute("aria-label", `通过 DOI 打开：${doi}`);
+  link.draggable = false;
+  return link;
+}
+
+// Shared by the list and swipe cards: method/topic badges plus the
+// user-correction tag.
+function appendClassificationBadges(container, item) {
+  const describe = (entries) => (entries || [])
+    .map((entry) => `${entry.name} (${Math.round((entry.confidence || 0) * 100)}%)`)
+    .join(", ");
+  const methodSummary = describe(item.methods);
+  const topicSummary = describe(item.topics);
+  (item.methods || []).forEach((entry) => appendBadge(container, "method", entry, { title: methodSummary }));
+  (item.topics || []).forEach((entry) => appendBadge(container, "topic", entry, { title: topicSummary }));
+  if (item.user_corrected) appendTagBadge(container, "用户修正");
+}
+
+// Offered by empty states whenever a filter may be hiding papers.
+function createClearFiltersButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn btn--secondary btn--small empty-state__action";
+  button.textContent = "清除筛选";
+  button.onclick = () => { clearAllFilters(); applyFilters(); };
+  return button;
+}
 
 function createSwipeAction(label, action, direction) {
   const button = document.createElement("button");
@@ -827,7 +975,15 @@ function renderSwipeDeck() {
   if (!item) {
     const empty = document.createElement("div");
     empty.className = "swipe-empty";
-    empty.textContent = "暂时没有新的文献了。切换到收藏或归档可继续处理。";
+    if (countActiveFilters() > 0) {
+      empty.textContent = "当前筛选条件下没有待筛选的文献，其余文献可能被筛选条件隐藏了。";
+      const hint = document.createElement("span");
+      hint.className = "empty-state__hint";
+      hint.textContent = "清除筛选后可继续刷卡。";
+      empty.append(hint, createClearFiltersButton());
+    } else {
+      empty.textContent = "暂时没有新的文献了。切换到收藏或归档可继续处理。";
+    }
     elements.list.appendChild(empty);
     return;
   }
@@ -856,14 +1012,27 @@ function renderSwipeDeck() {
   const titleZh = document.createElement("div");
   titleZh.className = "swipe-card__title-zh";
   titleZh.textContent = item.title_zh || "";
+  const badges = document.createElement("div");
+  badges.className = "swipe-card__badges";
+  appendClassificationBadges(badges, item);
+  const showAbstract = elements.summaryToggle.checked && Boolean(item.abstract);
+  if (showAbstract) badges.appendChild(createAbstractSourceBadge(item));
+  const doiLink = createDoiLink(item);
+  if (doiLink) badges.appendChild(doiLink);
+  const authors = document.createElement("div");
+  authors.className = "swipe-card__authors";
+  authors.textContent = item.authors ? `作者：${item.authors}` : "";
   const abstract = document.createElement("p");
   abstract.className = "swipe-card__abstract";
-  abstract.textContent = elements.summaryToggle.checked && item.abstract ? truncateText(item.abstract, 520) : "";
+  abstract.textContent = showAbstract ? truncateText(item.abstract, 520) : "";
   if (item.abstract_source === "gpt_generated") {
     abstract.classList.add("abstract-body--guess");
     abstract.title = "未读取摘要，仅根据标题推测";
   }
-  card.append(meta, title, titleZh, abstract);
+  card.append(meta, title, titleZh);
+  if (item.authors) card.appendChild(authors);
+  if (badges.children && badges.children.length) card.appendChild(badges);
+  card.appendChild(abstract);
   attachSwipeGesture(card, title);
   deck.appendChild(card);
   const actions = document.createElement("div");
@@ -970,7 +1139,12 @@ function renderList() {
     } else {
       empty.textContent = "暂时没有新的文献了...";
     }
-    if (hasFilters) empty.textContent += "（当前有筛选条件生效，可在上方清除）";
+    if (hasFilters) {
+      const hint = document.createElement("span");
+      hint.className = "empty-state__hint";
+      hint.textContent = "当前有筛选条件生效，部分文章可能被隐藏。";
+      empty.append(hint, createClearFiltersButton());
+    }
     elements.list.appendChild(empty);
     updateLoadMoreButton();
     return;
@@ -1017,20 +1191,10 @@ function renderList() {
     metaText.style.marginRight = "12px";
     metaInfo.appendChild(metaText);
     
-    // 2. Append Badges (Method & Topic)
-    const methodSummary = (item.methods || [])
-      .map((entry) => `${entry.name} (${Math.round((entry.confidence || 0) * 100)}%)`)
-      .join(", ");
-    const topicSummary = (item.topics || [])
-      .map((entry) => `${entry.name} (${Math.round((entry.confidence || 0) * 100)}%)`)
-      .join(", ");
-    if (typeof appendBadge === "function") {
-      (item.methods || []).forEach((entry) => appendBadge(metaInfo, "method", entry, { title: methodSummary }));
-      (item.topics || []).forEach((entry) => appendBadge(metaInfo, "topic", entry, { title: topicSummary }));
-    }
-    if (item.user_corrected) {
-      appendTagBadge(metaInfo, "用户修正");
-    }
+    // 2. Append Badges (Method & Topic), then the DOI link
+    appendClassificationBadges(metaInfo, item);
+    const doiLink = createDoiLink(item);
+    if (doiLink) metaInfo.appendChild(doiLink);
     if (state.filterMode === "everything") {
       const reviewLabel = { favorite: "已收藏", archived: "已归档", hidden: "已隐藏" }[reviewStateOf(paperKey(item))];
       if (reviewLabel) appendTagBadge(metaInfo, reviewLabel);
@@ -1062,7 +1226,7 @@ function renderList() {
     if (showSummary && item.abstract) {
       abstractDiv.className = "card__abstract";
 
-      const source = ABSTRACT_SOURCE_BADGES[item.abstract_source] || ABSTRACT_SOURCE_DEFAULT;
+      const source = abstractSourceOf(item);
       const tooltip = source.tooltip ? ` title="${escapeHtml(source.tooltip)}"` : "";
 
       abstractDiv.innerHTML = `
@@ -1288,10 +1452,23 @@ function updateLoadMoreButton() {
   elements.loadMore.textContent = remaining > 0 ? `加载更多（${Math.min(PAGE_SIZE, remaining)}）` : "加载更多";
 }
 
-// Buttons are deliberately NOT typing targets: after clicking a tab or
-// toggle, single-key shortcuts must keep working.
+// Only text-like fields are typing targets.  Buttons, selects and checkboxes
+// are not: after clicking a tab, toggle or filter, single-key shortcuts must
+// keep working (filter selects/checkboxes are also blurred after a change).
+// Date/time inputs count as typing because they use the arrow keys themselves.
+const TYPING_INPUT_TYPES = new Set([
+  "", "text", "search", "url", "email", "password", "number", "tel",
+  "date", "datetime-local", "month", "week", "time"
+]);
+
 function isTypingTarget(target) {
-  return target instanceof Element && Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  if (!(target instanceof Element)) return false;
+  if (target.isContentEditable) return true;
+  if (target.closest("textarea, [contenteditable='true'], [contenteditable='']")) return true;
+  const input = target.closest("input");
+  if (!input) return false;
+  const rawType = typeof input.getAttribute === "function" ? input.getAttribute("type") : input.type;
+  return TYPING_INPUT_TYPES.has(String(rawType || "").trim().toLowerCase());
 }
 
 function updateShortcutHint() {
@@ -1907,7 +2084,9 @@ function renderFilterOptions() {
         elements.filterMethod.appendChild(option);
       });
     } else {
-      buildChipList(elements.filterMethod, state.categories.methods, selected);
+      buildFilterCheckboxes(elements.filterMethod, state.categories.methods
+        .filter((method) => method && method.name)
+        .map((method) => ({ value: method.name, text: method.label ? `${method.label} (${method.name})` : method.name })), selected);
     }
   }
 
@@ -1929,7 +2108,9 @@ function renderFilterOptions() {
         elements.filterTopic.appendChild(option);
       });
     } else {
-      buildChipList(elements.filterTopic, state.categories.topics, selected);
+      buildFilterCheckboxes(elements.filterTopic, state.categories.topics
+        .filter((topic) => topic && topic.name)
+        .map((topic) => ({ value: topic.name, text: topic.name })), selected);
     }
   }
 }
@@ -2160,13 +2341,25 @@ function attachHandlers() {
   ];
   controls.forEach((control) => {
     if (!control) return;
+    if (control.tagName !== "SELECT" && control.classList && control.classList.contains("multi-filter__panel")) {
+      // Checkbox popover: one change event per click; normalise 全部 first.
+      control.addEventListener("change", (event) => {
+        normalizeCheckboxFilter(control, event.target);
+        applyFilters();
+        releaseFilterFocus(event.target);
+      });
+      return;
+    }
     if (control.tagName === "SELECT" && control.multiple) {
       control.addEventListener("focus", () => cacheMultiSelectState(control));
       control.addEventListener("mousedown", () => cacheMultiSelectState(control));
       control.addEventListener("keydown", () => cacheMultiSelectState(control));
     }
     control.addEventListener("input", applyFilters);
-    control.addEventListener("change", applyFilters);
+    control.addEventListener("change", (event) => {
+      applyFilters();
+      releaseFilterFocus(event.target);
+    });
   });
 
   if (elements.searchInput) {
@@ -2202,6 +2395,41 @@ function attachHandlers() {
   }
 }
 
+// Shown in the list area when neither the API nor feed.json answered, so the
+// page is not just an empty grid.
+function renderLoadError() {
+  if (!elements.list) return;
+  elements.list.textContent = "";
+  if (elements.list.classList) elements.list.classList.remove("grid--swipe");
+  const card = document.createElement("div");
+  card.className = "card load-error";
+  card.setAttribute("role", "alert");
+  const title = document.createElement("strong");
+  title.textContent = "无法加载论文列表。";
+  const hint = document.createElement("span");
+  hint.className = "empty-state__hint";
+  hint.textContent = "请确认服务已启动：";
+  const command = document.createElement("code");
+  command.textContent = "python -m paper_feed start";
+  hint.appendChild(command);
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "btn btn--primary btn--small empty-state__action";
+  retry.textContent = "重试";
+  retry.onclick = async () => {
+    retry.disabled = true;
+    retry.textContent = "重试中…";
+    if (!state.paperApiAvailable) await loadInteractions();
+    if (!state.categories.methods.length && !state.categories.topics.length) await loadCategories();
+    const ok = await loadFeed();
+    if (ok) resumeRunningJobs();
+  };
+  card.append(title, hint, retry);
+  elements.list.appendChild(card);
+  if (elements.countLabel) elements.countLabel.textContent = "加载失败";
+  if (elements.loadMore) elements.loadMore.hidden = true;
+}
+
 async function loadFeed() {
   setStatus("加载中...");
   const priorVisibleLimit = state.visibleLimit;
@@ -2225,6 +2453,7 @@ async function loadFeed() {
       console.warn("Paper API unavailable; using feed.json fallback", apiError);
     } catch (feedError) {
       setStatus("无法加载论文：Paper API 与 feed.json 均不可用。");
+      renderLoadError();
       return false;
     }
   }
@@ -2572,7 +2801,11 @@ async function startJob(kind) {
   setJobButtonBusy(kind, true);
   let payload = {};
   try {
-    const response = await fetch(endpoint, { method: "POST" });
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
     payload = await response.json().catch(() => ({}));
     if (response.status !== 202 || !payload.job) {
       throw new Error(payload.message || `无法启动后台任务（HTTP ${response.status}）`);
@@ -2620,6 +2853,21 @@ async function fetchConfig() {
   }
 }
 
+// Returns {pending, total} or null when the endpoint is missing / unreadable.
+async function fetchPendingSummaries() {
+  try {
+    const res = await fetch("/api/summarize_favorites/pending?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const pending = Number(payload && payload.pending);
+    if (!Number.isFinite(pending)) return null;
+    const total = Number(payload.total_favorites);
+    return { pending, total: Number.isFinite(total) ? total : NaN };
+  } catch (_) {
+    return null;
+  }
+}
+
 function configHasApiKey(config) {
   if (!config) return false;
   if (typeof config.has_api_key === "boolean") return config.has_api_key;
@@ -2634,7 +2882,22 @@ if (btnSummarizeFavorites) {
       return;
     }
 
-    if (!confirm(`确定要对 ${state.interactions.favorites.length} 篇收藏的文章生成 AI 总结吗？\n这会调用 AI 接口并消耗 API 额度。`)) {
+    const pending = await fetchPendingSummaries();
+    let question;
+    if (pending) {
+      if (pending.pending <= 0) {
+        const message = "所有收藏都已有 AI 总结或用户补充的摘要，无需生成。";
+        setStatus(message);
+        showToast(message, "info");
+        return;
+      }
+      const totalNote = Number.isFinite(pending.total) ? `（共 ${pending.total} 篇收藏）` : "";
+      question = `将为 ${pending.pending} 篇尚无总结的收藏文章生成 AI 总结${totalNote}。\n这会调用 AI 接口并消耗 API 额度。确定吗？`;
+    } else {
+      // Older servers have no pending endpoint: fall back to the favourite count.
+      question = `确定要对 ${state.interactions.favorites.length} 篇收藏的文章生成 AI 总结吗？\n这会调用 AI 接口并消耗 API 额度。`;
+    }
+    if (!confirm(question)) {
       return;
     }
 
@@ -2654,30 +2917,125 @@ if (btnReanalyze) {
 }
 
 
-if (btnSettings && modal) {
-  btnSettings.addEventListener("click", async () => {
-    const keyStatus = document.getElementById("apiKeyStatus");
-    setFormError("settingsError", "");
-    if (keyStatus) keyStatus.textContent = "API Key 状态：读取中…";
-    modal.showModal();
-    const config = await fetchConfig();
-    if (config) {
-      const hasKey = configHasApiKey(config);
-      form.OPENAI_API_KEY.value = "";
-      form.OPENAI_API_KEY.placeholder = hasKey ? "已配置（留空则保持不变）" : "sk-...";
-      if (form.OPENAI_MODEL) form.OPENAI_MODEL.value = config.OPENAI_MODEL || "";
-      form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
-      form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
-      if (keyStatus) {
-        keyStatus.textContent = hasKey ? "API Key 状态：✓ 已配置" : "API Key 状态：✗ 未配置（AI 翻译、分类和总结将不可用）";
-        keyStatus.dataset.state = hasKey ? "ok" : "missing";
-      }
-    } else if (keyStatus) {
+const CONFIG_FIELDS = ["OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_PROXY"];
+const CONFIG_SOURCE_LABELS = {
+  env: "来源：环境变量 · 由环境变量提供，此处修改不会生效",
+  config: "来源：config.json",
+  default: "来源：默认值",
+  unset: "来源：未设置"
+};
+let settingsSources = {};
+
+function renderConfigSources(sources) {
+  settingsSources = sources && typeof sources === "object" ? sources : {};
+  CONFIG_FIELDS.forEach((field) => {
+    const note = document.querySelector(`[data-source-for="${field}"]`);
+    if (!note) return;
+    const source = settingsSources[field];
+    const label = CONFIG_SOURCE_LABELS[source];
+    note.textContent = label || "";
+    note.hidden = !label;
+    if (label) note.dataset.source = source;
+    else delete note.dataset.source;
+  });
+}
+
+function setConnectionResult(text, resultState = "") {
+  const result = document.getElementById("testConnectionResult");
+  if (!result) return;
+  result.textContent = text || "";
+  if (resultState) result.dataset.state = resultState;
+  else delete result.dataset.state;
+}
+
+async function populateSettings() {
+  const keyStatus = document.getElementById("apiKeyStatus");
+  if (keyStatus) keyStatus.textContent = "API Key 状态：读取中…";
+  const config = await fetchConfig();
+  if (config) {
+    const hasKey = configHasApiKey(config);
+    form.OPENAI_API_KEY.value = "";
+    form.OPENAI_API_KEY.placeholder = hasKey ? "已配置（留空则保持不变）" : "sk-...";
+    if (form.OPENAI_MODEL) form.OPENAI_MODEL.value = config.OPENAI_MODEL || "";
+    form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
+    form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
+    renderConfigSources(config.sources);
+    const btnClearApiKey = document.getElementById("btnClearApiKey");
+    if (btnClearApiKey) btnClearApiKey.disabled = !hasKey;
+    if (keyStatus) {
+      keyStatus.textContent = hasKey ? "API Key 状态：✓ 已配置" : "API Key 状态：✗ 未配置（AI 翻译、分类和总结将不可用）";
+      keyStatus.dataset.state = hasKey ? "ok" : "missing";
+    }
+  } else {
+    renderConfigSources(null);
+    if (keyStatus) {
       keyStatus.textContent = "API Key 状态：无法读取服务器配置";
       keyStatus.dataset.state = "missing";
     }
+  }
+  return config;
+}
+
+async function testConnection() {
+  const button = document.getElementById("btnTestConnection");
+  if (button) { button.disabled = true; button.textContent = "测试中…"; }
+  setConnectionResult("正在发送一次极小的测试请求…");
+  try {
+    const res = await fetch("/api/test_connection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (res.status === 404 || res.status === 501) throw new Error("当前服务器不支持连接测试，请更新后端。");
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok || !payload.ok) throw new Error(payload.error || payload.message || `HTTP ${res.status}`);
+    const latency = payload.latency_ms != null && Number.isFinite(Number(payload.latency_ms)) ? ` · ${Math.round(Number(payload.latency_ms))} ms` : "";
+    setConnectionResult(`✓ 连接成功${payload.model ? ` · ${payload.model}` : ""}${latency}`, "ok");
+  } catch (error) {
+    setConnectionResult(`✗ 连接失败：${error.message || "网络错误"}`, "error");
+  } finally {
+    if (button) { button.disabled = false; button.textContent = "🔌 测试连接"; }
+  }
+}
+
+async function clearApiKey() {
+  const fromEnv = settingsSources.OPENAI_API_KEY === "env";
+  const question = fromEnv
+    ? "清除 config.json 中保存的 API Key？\n注意：当前生效的密钥来自环境变量，清除后仍会继续使用环境变量中的密钥。"
+    : "清除已保存的 API Key？\n清除后 AI 翻译、分类和总结将不可用，直到重新填写。";
+  if (!confirm(question)) return;
+  const button = document.getElementById("btnClearApiKey");
+  setFormError("settingsError", "");
+  if (button) button.disabled = true;
+  try {
+    const res = await fetch("/api/save_config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clear_api_key: true })
+    });
+    if (!res.ok) throw new Error(await responseMessage(res, "清除失败"));
+    setConnectionResult("");
+    showToast(fromEnv ? "已清除 config.json 中的密钥（环境变量中的密钥仍然生效）。" : "API Key 已清除。", "success");
+    await populateSettings();
+  } catch (error) {
+    setFormError("settingsError", `清除密钥失败：${error.message || "网络错误"}`);
+    if (button) button.disabled = false;
+  }
+}
+
+if (btnSettings && modal) {
+  btnSettings.addEventListener("click", async () => {
+    setFormError("settingsError", "");
+    setConnectionResult("");
+    modal.showModal();
+    await populateSettings();
   });
 }
+
+const btnTestConnection = document.getElementById("btnTestConnection");
+if (btnTestConnection) btnTestConnection.addEventListener("click", testConnection);
+const btnClearApiKey = document.getElementById("btnClearApiKey");
+if (btnClearApiKey) btnClearApiKey.addEventListener("click", clearApiKey);
 
 if (btnCategories && categoriesModal) {
   btnCategories.addEventListener("click", async () => {
@@ -2998,7 +3356,11 @@ async function exportFavoritesRis() {
   }
   try {
     if (btnExportFavorites) btnExportFavorites.disabled = true;
-    const response = await fetch("/api/export_favorites_ris", { method: "POST" });
+    const response = await fetch("/api/export_favorites_ris", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
     if (!response.ok) throw new Error(`导出失败（HTTP ${response.status || "错误"}）`);
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
@@ -3046,6 +3408,7 @@ async function init() {
   setupFilters();
   setupInboxViewToggle();
   setupMoreMenu();
+  setupMultiFilterDropdowns();
   document.addEventListener("keydown", handleTriageShortcut);
   await loadInteractions();
   await loadCategories();

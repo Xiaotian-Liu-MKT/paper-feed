@@ -85,8 +85,14 @@ class PaperRepository:
         else:
             self.conn.commit()
 
-    def resolve(self, record, create=True):
-        """Return a durable paper_id; title-only records never merge."""
+    def resolve(self, record, create=True, preferred_id=None):
+        """Return a durable paper_id; title-only records never merge.
+
+        *preferred_id* is only used when a new paper is created and that id is
+        still free.  The legacy importer passes the ``paper_id`` already
+        published in ``web/feed.json`` so a clean (CI) bootstrap keeps the same
+        identities instead of minting new UUIDs on every run.
+        """
         choices = identifiers(record)
         # A title/journal/date fingerprint is only a fallback for records with
         # no durable identifier at all.  Publisher front matter can legitimately
@@ -118,7 +124,7 @@ class PaperRepository:
         elif not create:
             return None
         else:
-            paper_id = str(uuid.uuid4())
+            paper_id = self._free_paper_id(preferred_id) or str(uuid.uuid4())
             self.conn.execute(
                 "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (paper_id, record.get("title") or "(untitled)", record.get("journal"),
@@ -127,6 +133,13 @@ class PaperRepository:
 
         self._claim_identifiers(paper_id, choices, stamp)
         return paper_id
+
+    def _free_paper_id(self, candidate):
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            return None
+        taken = self.conn.execute("SELECT 1 FROM papers WHERE paper_id=?", (candidate,)).fetchone()
+        return None if taken else candidate
 
     def attach_record_identifiers(self, paper_id, record):
         """Attach durable identifiers after an importer matched a legacy alias."""

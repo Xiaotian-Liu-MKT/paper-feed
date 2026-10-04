@@ -93,14 +93,22 @@ class PublishGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(PublishGuardError, "changed size"):
             validate_exports(self.xml, self.feed, self.baseline, projection_limit=3)
 
-    def test_full_projection_rejects_non_tail_removal_and_retained_reordering(self):
+    def test_full_projection_rejects_non_tail_removal(self):
         write_xml(self.baseline, ["a", "b", "c"])
         write_xml(self.xml, ["new", "b", "c"]); write_json(self.feed, ["new", "b", "c"])
         with self.assertRaisesRegex(PublishGuardError, "non-oldest"):
             validate_exports(self.xml, self.feed, self.baseline, projection_limit=3)
+
+    def test_retained_identities_may_change_order(self):
+        # Publishers revise publication dates; reordering alone is not history loss.
+        write_xml(self.baseline, ["a", "b", "c"])
         write_xml(self.xml, ["b", "new", "a"]); write_json(self.feed, ["b", "new", "a"])
-        with self.assertRaisesRegex(PublishGuardError, "changed order"):
-            validate_exports(self.xml, self.feed, self.baseline, projection_limit=3)
+        self.assertEqual(validate_exports(self.xml, self.feed, self.baseline, projection_limit=3), 3)
+        write_xml(self.xml, ["c", "b", "a"]); write_json(self.feed, ["c", "b", "a"])
+        self.assertEqual(validate_exports(self.xml, self.feed, self.baseline, projection_limit=3), 3)
+        write_xml(self.baseline, ["a", "b"])
+        write_xml(self.xml, ["b", "a", "new"]); write_json(self.feed, ["b", "a", "new"])
+        self.assertEqual(validate_exports(self.xml, self.feed, self.baseline, projection_limit=3), 3)
 
     def test_malformed_existing_baseline_is_rejected(self):
         self.baseline.write_text("not XML", encoding="utf-8")

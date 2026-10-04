@@ -160,6 +160,20 @@ async function run() {
   context.inputTarget = fakeTarget((selector) => selector.includes("input"));
   assert.strictEqual(vm.runInContext("isTypingTarget(buttonTarget)", context), false);
   assert.strictEqual(vm.runInContext("isTypingTarget(inputTarget)", context), true);
+  // Only text-like fields swallow shortcuts; selects and checkboxes do not.
+  const typedInput = (type) => Object.assign(Object.create(context.Element.prototype), {
+    closest: (selector) => (selector === "input" ? { getAttribute: () => type } : null)
+  });
+  context.textTarget = typedInput("text");
+  context.searchTarget = typedInput("search");
+  context.checkboxTarget = typedInput("checkbox");
+  context.selectTarget = fakeTarget((selector) => selector === "select");
+  context.textareaTarget = fakeTarget((selector) => selector.includes("textarea"));
+  assert.strictEqual(vm.runInContext("isTypingTarget(textTarget)", context), true);
+  assert.strictEqual(vm.runInContext("isTypingTarget(searchTarget)", context), true);
+  assert.strictEqual(vm.runInContext("isTypingTarget(textareaTarget)", context), true);
+  assert.strictEqual(vm.runInContext("isTypingTarget(checkboxTarget)", context), false);
+  assert.strictEqual(vm.runInContext("isTypingTarget(selectTarget)", context), false);
 
   // Journal dropdown is rebuilt (no duplicates) and keeps the current selection.
   const fakeSelect = () => {
@@ -175,7 +189,7 @@ async function run() {
   vm.runInContext(`
     delete globalThis.populateJournals;
   `, context);
-  vm.runInContext(source.match(/function populateJournals[\s\S]*?\n}\n/)[0], context);
+  vm.runInContext(source.match(/function populateJournals[\s\S]*?\r?\n}\r?\n/)[0], context);
   vm.runInContext(`
     elements.journalSelect = fakeJournalSelect;
     populateJournals([{ journal: "B" }, { journal: "A" }]);
@@ -195,7 +209,7 @@ async function run() {
   vm.runInContext(`
     delete globalThis.applyUrlFilters;
   `, context);
-  vm.runInContext(source.match(/function applyUrlFilters[\s\S]*?\n}\n/)[0], context);
+  vm.runInContext(source.match(/function applyUrlFilters[\s\S]*?\r?\n}\r?\n/)[0], context);
   vm.runInContext(`
     elements.filterMethod = null; elements.filterTopic = null; elements.filterPreset = null;
     elements.searchInput = { value: "" };
@@ -255,6 +269,36 @@ async function run() {
   // A title-only AI guess is labelled distinctly from a real AI summary.
   assert.match(source, /基于标题推测/);
   assert.match(source, /未读取摘要，仅根据标题推测/);
+
+  // Checkbox filter popover: 全部 clears the others, clearing all falls back to 全部.
+  const checkbox = (value, checked) => ({ value, checked });
+  const boxes = [checkbox("", false), checkbox("Experiment", true), checkbox("Survey", false)];
+  context.fakeFilter = { tagName: "DIV", id: "", dataset: {}, querySelectorAll: () => boxes };
+  vm.runInContext('normalizeCheckboxFilter(fakeFilter, null)', context);
+  assert.deepStrictEqual(boxes.map((b) => b.checked), [false, true, false]);
+  boxes[0].checked = true;
+  context.allBox = boxes[0];
+  vm.runInContext('normalizeCheckboxFilter(fakeFilter, allBox)', context);
+  assert.deepStrictEqual(boxes.map((b) => b.checked), [true, false, false]);
+  boxes[2].checked = true;
+  context.surveyBox = boxes[2];
+  vm.runInContext('normalizeCheckboxFilter(fakeFilter, surveyBox)', context);
+  assert.deepStrictEqual(boxes.map((b) => b.checked), [false, false, true]);
+  boxes[2].checked = false;
+  vm.runInContext('normalizeCheckboxFilter(fakeFilter, surveyBox)', context);
+  assert.deepStrictEqual(boxes.map((b) => b.checked), [true, false, false]);
+
+  // DOI links and the OpenAlex provenance badge.
+  assert.strictEqual(vm.runInContext('normalizeDoi("https://doi.org/10.1000/xyz")', context), "10.1000/xyz");
+  assert.strictEqual(vm.runInContext('normalizeDoi("doi:10.1000/abc")', context), "10.1000/abc");
+  assert.strictEqual(vm.runInContext('createDoiLink({ doi: null })', context), null);
+  assert.strictEqual(vm.runInContext('createDoiLink({ doi: "10.1000/a b" }).href', context), "https://doi.org/10.1000/a%20b");
+  assert.match(source, /📖 OpenAlex/);
+
+  // Every POST declares a JSON body (the server rejects others with 415).
+  const posts = source.match(/method:\s*"POST"[^}]*/g) || [];
+  assert.ok(posts.length > 0);
+  posts.forEach((call) => assert.match(call, /Content-Type/));
   console.log("frontend paper_id tests passed");
 }
 

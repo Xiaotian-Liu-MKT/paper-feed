@@ -95,7 +95,7 @@ class PublicationReliabilityTests(unittest.TestCase):
                 patch.object(get_RSS, "OUTPUT_FILE", output_xml), \
                 patch.object(get_RSS, "FEED_JSON", output_json), \
                 patch.object(get_RSS, "JOURNAL_HASH_FILE", os.path.join(directory, "web", "journals.hash")), \
-                patch.object(get_RSS, "ensure_database", side_effect=lambda _root, db: ensure_database(directory, db)), \
+                patch.object(get_RSS, "ensure_database", side_effect=lambda _root, db: ensure_database(directory, db, bootstrap=True)), \
                 patch.dict(os.environ, {"PAPER_FEED_DB": database}), \
                 patch.object(get_RSS, "load_config", side_effect=[[results[0]["url"]], ["brand new keyword"]]), \
                 patch.object(get_RSS, "fetch_rss_result", side_effect=results), \

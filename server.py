@@ -45,11 +45,20 @@ RSS_LIST_FILE = os.path.join(BASE_DIR, "RSS list.md")
 FILE_LOCK = threading.RLock()
 MAX_LISTED_JOBS = 20
 CONFIG_SAVE_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
+MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+MAX_ABSTRACT_CHARS = 50_000
+TEST_CONNECTION_TIMEOUT = 20
+# Abstract sources that are real (non-AI) text and may be exported as RIS AB.
+RIS_ABSTRACT_SOURCES = {"user_provided", "crossref", "semantic_scholar", "openalex"}
 
 
 def paper_service():
-    """A request-scoped service; connections are never shared by HTTP threads."""
-    return PaperFeedService(BASE_DIR, os.environ.get("PAPER_FEED_DB"))
+    """A request-scoped service; connections are never shared by HTTP threads.
+
+    The local server never auto-imports the tracked legacy exports into a new
+    database; users run `python -m paper_feed import-legacy` explicitly.
+    """
+    return PaperFeedService(BASE_DIR, os.environ.get("PAPER_FEED_DB"), import_legacy=False)
 
 
 def atomic_write_text(path, content, encoding="utf-8"):
@@ -318,6 +327,12 @@ def build_favorite_ris_entry(item):
         lines.append(f"PY  - {year}")
     if url:
         lines.append(f"UR  - {url}")
+    doi = _ris_clean(item.get("doi"))
+    if doi:
+        lines.append(f"DO  - {doi}")
+    raw_abstract = _ris_clean(item.get("raw_abstract"))
+    if raw_abstract and item.get("abstract_source") in RIS_ABSTRACT_SOURCES:
+        lines.append(f"AB  - {raw_abstract}")
     # This stable note makes the export traceable even if legacy source metadata
     # is absent.  It deliberately uses the durable SQLite identity, not feed ids.
     lines.append(f"N1  - Paper Feed ID: {_ris_clean(item.get('paper_id'))}")
@@ -1006,6 +1021,111 @@ def update_feed_item_classification(item_id, updated):
         with FILE_LOCK:
             atomic_write_json(FEED_FILE, feed, ensure_ascii=True)
 
+def config_sources():
+    """Where each effective setting comes from: env > config.json > default.
+
+    Mirrors get_RSS.get_config precedence; returns labels only, never values.
+    """
+    import get_RSS
+    local_config = {}
+    if os.path.exists(get_RSS.CONFIG_FILE):
+        try:
+            with open(get_RSS.CONFIG_FILE, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                local_config = loaded
+        except Exception:
+            local_config = {}
+    sources = {}
+    for key in CONFIG_SAVE_KEYS:
+        if get_RSS.is_usable_config_value(os.environ.get(key)):
+            sources[key] = "env"
+        elif get_RSS.is_usable_config_value(local_config.get(key)):
+            sources[key] = "config"
+        elif get_RSS.CONFIG_DEFAULTS.get(key):
+            sources[key] = "default"
+        else:
+            sources[key] = "unset"
+    return sources
+
+
+def _redact(text, secret):
+    text = str(text or "")
+    if secret:
+        text = text.replace(secret, "***")
+    return text[:400]
+
+
+def check_openai_connection():
+    """Send one minimal chat completion with the effective config (no retries)."""
+    import time
+    import get_RSS
+    config = get_config()
+    model = config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+    api_key = config.get("OPENAI_API_KEY")
+    if not api_key:
+        return {"ok": False, "model": model, "latency_ms": None,
+                "error": "未配置 API Key，请先在设置中填写。 / No API key configured."}
+    started = time.perf_counter()
+    try:
+        client = get_RSS.make_openai_client(api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
+        client = client.with_options(max_retries=0, timeout=TEST_CONNECTION_TIMEOUT)
+        client.chat.completions.create(model=model, max_tokens=1,
+                                       messages=[{"role": "user", "content": "ping"}])
+    except Exception as error:
+        latency = int((time.perf_counter() - started) * 1000)
+        return {"ok": False, "model": model, "latency_ms": latency,
+                "error": f"连接失败 / Connection failed: {type(error).__name__}: {_redact(error, api_key)}"}
+    return {"ok": True, "model": model, "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+
+
+def pending_summary_counts():
+    """{pending, total_favorites}: favorites the summarize job would still process."""
+    from get_RSS import pending_summary_items
+    service = paper_service()
+    service._ensure_database()
+    favorites = service.favorite_legacy_ids()
+    legacy_ids = [legacy_id for _, legacy_id in favorites if legacy_id]
+    pending = pending_summary_items(service.database, legacy_ids) if legacy_ids else []
+    return {"pending": len(pending), "total_favorites": len(favorites)}
+
+
+def is_http_url(value):
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value.strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def probe_journal_feed(url):
+    """Fetch one RSS URL once and summarize what was parsed."""
+    from get_RSS import fetch_rss_result
+    result = fetch_rss_result(url, retries=1) or {}
+    entries = result.get("entries") or []
+    payload = {"ok": bool(result.get("success")) and bool(entries), "entries": len(entries),
+               "feed_title": (entries[0].get("journal") if entries else "") or "",
+               "latest_titles": [entry.get("title") or "" for entry in entries[:3]],
+               "status_code": result.get("status_code")}
+    if not result.get("success"):
+        payload["error"] = f"抓取失败 / Fetch failed: {result.get('error') or 'unknown error'}"
+    elif not entries:
+        payload["error"] = "未解析到任何条目，可能不是 RSS 地址。 / No entries parsed; this may not be an RSS feed."
+    return payload
+
+
+LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+WILDCARD_HOSTS = {"", "0.0.0.0", "::"}
+
+
+def _host_name(host_header):
+    """Hostname part of a Host header ("[::1]:8000" -> "::1")."""
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):
+        return host[1:host.find("]")] if "]" in host else host[1:]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         # 设置静态文件根目录为 web/
@@ -1056,10 +1176,78 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _server_port(self):
+        try:
+            return int(self.server.server_address[1])
+        except Exception:
+            return None
+
+    def _allowed_hostnames(self):
+        allowed = set(LOCAL_HOSTNAMES)
+        try:
+            bound = str(self.server.server_address[0]).lower()
+        except Exception:
+            bound = ""
+        if bound and bound not in WILDCARD_HOSTS:
+            allowed.add(bound)
+        return allowed
+
+    def _reject(self, status, message):
+        self.close_connection = True
+        self.send_json(status, {"status": "error", "message": message})
+        return True
+
+    def _security_rejection(self):
+        """Return True when a response has been sent and the request must stop.
+
+        The server has no authentication, so it defends against DNS rebinding
+        (Host check) and cross-site requests (Origin / Content-Type checks).
+        """
+        host = self.headers.get("Host")
+        if host is not None and _host_name(host) not in self._allowed_hostnames():
+            return self._reject(403, "Forbidden host / 不允许的 Host")
+        if self.command != "POST":
+            return False
+        fetch_site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if fetch_site in {"cross-site", "same-site"}:
+            return self._reject(403, "Cross-site request rejected / 拒绝跨站请求")
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            port = self._server_port()
+            allowed = {f"http://{name}:{port}" for name in ("127.0.0.1", "localhost", "[::1]")}
+            if origin.strip().lower().rstrip("/") not in allowed:
+                return self._reject(403, "Cross-origin request rejected / 拒绝跨源请求")
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length else 0
+        except ValueError:
+            return self._reject(400, "Invalid Content-Length header")
+        if length < 0:
+            return self._reject(400, "Invalid Content-Length header")
+        if length > MAX_REQUEST_BODY_BYTES:
+            return self._reject(413, "Request body too large (limit 2 MB) / 请求体过大")
+        content_type = self.headers.get("Content-Type")
+        media_type = (content_type or "").split(";", 1)[0].strip().lower()
+        # Bodies must be JSON (forms and text/plain can be sent cross-site
+        # without a CORS preflight).  A body-less POST without Content-Type is
+        # tolerated for simple action endpoints; Origin is still enforced above.
+        if (content_type is not None or length > 0) and media_type != "application/json":
+            return self._reject(415, "Content-Type must be application/json")
+        return False
+
     def do_GET(self):
+        if self._security_rejection():
+            return
         self._guarded(self._do_get)
 
+    def do_HEAD(self):
+        if self._security_rejection():
+            return
+        super().do_HEAD()
+
     def do_POST(self):
+        if self._security_rejection():
+            return
         self._guarded(self._do_post)
 
     def _do_get(self):
@@ -1093,8 +1281,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 "OPENAI_BASE_URL": config.get("OPENAI_BASE_URL") or "",
                 "OPENAI_PROXY": config.get("OPENAI_PROXY") or "",
                 "OPENAI_MODEL": config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+                "sources": config_sources(),
             }
             self.send_json(200, safe_config)
+            return
+
+        if path == '/api/summarize_favorites/pending':
+            self.send_json(200, pending_summary_counts())
             return
 
         if path in ('/api/jobs', '/api/jobs/'):
@@ -1283,6 +1476,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 
                 if not item_id or new_abstract is None:
                     raise ValueError("Missing id or abstract")
+                if not isinstance(new_abstract, str):
+                    raise ValueError("abstract must be a string")
+                if len(new_abstract) > MAX_ABSTRACT_CHARS:
+                    raise ValueError(f"Abstract too long (max {MAX_ABSTRACT_CHARS} characters) / 摘要过长")
                 
                 paper_service().save_abstract(item_id, new_abstract)
                 
@@ -1362,14 +1559,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     if isinstance(loaded, dict):
                         current_config = loaded
 
-                for key in CONFIG_SAVE_KEYS:
-                    if isinstance(new_config.get(key), str):
-                        new_config[key] = new_config[key].strip()
+                # Only known settings are persisted; unknown keys are ignored.
+                updates = {key: new_config[key].strip() for key in CONFIG_SAVE_KEYS
+                           if isinstance(new_config.get(key), str)}
                 # A blank password field means "keep the existing key" because
                 # read APIs deliberately never return secrets to the browser.
-                if not new_config.get("OPENAI_API_KEY"):
-                    new_config.pop("OPENAI_API_KEY", None)
-                current_config.update(new_config)
+                if not updates.get("OPENAI_API_KEY"):
+                    updates.pop("OPENAI_API_KEY", None)
+                current_config.update(updates)
+                if new_config.get("clear_api_key") is True:
+                    current_config.pop("OPENAI_API_KEY", None)
                 
                 # 写入文件
                 # 这里的 CONFIG_FILE 是在根目录下，不是 web/ 下，更安全
@@ -1390,6 +1589,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     raise ValueError("Invalid journals payload")
                 meta_payload = req_data.get("meta", None)
 
+                invalid = [item.strip() for item in journals
+                           if isinstance(item, str) and item.strip() and not is_http_url(item)]
+                if invalid:
+                    raise ValueError("Only http(s) RSS URLs are allowed / 仅支持 http(s) 地址: "
+                                     + ", ".join(invalid[:5]))
                 cleaned = []
                 seen = set()
                 for item in journals:
@@ -1449,6 +1653,21 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self.send_json(400 if isinstance(e, ValueError) else 500, {"status": "error", "message": str(e)})
+            return
+
+        if path == '/api/journals/test':
+            try:
+                req_data = self.read_json_body()
+                url = req_data.get("url") if isinstance(req_data, dict) else None
+                if not is_http_url(url):
+                    raise ValueError("url must be an http(s) URL / 仅支持 http(s) 地址")
+                self.send_json(200, probe_journal_feed(url.strip()))
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+            return
+
+        if path == '/api/test_connection':
+            self.send_json(200, check_openai_connection())
             return
 
         if path == '/api/reanalyze':

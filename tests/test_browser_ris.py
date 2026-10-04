@@ -41,7 +41,7 @@ class FavoriteRisExportTests(unittest.TestCase):
     @staticmethod
     def _post(httpd):
         conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=3)
-        conn.request("POST", "/api/export_favorites_ris", b"")
+        conn.request("POST", "/api/export_favorites_ris", b"{}", {"Content-Type": "application/json"})
         response = conn.getresponse()
         status, headers, body = response.status, dict(response.getheaders()), response.read()
         conn.close()

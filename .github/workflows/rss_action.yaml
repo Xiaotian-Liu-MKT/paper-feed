@@ -5,6 +5,12 @@ on:
     - cron: '0 */6 * * *'  # 每6小时运行一次
   workflow_dispatch:      # 允许手动触发
 
+# Never run two publications at once (a scheduled run overlapping a manual one
+# would otherwise race on the same files and fail with a non-fast-forward push).
+concurrency:
+  group: rss-publish
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,6 +32,7 @@ jobs:
       run: |
         pip install -r requirements.txt
 
+    # A failing test stops the job here, so no RSS update is published until fixed.
     - name: Run tests
       run: python -m unittest discover -s tests -p "test_*.py" -v
 
@@ -39,7 +46,9 @@ jobs:
         OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
       run: |
         # SQLite is an ephemeral CI cache. `refresh` (get_RSS.py) bootstraps it from the
-        # committed XML/JSON compatibility exports when it is absent.
+        # committed XML/JSON compatibility exports when it is absent; the bootstrap
+        # restores paper_id and the title analyses (title_zh/method/topic) carried
+        # by web/feed.json, so only genuinely new papers are sent to the AI model.
         rm -f data/paper_feed.sqlite3 data/paper_feed.sqlite3-wal data/paper_feed.sqlite3-shm
         python -m paper_feed refresh
 
@@ -70,4 +79,17 @@ jobs:
           exit 0
         fi
         git commit -m "Auto-update RSS feed"
-        git push
+        # Someone may have pushed while this job ran: rebase onto it and retry.
+        for attempt in 1 2 3; do
+          if git push; then
+            exit 0
+          fi
+          echo "Push rejected (attempt $attempt); rebasing onto the remote branch..." >&2
+          if ! git pull --rebase --autostash; then
+            git rebase --abort 2>/dev/null || true
+            echo "Rebase failed (conflicting changes to the exports); not publishing." >&2
+            exit 1
+          fi
+        done
+        echo "Push failed after 3 attempts." >&2
+        exit 1

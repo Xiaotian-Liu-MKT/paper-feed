@@ -1,5 +1,6 @@
 """Compatibility exports derived from durable Paper Feed SQLite records."""
 import json
+import os
 import re
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
@@ -87,6 +88,28 @@ def _labels(value):
     return [value] if value else []
 
 
+DEFAULT_CHANNEL_LINK = "https://github.com/your_username/your_repo"
+
+
+def channel_link():
+    """Repository URL for the RSS channel (GitHub Actions sets GITHUB_REPOSITORY)."""
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip().strip("/")
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+        server = os.environ.get("GITHUB_SERVER_URL", "").strip().rstrip("/") or "https://github.com"
+        return f"{server}/{repository}"
+    return DEFAULT_CHANNEL_LINK
+
+
+def keywords_are_private():
+    """RSS_KEYWORDS is a secret in CI: never publish its terms in web/feed.json."""
+    return bool(os.environ.get("RSS_KEYWORDS", "").strip())
+
+
+def keyword_terms(queries):
+    return sorted({p.strip() for q in queries for p in re.split(r"\s+AND\s+", q, flags=re.IGNORECASE) if p.strip()},
+                  key=str.lower)
+
+
 def export_items(items, xml_path, json_path, queries=(), limit=1000, atomic_write=None):
     """Atomically write legacy XML/JSON; limits only the presentation, never DB."""
     items = _sort_items(items)[:limit]
@@ -106,9 +129,14 @@ def export_items(items, xml_path, json_path, queries=(), limit=1000, atomic_writ
           "methods": methods, "topics": topics, "theories": translation.get("theories", []), "context": translation.get("context", []), "subjects": translation.get("subjects", []),
           "novelty_score": translation.get("novelty_score"), "classification_source": "user" if correction else "gpt", "classification_version": translation.get("classification_version", ""), "user_corrected": bool(correction),
           "summary": item.get("summary", ""), "abstract": abstract.get("abstract", ""), "raw_abstract": abstract.get("raw_abstract", ""), "abstract_source": abstract.get("source", ""), "journal": item.get("journal", ""), "pub_date": str(item.get("pub_date") or "")})
-    payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "keywords": sorted({p.strip() for q in queries for p in re.split(r"\s+AND\s+", q, flags=re.IGNORECASE) if p.strip()}, key=str.lower), "items": data}
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat()}
+    if not keywords_are_private():
+        # Only used by the UI to highlight terms; omitted when the rules come
+        # from the RSS_KEYWORDS secret because CI commits this file publicly.
+        payload["keywords"] = keyword_terms(queries)
+    payload["items"] = data
     root = ET.Element("rss", version="2.0"); channel = ET.SubElement(root, "channel")
-    for tag, value in (("title", "My Customized Papers"), ("link", "https://github.com/your_username/your_repo"), ("description", "Aggregated research papers")):
+    for tag, value in (("title", "My Customized Papers"), ("link", channel_link()), ("description", "Aggregated research papers")):
         ET.SubElement(channel, tag).text = value
     for item in data:
         node = ET.SubElement(channel, "item")

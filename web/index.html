@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.2" />
+    <link rel="stylesheet" href="styles.css?v=2.3" />
   </head>
   <body>
     <div id="offlineBanner" class="offline-banner" role="status" hidden>
@@ -71,19 +71,21 @@
           <details id="advancedFilters" class="advanced-filters">
             <summary>更多筛选</summary>
             <div class="controls controls--advanced">
-          <label class="control">
-            <span>研究方法</span>
-            <select id="filterMethod" class="select--compact-multi" multiple size="1">
-              <option value="">全部方法</option>
-            </select>
-          </label>
+          <div class="control">
+            <span id="filterMethodLabel">研究方法</span>
+            <details class="multi-filter" data-all-label="全部方法">
+              <summary class="multi-filter__summary" aria-labelledby="filterMethodLabel filterMethodSummary"><span id="filterMethodSummary">全部方法</span></summary>
+              <div id="filterMethod" class="multi-filter__panel" role="group" aria-labelledby="filterMethodLabel" data-all-label="全部方法"></div>
+            </details>
+          </div>
 
-          <label class="control">
-            <span>研究主题</span>
-            <select id="filterTopic" class="select--compact-multi" multiple size="1">
-              <option value="">全部主题</option>
-            </select>
-          </label>
+          <div class="control">
+            <span id="filterTopicLabel">研究主题</span>
+            <details class="multi-filter" data-all-label="全部主题">
+              <summary class="multi-filter__summary" aria-labelledby="filterTopicLabel filterTopicSummary"><span id="filterTopicSummary">全部主题</span></summary>
+              <div id="filterTopic" class="multi-filter__panel" role="group" aria-labelledby="filterTopicLabel" data-all-label="全部主题"></div>
+            </details>
+          </div>
 
           <label class="control">
             <span>方法逻辑</span>
@@ -194,23 +196,34 @@
 
         <label class="control">
           <span>API Key</span>
-          <input name="OPENAI_API_KEY" type="password" placeholder="sk-..." autocomplete="off">
+          <input name="OPENAI_API_KEY" type="password" placeholder="sk-..." autocomplete="off" aria-describedby="sourceOPENAI_API_KEY">
+          <small id="sourceOPENAI_API_KEY" class="field-source" data-source-for="OPENAI_API_KEY" hidden></small>
         </label>
 
         <label class="control">
           <span>模型 (OPENAI_MODEL)</span>
-          <input name="OPENAI_MODEL" type="text" placeholder="gpt-4o-mini" autocomplete="off">
+          <input name="OPENAI_MODEL" type="text" placeholder="gpt-4o-mini" autocomplete="off" aria-describedby="sourceOPENAI_MODEL">
+          <small id="sourceOPENAI_MODEL" class="field-source" data-source-for="OPENAI_MODEL" hidden></small>
         </label>
 
         <label class="control">
           <span>Base URL (可选)</span>
-          <input name="OPENAI_BASE_URL" type="text" placeholder="https://api.openai.com/v1">
+          <input name="OPENAI_BASE_URL" type="text" placeholder="https://api.openai.com/v1" aria-describedby="sourceOPENAI_BASE_URL">
+          <small id="sourceOPENAI_BASE_URL" class="field-source" data-source-for="OPENAI_BASE_URL" hidden></small>
         </label>
 
         <label class="control">
           <span>Proxy (可选)</span>
-          <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890">
+          <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890" aria-describedby="sourceOPENAI_PROXY">
+          <small id="sourceOPENAI_PROXY" class="field-source" data-source-for="OPENAI_PROXY" hidden></small>
         </label>
+
+        <div class="settings-tools">
+          <button id="btnTestConnection" class="btn btn--secondary btn--small" type="button" title="用已保存的配置发送一次极小的请求（消耗极少额度）">🔌 测试连接</button>
+          <button id="btnClearApiKey" class="btn btn--danger btn--small" type="button">🗑️ 清除密钥</button>
+          <span id="testConnectionResult" class="settings-tools__result" role="status" aria-live="polite"></span>
+        </div>
+        <p class="modal__hint">“测试连接”使用<strong>已保存</strong>的配置向模型发送一次极小的请求；如有未保存的修改，请先保存。</p>
 
         <p id="settingsError" class="form-error" role="alert" hidden></p>
         <div class="modal__actions">
@@ -383,6 +396,6 @@
     </dialog>
 
     <script src="nav.js" defer></script>
-    <script src="app.js?v=2.3"></script>
+    <script src="app.js?v=2.4"></script>
   </body>
 </html>

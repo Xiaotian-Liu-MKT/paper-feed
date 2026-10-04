@@ -1426,7 +1426,7 @@ function attachHandlers() {
       if (event.target.closest("a")) return; // 链接自身负责跳转
       const row = event.target.closest("tr");
       if (!row || !row.dataset.journal) return;
-      window.location.hash = buildJournalDetailHash(row.journal);
+      window.location.hash = buildJournalDetailHash(row.dataset.journal);
     });
   }
 

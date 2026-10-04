@@ -127,6 +127,12 @@ def probe_port(port, host=DEFAULT_HOST, timeout=2.0):
     return "busy"
 
 
+def python_command():
+    """The interpreter running this CLI, quoted for copy-paste into a shell."""
+    executable = sys.executable or "python"
+    return f'"{executable}"' if any(char.isspace() for char in executable) else executable
+
+
 def open_browser(url):
     """Open *url* (with a cache buster) without blocking the caller."""
     target = f"{url.rstrip('/')}/?t={int(time.time() * 1000)}"
@@ -196,7 +202,8 @@ def _start(args, refresh):
     state = probe_port(port, args.host)
     if state == "busy":
         print(f"Error: port {port} is already in use by another program. 端口 {port} 已被其他程序占用。")
-        print(f"  Stop that program, or choose another port: python -m paper_feed {args.command} --port 8001")
+        print("  Stop that program, or choose another port / 关闭该程序或换一个端口:")
+        print(f"    {python_command()} -m paper_feed {args.command} --port 8001")
         print("  (or set the PAPER_FEED_PORT environment variable / 或设置 PAPER_FEED_PORT 环境变量)")
         return EXIT_FAILURE
     if refresh:
@@ -282,8 +289,20 @@ def cmd_summarize_favorites(args):
         return EXIT_OK
     config = rss.get_config()
     if not config.get("OPENAI_API_KEY"):
-        print("OPENAI_API_KEY is not configured; AI summaries are unavailable. 未配置 OPENAI_API_KEY。")
-        return EXIT_OK if args.dry_run else EXIT_FAILURE
+        print("OPENAI_API_KEY is not configured: AI summaries are skipped. Free original abstracts can still be\n"
+              "looked up by DOI (Crossref -> OpenAlex -> Semantic Scholar; no key, no tokens).\n"
+              "未配置 OPENAI_API_KEY：跳过 AI 总结；仍可按 DOI 免费查找原始摘要（不需要密钥、不消耗 token）。")
+        if args.dry_run:
+            print("--dry-run: nothing was fetched. 仅统计，未联网。")
+            return EXIT_OK
+        question = (f"Look up free abstracts for {len(pending)} favorite(s)? This uses the network. "
+                    "将联网免费查找摘要，继续？")
+        if not confirm(question, args.yes):
+            print("Cancelled. 已取消。")
+            return EXIT_FAILURE
+        result = rss.fetch_missing_abstracts([item["paper_id"] for item in pending]) or {}
+        _print_fetch_result(result)
+        return EXIT_OK if result.get("status") == "ok" else EXIT_FAILURE
     if args.dry_run:
         print("--dry-run: OpenAI was not called. 仅统计，未调用 OpenAI。")
         return EXIT_OK
@@ -294,7 +313,43 @@ def cmd_summarize_favorites(args):
         return EXIT_FAILURE
     result = rss.summarize_specific_papers(legacy_ids) or {}
     print(result.get("message", ""))
+    if result.get("fetched"):
+        print(f"Free abstracts fetched by DOI: {result['fetched']}. 已免费获取 {result['fetched']} 篇原始摘要。")
+    if result.get("ai_skipped"):
+        print("AI summary skipped (no API key). 已跳过 AI 总结（未配置密钥）。")
     return EXIT_OK if result.get("status") == "ok" and not result.get("failed") else EXIT_FAILURE
+
+
+def _print_fetch_result(result):
+    print(result.get("message", ""))
+    print(f"Fetched / 已获取: {result.get('fetched', 0)}; not found / 未找到: {result.get('failed', 0)}; "
+          f"skipped / 跳过: {result.get('skipped', 0)}")
+    for error in result.get("errors") or []:
+        print(f"  - {error}")
+
+
+FETCH_VIEWS = ("favorite", "all", "inbox", "archived")
+
+
+def cmd_fetch_abstracts(args):
+    rss = _load_rss()
+    if not os.path.exists(_database_path()):
+        return _missing_database_notice()
+    from .ingestion import paper_ids_in_view
+    count = len(paper_ids_in_view(_database_path(), args.view))
+    print(f"{count} paper(s) in view '{args.view}'; those with a DOI and no stored abstract will be looked up.\n"
+          f"视图 {args.view} 中有 {count} 篇论文；有 DOI 且尚无摘要的会被查找。")
+    if not count:
+        print("Nothing to do. 无需处理。")
+        return EXIT_OK
+    question = ("Look up abstracts via Crossref -> OpenAlex -> Semantic Scholar? Free, no API key or tokens, "
+                "but uses the network. 将联网免费查找摘要（不需要密钥、不消耗 token），继续？")
+    if not confirm(question, args.yes):
+        print("Cancelled. 已取消。")
+        return EXIT_FAILURE
+    result = rss.fetch_missing_abstracts(view=args.view) or {}
+    _print_fetch_result(result)
+    return EXIT_OK if result.get("status") == "ok" else EXIT_FAILURE
 
 
 def _config_lines(lines):
@@ -370,9 +425,68 @@ def cmd_backup(args):
     try:
         result = backup_database(args.database, args.out)
     except FileNotFoundError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print(f"Error: {error}. 找不到数据库。", file=sys.stderr)
         return EXIT_FAILURE
-    print(json.dumps(result, indent=2))
+    ok = result["integrity"] == "ok"
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return EXIT_OK if ok else EXIT_FAILURE
+    size_kb = max(1, round(result["bytes"] / 1024))
+    if ok:
+        print(f"Backup written ({result['papers']} papers, {size_kb} KB, integrity_check ok). "
+              f"备份完成（{result['papers']} 篇论文）：")
+    else:
+        print(f"Backup written but integrity_check reported: {result['integrity']}. "
+              "备份已写出，但完整性检查未通过：")
+    print(f"  {result['backup']}")
+    print(f"Restore it later with / 恢复命令: {python_command()} -m paper_feed restore \"{result['backup']}\"")
+    return EXIT_OK if ok else EXIT_FAILURE
+
+
+def _state_breakdown(states):
+    return ", ".join(f"{name} {states.get(name, 0)}" for name in ("inbox", "favorite", "archived", "hidden"))
+
+
+def cmd_restore(args):
+    from .backup import RestoreError, check_restore_source, inspect_database, restore_database
+    database = Path(args.database or _database_path())
+    port = resolve_port(args.port)
+    if probe_port(port, args.host) == "paper_feed":
+        print(f"Error: Paper Feed is running on port {port}; stop it (Ctrl+C in its window) before restoring. "
+              f"Paper Feed 正在端口 {port} 运行，请先停止服务再恢复。", file=sys.stderr)
+        return EXIT_FAILURE
+    try:
+        info = check_restore_source(args.backup, database)
+    except RestoreError as error:
+        print(f"Error: {error}. 无法恢复该备份。", file=sys.stderr)
+        return EXIT_FAILURE
+    print(f"Backup / 备份: {args.backup}")
+    print(f"  integrity_check ok; {info['papers']} papers ({_state_breakdown(info['states'])})")
+    if database.exists():
+        try:
+            current = inspect_database(database)
+            detail = (f"{current['papers']} papers ({_state_breakdown(current['states'])})"
+                      if current["papers"] is not None else "no papers table")
+        except Exception as error:  # a corrupt live database is a reason to restore
+            detail = f"unreadable ({type(error).__name__})"
+        print(f"Current database / 当前数据库: {database}")
+        print(f"  {detail}; it is copied to a pre-restore backup first / 将先另存一份安全备份")
+    else:
+        print(f"Current database / 当前数据库: {database} (does not exist yet / 尚不存在)")
+    question = ("Replace the current database with this backup? Favorites and review state will match the backup. "
+                "用备份替换当前数据库（收藏与分流状态将回到备份时的样子），继续？")
+    if not confirm(question, args.yes):
+        print("Cancelled. 已取消。")
+        return EXIT_FAILURE
+    try:
+        result = restore_database(args.backup, database)
+    except (RestoreError, OSError, sqlite3.Error) as error:
+        print(f"Error: restore failed: {error}. 恢复失败；当前数据库未被替换或可从安全备份找回。", file=sys.stderr)
+        return EXIT_FAILURE
+    if result["safety_backup"]:
+        print(f"Previous database saved to / 原数据库已另存为: {result['safety_backup']}")
+    print(f"Restored {result['papers']} papers into {result['database']} "
+          f"({_state_breakdown(result['states'])}). 恢复完成。")
     return EXIT_OK if result["integrity"] == "ok" else EXIT_FAILURE
 
 
@@ -526,8 +640,9 @@ def run_doctor(root=PROJECT_DIR, port=None, database=None):
 
     db_path = Path(database or os.environ.get("PAPER_FEED_DB") or root / "data" / "paper_feed.sqlite3")
     if not db_path.exists():
-        add(WARN, "SQLite database", f"{db_path} not found - created (or imported from legacy exports) "
-                                     "on the first refresh/start / 首次运行时自动创建")
+        add(WARN, "SQLite database", f"{db_path} not found - created on the first refresh/start; "
+                                     "`import-legacy` imports existing exports / 首次运行时自动创建，"
+                                     "已有导出可用 import-legacy 导入")
     else:
         try:
             conn = sqlite3.connect(str(db_path), timeout=5)
@@ -685,10 +800,22 @@ def build_parser():
 
     sub = add("summarize-favorites", cmd_summarize_favorites, "AI summaries for favorites / 为收藏生成 AI 总结",
               "Generate AI summaries for favorites that do not have one yet (uses the stored abstract when\n"
-              "present, otherwise predicts from the title). Prints the count and asks first.\n"
-              "为尚无 AI 总结的收藏生成总结；执行前显示数量并确认。",
-              epilog="exit codes: 0 done / nothing to do / dry run; 1 cancelled, no API key, or failures")
+              "present or found for free by DOI, otherwise predicts from the title). Prints the count and\n"
+              "asks first. Without OPENAI_API_KEY only the free abstract lookup runs (AI summary skipped).\n"
+              "为尚无 AI 总结的收藏生成总结；执行前显示数量并确认。未配置密钥时只免费查找原始摘要，跳过 AI 总结。",
+              epilog="exit codes: 0 done / nothing to do / dry run; 1 cancelled or failures")
     _add_ai_options(sub)
+
+    sub = add("fetch-abstracts", cmd_fetch_abstracts, "free abstract lookup by DOI / 免费按 DOI 获取摘要",
+              "Look up original abstracts by DOI via Crossref -> OpenAlex -> Semantic Scholar for papers that\n"
+              "have none yet. Free: no API key and no tokens, but it uses the network. Set OPENALEX_MAILTO\n"
+              "(environment or config.json) to use the OpenAlex polite pool.\n"
+              "按 DOI 依次通过 Crossref、OpenAlex、Semantic Scholar 免费获取原始摘要（不需要密钥、不消耗 token，需要联网）。",
+              epilog="exit codes: 0 done / nothing to do / no database yet; 1 cancelled or error")
+    sub.add_argument("--view", choices=FETCH_VIEWS, default="favorite",
+                     help="which papers to look up (default: favorite) / 处理哪个视图的论文（默认收藏）")
+    sub.add_argument("--yes", "-y", action="store_true",
+                     help="do not ask for confirmation (required when not on a terminal) / 跳过确认")
 
     keywords = add("keywords", None, "show or preview keyword rules / 查看或预览关键词规则",
                    "Inspect the keyword rules used by refresh (keywords.dat, or RSS_KEYWORDS when set).\n"
@@ -735,6 +862,23 @@ def build_parser():
                      help="directory for the backup file (default: the database's data/ directory) / 输出目录")
     sub.add_argument("--database",
                      help="database to back up (default: PAPER_FEED_DB or data/paper_feed.sqlite3) / 数据库路径")
+    sub.add_argument("--json", action="store_true", help="print the result as JSON / 以 JSON 输出结果")
+
+    sub = add("restore", cmd_restore, "replace the database with a backup / 从备份恢复数据库",
+              "Replace the SQLite database with a backup file made by `backup`. Refuses while a Paper Feed\n"
+              "server answers on the port, checks the backup with PRAGMA integrity_check, saves the current\n"
+              "database as paper_feed.sqlite3-pre-restore-<time>.sqlite3, then swaps the files.\n"
+              "用 backup 生成的备份替换数据库：服务运行时拒绝执行；先做完整性检查，并把当前数据库另存为安全备份。",
+              epilog="exit codes: 0 restored; 1 cancelled, server running, invalid backup or failure")
+    sub.add_argument("backup", metavar="BACKUP_FILE", help="backup file to restore / 要恢复的备份文件")
+    sub.add_argument("--database",
+                     help="database to replace (default: PAPER_FEED_DB or data/paper_feed.sqlite3) / 被替换的数据库")
+    sub.add_argument("--port", type=_port_type, default=None,
+                     help=f"port checked for a running server (default: PAPER_FEED_PORT, else {DEFAULT_PORT}) "
+                          "/ 检查是否有服务在此端口运行")
+    sub.add_argument("--host", default=DEFAULT_HOST, help=argparse.SUPPRESS)
+    sub.add_argument("--yes", "-y", action="store_true",
+                     help="do not ask for confirmation (required when not on a terminal) / 跳过确认")
 
     sub = add("import-legacy", cmd_import_legacy, "import pre-SQLite JSON/XML files / 导入旧版数据",
               "One-way, idempotent import of legacy files (filtered_feed.xml, web/*.json) into SQLite.\n"

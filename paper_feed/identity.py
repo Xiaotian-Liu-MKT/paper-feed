@@ -1,6 +1,8 @@
 """Conservative, deterministic identities for papers."""
 import hashlib
 import re
+from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s<>\"')\]]+", re.I)
@@ -76,6 +78,44 @@ def identifiers(record):
     if source and guid:
         found.append(("source_guid", f"{source}\x1f{str(guid).strip()}"))
     return found
+
+
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y%m%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
+    "%B %Y", "%b %Y", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+)
+
+
+def normalize_published_at(value):
+    """ISO 8601 text for a publication date, or the original text when unparseable.
+
+    datetimes keep their timezone (naive stays naive); RFC 822 RSS dates and a
+    few common textual forms are converted so string sorting in SQLite is correct.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        pass
+    try:
+        return parsedate_to_datetime(text).isoformat()
+    except (TypeError, ValueError, IndexError):
+        pass
+    for pattern in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+        return parsed.date().isoformat() if pattern.count("%H") == 0 else parsed.isoformat()
+    return text
 
 
 def fingerprint(record):

@@ -603,7 +603,11 @@ async function generateReport() {
     reportElements.btnGenerate.textContent = "计算中...";
   }
   try {
-    const res = await fetch("/api/preference_report", { method: "POST" });
+    const res = await fetch("/api/preference_report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
     const data = await readJsonSafely(res);
     if (!res.ok || data?.status !== "ok") {
       setStatus(data?.message || `计算失败(${res.status})`);

@@ -2,6 +2,8 @@
 
 ## 项目定位与数据边界
 
+项目根目录：`E:\GitHub\paper-feed`（已从 `C:\Users\91784\PycharmProjects\paper-feed` 迁移）。
+
 Paper Feed 是本地 browser-first 学术 RSS 筛选器。主线是 RSS 抓取、SQLite 持久化、浏览器端分流与 RIS 导出；不再以 JSON 文件作为数据真相源，也不直连 Zotero API。
 
 默认数据库为 `data/paper_feed.sqlite3`，可用 `PAPER_FEED_DB` 覆盖。所有持久化实体和新 API/前端调用以稳定 `paper_id` 为键；旧 RSS `id`、链接和 JSON 键仅在兼容层解析，不能作为新存储身份。`filtered_feed.xml`、`web/feed.json`、`web/translations.json` 与其他 `web/*.json` 是兼容导出或本地状态，不是权威数据库。
@@ -28,12 +30,16 @@ Paper Feed 是本地 browser-first 学术 RSS 筛选器。主线是 RSS 抓取�
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-run_web.bat          # 默认 refresh：刷新后启动/打开
-run_web.bat refresh  # 默认行为的显式别名
-run_web.bat start    # 不调用 get_RSS.py，仅使用已有数据
+run_web.bat               # 默认 start：仅使用已有数据启动/打开（双击安全，无网络/AI 费用）
+run_web.bat run           # 先刷新再启动/打开（refresh 为别名）
+run_web.bat start 8001    # 第二个参数或 PAPER_FEED_PORT 指定端口
 ```
 
-启动器会检查 `.venv\Scripts\python.exe`、参数数量和名称，并以只读 `/api/interactions` 返回的 `favorites`、`archived`、`hidden` 数组结构识别已运行的 Paper Feed；其他端口 8000 占用会失败。默认和 `refresh` 都可能访问 RSS 网络、调用 OpenAI 并修改数据库和兼容导出；`start` 没有这些刷新副作用。启动器不输出配置或密钥。
+启动器会检查 `.venv\Scripts\python.exe`、参数数量和名称，并以只读 `/api/interactions` 返回的 `favorites`、`archived`、`hidden` 数组结构识别已运行的 Paper Feed；其他程序占用端口会失败。`run`/`refresh` 可能访问 RSS 网络、调用 OpenAI 并修改数据库和兼容导出；默认 `start` 没有这些刷新副作用。启动器不输出配置或密钥。
+
+全新克隆首次启动会创建**空数据库**，不再自动导入已跟踪的导出（作者数据）；需要时运行 `python -m paper_feed import-legacy`，或设 `PAPER_FEED_BOOTSTRAP_FROM_EXPORTS=1`。CI 通过 `CI`/`GITHUB_ACTIONS` 自动引导，并从 `web/feed.json` 恢复 `paper_id` 与已有翻译，避免每轮重新分析。
+
+本地服务会拒绝非 loopback 的 `Host`（防 DNS rebinding）、跨站 `Origin`/`Sec-Fetch-Site` 的 POST、非 JSON `Content-Type` 的 POST（415）和超过 2 MB 的请求体（413）；`/api/save_config` 只保存 `OPENAI_*` 白名单字段。新增前端 POST 必须带 `Content-Type: application/json`。
 
 OpenAI 设置来自被忽略的根 `config.json` 或 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_PROXY` 环境变量。不得把真实密钥写入源码、测试、文档、日志或提交记录。未配置 OpenAI 时，现有数据浏览和 RSS 抓取可用，但 AI 翻译、分类和总结不可用。
 

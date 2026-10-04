@@ -1,11 +1,13 @@
 # Paper Feed AI 功能技术文档
 
 ## 版本信息
-**文档版本**: 2.6
-**最后更新**: 2026-10-04
+**文档版本**: 2.7
+**最后更新**: 2026-10-05
 **项目**: Paper Feed - 学术论文 RSS 订阅系统
 
 > 2.6 变更要点：数据真相源已迁移到 SQLite（`data/paper_feed.sqlite3`，经 `paper_feed/` 包访问），所有持久化以稳定 `paper_id` 为键；`feed.json` / `filtered_feed.xml` / `translations.json` 仅为兼容导出或缓存。新增关键词编辑器、期刊目录、已隐藏视图、导航栏、`OPENAI_MODEL`、端口配置与备份命令。更完整的维护边界见 `DEV_CONTEXT.md`。
+>
+> 2.7 变更要点：本地服务加 Host/Origin/Content-Type/体积校验；`run_web.bat` 默认 `start`；全新克隆建空库（CI 自动引导并保留 `paper_id` 与翻译）；按需总结前先按 DOI 免费抓取摘要（Crossref → OpenAlex → Semantic Scholar）；新增 `restore` / `fetch-abstracts` 命令与若干 API。
 
 ## 1. 核心功能：AI 深度分类与分析
 
@@ -108,26 +110,31 @@
 | `reanalyze` / `summarize-favorites` | 计数（`get_RSS.stale_analysis_items` / `get_RSS.pending_summary_items`）→ 确认（`--yes`）→ `run_reanalysis_flow` / `summarize_specific_papers`；`--dry-run` 只计数 |
 | `keywords show` / `keywords preview` | 规则来源与 `get_RSS.load_config` 相同；预览调用 `server.keyword_preview`（SQLite） |
 | `doctor` | `cli.run_doctor`：Python、依赖、httpx `proxy=`、配置来源（不打印密钥）、期刊/关键词、数据库 `integrity_check` 与各状态计数、端口、`web/` 资源；有 FAIL 时退出 1 |
-| `backup` / `import-legacy` / `publish-guard` | `paper_feed.backup` / `paper_feed.importer` / `paper_feed.publish_guard.run` |
+| `backup [--json]` / `restore <文件> [--yes]` | `paper_feed.backup`（`restore` 在服务运行时拒绝执行，先校验 `integrity_check` 并保存 `pre-restore` 副本） |
+| `fetch-abstracts [--view] [--yes]` | `get_RSS.fetch_missing_abstracts`：按 DOI 免费抓取原始摘要，不消耗 token |
+| `import-legacy` / `publish-guard` | `paper_feed.importer` / `paper_feed.publish_guard.run` |
 
 兼容外壳：`python get_RSS.py` → `refresh`，`python server.py` → `serve`，`python -m paper_feed.publish_guard` 保留；`run_web.bat` / `run_web.sh` 分别调用 `-m paper_feed run|start --port ...`。新增命令行功能请加在 `cli.py` 并补 `tests/test_cli.py`。
 
 ## 4. API 接口 (`server.py`)
 
-服务仅绑定 `127.0.0.1`，端口默认 8000，可用 `PAPER_FEED_PORT` 或 `--port` 修改；无认证，禁止公网暴露。
+服务仅绑定 `127.0.0.1`，端口默认 8000，可用 `PAPER_FEED_PORT` 或 `--port` 修改；无认证，禁止公网暴露。服务拒绝非 loopback `Host`（403）、跨站 `Origin`/`Sec-Fetch-Site` 的 POST（403）、带请求体但非 `application/json` 的 POST（415）及超过 2 MB 的请求体（413）；新前端 POST 一律带 `Content-Type: application/json`。
 
 *   `GET /api/papers?view=inbox|favorite|archived|hidden|all`: 按视图列出论文。
 *   `GET /api/papers/<paper_id>`: 单篇论文。
 *   `POST /api/papers/<paper_id>/review`: 分流动作 like/unlike/archive/unarchive/hide/unhide。
 *   `GET /api/config`: 获取配置（密钥脱敏，返回 `has_api_key`、`OPENAI_MODEL` 等）。
-*   `POST /api/save_config`: 保存配置（含 `OPENAI_MODEL`）。优先级：非空环境变量 > config.json 非空非占位值 > 默认值。
+*   `POST /api/save_config`: 保存配置（仅 `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`/`OPENAI_PROXY` 白名单；`{"clear_api_key": true}` 清除密钥）。优先级：非空环境变量 > config.json 非空非占位值 > 默认值；`GET /api/config` 的 `sources` 标明每项来源（`env`/`config`/`default`/`unset`）。
+*   `POST /api/test_connection`: 用已保存配置发一次 `max_tokens=1` 请求，返回 `{ok, model, latency_ms, error?}`。
 *   `GET /api/keywords` / `POST /api/keywords`: 读写 `keywords.dat`，返回 `{text, keywords}`。
 *   `POST /api/keywords/preview`: 用与入库相同的匹配器预览规则在已入库论文中的命中情况。
-*   `GET /api/journals` / `POST /api/journals`: 读写订阅列表。
+*   `GET /api/journals` / `POST /api/journals`: 读写订阅列表（非 http(s) 地址返回 400）。
+*   `POST /api/journals/test`: 试抓单个 RSS，返回 `{ok, entries, feed_title, latest_titles, error?}`。
 *   `GET /api/journal_catalog`: 期刊目录（`name`, `url`, `subject`, `tags`, `subscribed`）。
 *   `POST /api/fetch`: 后台 job：RSS 抓取 + 标题翻译/分类（**不自动抓取摘要/总结**）。
 *   `POST /api/reanalyze`: 后台 job：标题 AI 重新分析。
-*   `POST /api/summarize_favorites`: 后台 job：对收藏按需生成 AI 总结。
+*   `POST /api/summarize_favorites`: 后台 job：对收藏按需生成 AI 总结（先按 DOI 免费抓取缺失的原始摘要）。
+*   `GET /api/summarize_favorites/pending`: `{pending, total_favorites}`，前端确认框显示真实待处理数。
 *   `GET /api/jobs` / `GET /api/jobs/<job_id>`: 最近任务列表 / 单个任务状态（可能为 `partial_failed`，结果含 `failed` 与 `errors`）。
 *   `POST /api/update_abstract`: 按 `paper_id` 保存用户补充摘要。
 *   `POST /api/update_classification`: 按 `paper_id` 保存用户分类修正。
@@ -143,7 +150,7 @@
 2.  **按需总结阶段**: 用户点击“生成 AI 总结”时：
     *   **已有摘要**: 若数据库已有原始摘要（含用户手动补充），AI 基于摘要总结 (`gpt_summarized`)。
     *   **无摘要**: AI 基于标题生成研究方向预测 (`gpt_generated`)。
-    *   **外部抓取**: 仅作为可选后端辅助逻辑，默认不在 RSS 流程中使用。
+    *   **外部抓取**: 按需总结前，对缺少原始摘要且有 DOI 的论文依次查询 Crossref → OpenAlex → Semantic Scholar（免费，`abstract_source` = `crossref`/`openalex`/`semantic_scholar`；可选 `OPENALEX_MAILTO`）。无 API Key 时仍会抓取原始摘要，仅跳过 AI。RSS 刷新流程**不**抓取摘要。用户补充的摘要不会被任务覆盖。
 
 ## 6. 后期更新指导
 
@@ -155,7 +162,7 @@
 *   **摘要编辑**: `server.py` -> `/api/update_abstract` -> `PaperFeedService.save_abstract(paper_id, ...)`（`paper_analyses`, `analysis_kind='abstract'`, `source='user_provided'`）。
 *   **分流**: `PaperFeedService.review(paper_id, action)` 写 `paper_review_state` 与 `paper_review_events`。
 *   **兼容导出**: `paper_feed.exporter`（`filtered_feed.xml`、`web/feed.json`）。
-*   **命令行**: `paper_feed/cli.py`（`python -m paper_feed --help`）；备份 / 旧数据导入为 `backup` / `import-legacy` 子命令，环境自检为 `doctor`。
+*   **命令行**: `paper_feed/cli.py`（`python -m paper_feed --help`）；备份 / 恢复 / 旧数据导入 / 免费补摘要为 `backup` / `restore` / `import-legacy` / `fetch-abstracts` 子命令，环境自检为 `doctor`。
 *   **偏好报告**: `server.py` -> `generate_title_report` 写入 `web/preference_report.json`；前端 `web/report.js` 在 `web/insights.html#prefs` 渲染。
 *   **来源/期刊筛选跳转**: `web/app.js` -> `applyUrlFilters` 处理 `journal/source/q` 查询参数。
 *   **前端渲染**: `web/app.js` -> `renderList`。

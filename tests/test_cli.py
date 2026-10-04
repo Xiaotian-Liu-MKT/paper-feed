@@ -7,6 +7,7 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from paper_feed.db import PaperRepository, connect  # noqa: E402
 from paper_feed.ingestion import save_abstracts, save_translations  # noqa: E402
 
 COMMANDS = ["start", "run", "serve", "refresh", "reanalyze", "summarize-favorites", "keywords",
-            "doctor", "backup", "import-legacy", "publish-guard"]
+            "fetch-abstracts", "doctor", "backup", "restore", "import-legacy", "publish-guard"]
 CLEAN_ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL", "RSS_KEYWORDS",
                   "RSS_JOURNALS", "PAPER_FEED_DB", "PAPER_FEED_PORT")
 
@@ -197,6 +198,9 @@ class RefreshAndServeDispatchTests(unittest.TestCase):
         self.assertEqual(code, 1)
         run_server.assert_not_called()
         self.assertIn("--port 8001", output)
+        # The hint names the interpreter actually in use, not a bare `python`.
+        self.assertIn(f"{cli.python_command()} -m paper_feed start --port 8001", output)
+        self.assertIn(sys.executable, output)
 
     def test_start_serves_without_network(self):
         with patch.object(cli, "probe_port", return_value="free"), \
@@ -323,6 +327,52 @@ class AiCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(sorted(summarize.call_args.args[0]), ["legacy-0", "legacy-1"])
 
+    def test_summarize_favorites_prints_fetched_and_skipped(self):
+        result = {"status": "ok", "message": "Fetched 1 abstracts; AI summary skipped.", "updated": 0,
+                  "fetched": 1, "ai_skipped": True, "failed": 0}
+        with patch.object(get_RSS, "summarize_specific_papers", return_value=result):
+            code, output = run_cli("summarize-favorites", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("Free abstracts fetched by DOI: 1", output)
+        self.assertIn("AI summary skipped", output)
+
+    def test_summarize_favorites_without_key_offers_free_abstract_fetch(self):
+        result = {"status": "ok", "message": "Fetched 1 abstracts; 0 not found; 0 skipped.",
+                  "fetched": 1, "failed": 0, "skipped": 0, "errors": []}
+        with patch.object(get_RSS, "get_config", return_value={}), \
+                patch.object(get_RSS, "summarize_specific_papers") as summarize, \
+                patch.object(get_RSS, "fetch_missing_abstracts", return_value=result) as fetch:
+            code, output = run_cli("summarize-favorites", "--dry-run")
+            self.assertEqual(code, 0)
+            fetch.assert_not_called()
+            with patch.object(cli, "_stdin_is_interactive", return_value=False):
+                self.assertEqual(run_cli("summarize-favorites")[0], 1)
+            fetch.assert_not_called()
+            code, output = run_cli("summarize-favorites", "--yes")
+        self.assertEqual(code, 0)
+        summarize.assert_not_called()
+        fetch.assert_called_once_with([self.ids["Beta paper"]])
+        self.assertIn("AI summaries are skipped", output)
+        self.assertIn("Fetched / 已获取: 1", output)
+
+    def test_fetch_abstracts_command(self):
+        result = {"status": "ok", "message": "Fetched 2 abstracts; 1 not found; 0 skipped.",
+                  "fetched": 2, "failed": 1, "skipped": 0, "errors": []}
+        with patch.object(get_RSS, "fetch_missing_abstracts", return_value=result) as fetch:
+            with patch.object(cli, "_stdin_is_interactive", return_value=False):
+                code, output = run_cli("fetch-abstracts")
+            self.assertEqual(code, 1)
+            fetch.assert_not_called()
+            code, output = run_cli("fetch-abstracts", "--view", "all", "--yes")
+        self.assertEqual(code, 0)
+        fetch.assert_called_once_with(view="all")
+        self.assertIn("3 paper(s) in view 'all'", output)
+        self.assertIn("Fetched / 已获取: 2", output)
+        code, output = run_cli("fetch-abstracts", "--view", "bogus")
+        self.assertEqual(code, 2)
+        with patch.object(get_RSS, "fetch_missing_abstracts", return_value={"status": "error"}):
+            self.assertEqual(run_cli("fetch-abstracts", "--yes")[0], 1)
+
     def test_dry_run_with_missing_database_does_not_create_it(self):
         missing = Path(self.temp.name) / "absent.sqlite3"
         with patch.dict(os.environ, {"PAPER_FEED_DB": str(missing)}):
@@ -369,6 +419,14 @@ class StorageCommandTests(unittest.TestCase):
             make_database(database)
             code, output = run_cli("backup", "--database", str(database), "--out", str(Path(temp) / "out"))
             self.assertEqual(code, 0)
+            self.assertIn("Backup written (3 papers", output)
+            self.assertIn("备份完成", output)
+            backups = list((Path(temp) / "out").glob("paper_feed.sqlite3-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn(str(backups[0]), output)
+            self.assertIn("-m paper_feed restore", output)
+            code, output = run_cli("backup", "--json", "--database", str(database), "--out", str(Path(temp) / "out"))
+            self.assertEqual(code, 0)
             self.assertEqual(json.loads(output)["papers"], 3)
             code, output = run_cli("backup", "--database", str(Path(temp) / "missing.sqlite3"))
             self.assertEqual(code, 1)
@@ -386,6 +444,108 @@ class StorageCommandTests(unittest.TestCase):
         self.assertIn("passed: 5", output)
         with patch.object(publish_guard, "validate_exports", side_effect=publish_guard.PublishGuardError("bad")):
             self.assertEqual(run_cli("publish-guard", "--xml", "a", "--json", "b")[0], 1)
+
+
+class RestoreCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.database = self.root / "data" / "paper_feed.sqlite3"
+        self.database.parent.mkdir()
+        # Backup holds 3 papers with a favorite; the live database later diverges.
+        ids = make_database(self.database)
+        set_state(self.database, ids["Alpha paper"], "favorite")
+        self.backup = Path(json.loads(
+            run_cli("backup", "--json", "--database", str(self.database), "--out", str(self.root / "bk"))[1])["backup"])
+        self.database.unlink()
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.database) + suffix).unlink(missing_ok=True)
+        make_database(self.database, titles=("Only live paper",))
+        self.probe = patch.object(cli, "probe_port", return_value="free")
+        self.probe.start()
+
+    def tearDown(self):
+        self.probe.stop()
+        self.temp.cleanup()
+
+    def papers(self, path=None):
+        conn = connect(str(path or self.database))
+        try:
+            titles = sorted(row[0] for row in conn.execute("SELECT title FROM papers"))
+            states = dict(conn.execute("SELECT p.title, s.state FROM papers p JOIN paper_review_state s USING(paper_id)"))
+        finally:
+            conn.close()
+        return titles, states
+
+    def restore(self, *extra):
+        return run_cli("restore", str(self.backup), "--database", str(self.database), *extra)
+
+    def test_restore_replaces_database_after_safety_backup(self):
+        Path(str(self.database) + "-wal").write_bytes(b"")  # stale sidecar must not survive
+        code, output = self.restore("--yes")
+        self.assertEqual(code, 0, output)
+        titles, states = self.papers()
+        self.assertEqual(titles, ["Alpha paper", "Beta paper", "Gamma paper"])
+        self.assertEqual(states["Alpha paper"], "favorite")
+        safety = list(self.database.parent.glob("paper_feed.sqlite3-pre-restore-*.sqlite3"))
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(self.papers(safety[0])[0], ["Only live paper"])
+        self.assertIn(str(safety[0]), output)
+        self.assertIn("恢复完成", output)
+        self.assertFalse(Path(str(self.database) + ".restore-tmp").exists())
+
+    def test_restore_requires_confirmation(self):
+        with patch.object(cli, "_stdin_is_interactive", return_value=False):
+            code, output = self.restore()
+        self.assertEqual(code, 1)
+        self.assertIn("--yes", output)
+        self.assertEqual(self.papers()[0], ["Only live paper"])
+        with patch.object(cli, "_stdin_is_interactive", return_value=True), \
+                patch("builtins.input", return_value="n"):
+            self.assertEqual(self.restore()[0], 1)
+        self.assertEqual(self.papers()[0], ["Only live paper"])
+        with patch.object(cli, "_stdin_is_interactive", return_value=True), \
+                patch("builtins.input", return_value="y"):
+            self.assertEqual(self.restore()[0], 0)
+        self.assertEqual(len(self.papers()[0]), 3)
+
+    def test_restore_refuses_while_paper_feed_server_is_running(self):
+        with patch.object(cli, "probe_port", return_value="paper_feed") as probe:
+            code, output = self.restore("--yes", "--port", "18011")
+        self.assertEqual(code, 1)
+        probe.assert_called_once_with(18011, "127.0.0.1")
+        self.assertIn("running", output)
+        self.assertEqual(self.papers()[0], ["Only live paper"])
+        self.assertEqual(list(self.database.parent.glob("*pre-restore*")), [])
+
+    def test_restore_rejects_missing_corrupt_or_foreign_files(self):
+        code, output = run_cli("restore", str(self.root / "missing.sqlite3"), "--database", str(self.database), "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not found", output)
+        garbage = self.root / "garbage.sqlite3"
+        garbage.write_bytes(b"this is not a database" * 100)
+        code, output = run_cli("restore", str(garbage), "--database", str(self.database), "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not a readable SQLite database", output)
+        foreign = self.root / "foreign.sqlite3"
+        conn = sqlite3.connect(str(foreign))
+        conn.execute("CREATE TABLE other(x)")
+        conn.commit()
+        conn.close()
+        code, output = run_cli("restore", str(foreign), "--database", str(self.database), "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not a Paper Feed database", output)
+        code, output = run_cli("restore", str(self.database), "--database", str(self.database), "--yes")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.papers()[0], ["Only live paper"])
+        self.assertEqual(list(self.database.parent.glob("*pre-restore*")), [])
+
+    def test_restore_into_missing_database(self):
+        self.database.unlink()
+        code, output = self.restore("--yes")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.papers()[0]), 3)
+        self.assertIn("does not exist yet", output)
 
 
 class DoctorTests(unittest.TestCase):

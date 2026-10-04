@@ -53,6 +53,14 @@ class LegacyImporter:
                     xml_orders.setdefault(str(record["id"]), record["_legacy_order"])
                 item.clear()
         feed = read_json(self.root / "web/feed.json", {}).get("items", [])
+        # Keep the paper_id already published in feed.json for the matching XML
+        # record, so a clean bootstrap does not re-mint every identity.
+        feed_paper_ids = {str(item.get("id")): item.get("paper_id") for item in feed
+                          if isinstance(item, dict) and item.get("id") and item.get("paper_id")}
+        for record in records:
+            preferred = feed_paper_ids.get(str(record.get("id")))
+            if preferred:
+                record["_preferred_paper_id"] = preferred
         for item in feed:
             if isinstance(item, dict):
                 legacy_key = item.get("id")
@@ -107,6 +115,7 @@ class LegacyImporter:
 
     def _run_import(self, fail_after, backup_enabled):
         records = self.records()
+        self._feed_analyses = []
         summary = Counter(records=len(records))
         unresolved = []
         backup = self.backup_legacy_files() if backup_enabled else None
@@ -155,7 +164,8 @@ class LegacyImporter:
                 if paper_id:
                     repo.attach_record_identifiers(paper_id, record)
                 else:
-                    paper_id = repo.resolve(record)
+                    paper_id = repo.resolve(record, preferred_id=record.get("_preferred_paper_id")
+                                            or (record.get("paper_id") if record.get("source") == "legacy_feed" else None))
                 repo.add_legacy_alias(paper_id, legacy_key)
                 repo.ensure_inbox(paper_id)
             except ValueError as exc:
@@ -175,6 +185,10 @@ class LegacyImporter:
                  record.get("summary"), json.dumps(record), stamp, stamp),
             )
             summary["observations"] += 1
+            if record.get("source") == "legacy_feed":
+                analysis = feed_translation_payload(record)
+                if analysis:
+                    self._feed_analyses.append((paper_id, analysis))
             if fail_after and index >= fail_after:
                 raise RuntimeError("injected import failure")
 
@@ -189,6 +203,7 @@ class LegacyImporter:
     def _import_metadata(self, conn, repo, unresolved):
         self._import_interactions(conn, repo, unresolved)
         self._import_cache(conn, repo, unresolved, "translations.json", "translation", "paper_analyses", title_keys=True)
+        self._import_feed_translations(conn, getattr(self, "_feed_analyses", []))
         self._import_cache(conn, repo, unresolved, "abstracts.json", "abstract", "paper_analyses")
         self._import_cache(conn, repo, unresolved, "user_corrections.json", "user_correction", "paper_user_overrides")
 
@@ -254,6 +269,36 @@ class LegacyImporter:
                 )
 
     @staticmethod
+    def _import_feed_translations(conn, analyses):
+        """Restore title analyses carried by the committed web/feed.json.
+
+        CI deletes its SQLite cache every run and web/translations.json is not
+        committed, so without this every bootstrap would look unanalysed and
+        re-send all titles to the model.  An existing versioned analysis (from
+        translations.json or an earlier local run) is never overwritten.
+        """
+        for paper_id, payload in analyses:
+            row = conn.execute(
+                "SELECT payload_json FROM paper_analyses WHERE paper_id=? AND analysis_kind='translation' "
+                "AND analysis_version=''", (paper_id,)).fetchone()
+            if row:
+                try:
+                    existing = json.loads(row[0] or "{}")
+                except (TypeError, ValueError):
+                    existing = {}
+                keep_existing = (not isinstance(existing, dict) or existing.get("classification_version")
+                                 or not payload.get("classification_version"))
+                if keep_existing:
+                    continue
+            conn.execute(
+                """INSERT INTO paper_analyses(paper_id,analysis_kind,analysis_version,payload_json,updated_at)
+                VALUES (?,'translation','',?,?)
+                ON CONFLICT(paper_id,analysis_kind,analysis_version) DO UPDATE SET
+                    payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (paper_id, json.dumps(payload), now()),
+            )
+
+    @staticmethod
     def _store_unresolved(conn, unresolved):
         for kind, key, reason, payload in unresolved:
             conn.execute(
@@ -262,6 +307,37 @@ class LegacyImporter:
                 VALUES (?,?,?,?,?)""",
                 (kind, key, reason, json.dumps(payload), now()),
             )
+
+
+def _label_list(plural, singular):
+    if isinstance(plural, list) and plural:
+        return [entry for entry in plural if entry]
+    if isinstance(singular, str) and singular.strip():
+        return [{"name": singular.strip(), "confidence": 0.4}]
+    return []
+
+
+def feed_translation_payload(item):
+    """Rebuild the ``paper_analyses`` translation payload from one feed.json item.
+
+    Mirrors the shape get_RSS.batch_analyze_papers saves (zh, methods, topics,
+    theories, context, subjects, novelty_score, classification_version).  Items
+    without ``title_zh`` were never analysed: the exporter's default
+    method/topic labels must not be mistaken for a classification.
+    """
+    zh = item.get("title_zh")
+    if not isinstance(zh, str) or not zh.strip():
+        return None
+    lists = {key: [value for value in item.get(key) or [] if isinstance(value, str)]
+             if isinstance(item.get(key), list) else [] for key in ("theories", "context", "subjects")}
+    return {
+        "zh": zh,
+        "methods": _label_list(item.get("methods"), item.get("method")),
+        "topics": _label_list(item.get("topics"), item.get("topic")),
+        **lists,
+        "novelty_score": item.get("novelty_score"),
+        "classification_version": item.get("classification_version") or "",
+    }
 
 
 def import_legacy(root=".", database=None, dry_run=False):

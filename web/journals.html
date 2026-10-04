@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed · 期刊管理</title>
-    <link rel="stylesheet" href="styles.css?v=2.2" />
+    <link rel="stylesheet" href="styles.css?v=2.3" />
     <link rel="stylesheet" href="pages.css?v=1.1" />
   </head>
   <body class="journals-page">
@@ -39,6 +39,7 @@
           <button id="btnImportOpen" class="btn btn--secondary" type="button">导入 / 批量操作</button>
           <button id="btnExport" class="btn btn--secondary" type="button">导出文件</button>
           <button id="btnSave" class="btn btn--primary" type="button">保存更新</button>
+          <span id="dirtyIndicator" class="dirty-indicator" role="status" hidden>● 有未保存的修改</span>
         </div>
         <p class="panel-hint">保存会覆盖 `journals.dat`，导入会自动去重并清理空行；URL 中的 utm_* 跟踪参数会在保存时自动去除。</p>
       </section>
@@ -46,7 +47,7 @@
       <section class="panel" id="catalogPanel">
         <details id="catalogDetails" class="report-details">
           <summary>📖 从目录添加</summary>
-          <p class="panel-hint" style="margin-top: 12px;">从内置期刊目录（RSS list.md）中勾选要订阅的期刊，已订阅的会自动勾选并禁用。点击「添加所选」会合并到当前列表并立即保存。</p>
+          <p class="panel-hint" style="margin-top: 12px;">从内置期刊目录（RSS list.md）中勾选要订阅的期刊，已订阅的会自动勾选并禁用。点击「添加所选」会合并到当前列表并立即保存（列表中其他未保存的修改也会一并保存）。</p>
           <div class="catalog-toolbar">
             <input id="catalogSearch" type="search" placeholder="按名称 / 学科 / 标签筛选目录" />
             <span id="catalogCount" class="panel-note"></span>
@@ -65,7 +66,7 @@
             <button id="btnAdd" class="btn btn--secondary" type="button">+ 添加一行</button>
           </div>
           <div id="journalList" class="journal-list"></div>
-          <p class="panel-hint">直接编辑期刊名称、URL 与学科，删除会立即从列表移除。</p>
+          <p class="panel-hint">直接编辑期刊名称、URL 与学科；URL 必须以 http:// 或 https:// 开头。「测试」会抓取一次该源检查能否解析。删除只会把期刊移出订阅列表（保存后生效），已入库论文不会被删除。</p>
         </div>
       </section>
 
@@ -97,6 +98,6 @@
     </dialog>
 
     <script src="nav.js?v=1.1"></script>
-    <script src="journals.js?v=1.1"></script>
+    <script src="journals.js?v=1.2"></script>
   </body>
 </html>

@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from .db import PaperRepository, connect, now
+from .identity import normalize_doi
 from .importer import LEGACY_FILES, LegacyImporter
 
 
@@ -35,9 +36,14 @@ def _primary(labels, fallback):
 
 class PaperFeedService:
     """Never retains a connection: each public call opens and closes one."""
-    def __init__(self, root=".", database=None):
+    def __init__(self, root=".", database=None, import_legacy=True):
         self.root = Path(root)
         self.database = str(database or self.root / "data" / "paper_feed.sqlite3")
+        # The local web server passes import_legacy=False: tracked compatibility
+        # exports (web/feed.json, ...) belong to the repository author, so a new
+        # user starts with an empty library and imports explicitly.  CI bootstraps
+        # through paper_feed.ingestion.ensure_database, which is unaffected.
+        self.import_legacy = import_legacy
 
     def _ensure_database(self):
         # The importer is deliberately called only for a missing formal database.
@@ -47,11 +53,14 @@ class PaperFeedService:
             with _INITIALIZATION_LOCK:
                 if not os.path.exists(self.database):
                     has_legacy = any((self.root / name).exists() for name in LEGACY_FILES)
-                    if has_legacy:
+                    if has_legacy and self.import_legacy:
                         LegacyImporter(self.root, self.database).run()
                     else:
                         conn = connect(self.database)
                         conn.close()
+                        if has_legacy:
+                            print("Created an empty Paper Feed database. 如需导入已有导出，运行 "
+                                  "python -m paper_feed import-legacy")
 
     def _connection(self):
         self._ensure_database()
@@ -82,6 +91,9 @@ class PaperFeedService:
         }.items() if value is not None})
         aliases = self._aliases(conn, paper_id)
         item["legacy_id"] = aliases.get("legacy_id") or item.get("id")
+        doi_row = conn.execute("SELECT MIN(identifier_value) FROM paper_identifiers WHERE paper_id=? AND identifier_type='doi'",
+                               (paper_id,)).fetchone()
+        item["doi"] = (doi_row[0] if doi_row and doi_row[0] else None) or normalize_doi(item.get("doi") or "")
         item["legacy_link"] = item.get("link")
         def payload(table, column, kind):
             data = conn.execute(f"SELECT payload_json FROM {table} WHERE paper_id=? AND {column}=?", (paper_id, kind)).fetchone()
