@@ -415,3 +415,24 @@ class DoctorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParseModelJsonTests(unittest.TestCase):
+    def test_plain_and_fenced(self):
+        self.assertEqual(get_RSS.parse_model_json('{"results": [1]}'), {"results": [1]})
+        self.assertEqual(get_RSS.parse_model_json('```json\n{"results": [1]}\n```'), {"results": [1]})
+
+    def test_trailing_prose_is_ignored(self):
+        self.assertEqual(get_RSS.parse_model_json('{"results": [{"index": 1}]}\nDone.'), {"results": [{"index": 1}]})
+
+    def test_concatenated_objects_are_merged(self):
+        text = '{"results": [{"index": 1}]}\n{"results": [{"index": 2}]}'
+        self.assertEqual(get_RSS.parse_model_json(text), {"results": [{"index": 1}, {"index": 2}]})
+
+    def test_one_item_per_line(self):
+        text = '{"index": 1, "zh": "a"}\n{"index": 2, "zh": "b"}'
+        self.assertEqual(get_RSS.parse_model_json(text), {"results": [{"index": 1, "zh": "a"}, {"index": 2, "zh": "b"}]})
+
+    def test_no_json_raises(self):
+        with self.assertRaises(ValueError):
+            get_RSS.parse_model_json("sorry, no JSON here")

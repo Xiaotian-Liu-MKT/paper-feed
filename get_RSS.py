@@ -338,6 +338,45 @@ def strip_code_fences(text):
     return match.group(1).strip() if match else text
 
 
+def parse_model_json(text):
+    """Parse a model's JSON reply, tolerating fences, trailing prose and several concatenated values.
+
+    Codex sometimes emits ``{"results": [...]}`` twice, or one item object per
+    line; ``results`` lists are merged and bare item objects are collected
+    into ``{"results": [...]}``.  Raises ValueError when no JSON is found.
+    """
+    text = strip_code_fences(text)
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    values, index = [], 0
+    while True:
+        starts = [pos for pos in (text.find("{", index), text.find("[", index)) if pos != -1]
+        if not starts:
+            break
+        try:
+            value, index = decoder.raw_decode(text, min(starts))
+        except ValueError:
+            index = min(starts) + 1
+            continue
+        values.append(value)
+    if not values:
+        raise ValueError("model reply contained no JSON")
+    if len(values) == 1:
+        return values[0]
+    results = []
+    for value in values:
+        if isinstance(value, dict) and isinstance(value.get("results"), list):
+            results.extend(value["results"])
+        elif isinstance(value, list):
+            results.extend(value)
+        elif isinstance(value, dict):
+            results.append(value)
+    return {"results": results}
+
+
 def _stderr_tail(data, limit=300):
     if isinstance(data, bytes):
         data = data.decode("utf-8", errors="replace")
@@ -921,7 +960,7 @@ def summarize_batch_with_gpt(entries, api_key, base_url=None, proxy=None, model=
             temperature=0.3,
             response_format={"type": "json_object"},
         )
-        data = json.loads(strip_code_fences(response.choices[0].message.content or ""))
+        data = parse_model_json(response.choices[0].message.content or "")
     except Exception as e:
         print(f"GPT batch summary error: {e}")
         reason = f"{type(e).__name__}: {e}"
@@ -1290,8 +1329,7 @@ Example:
                 ],
                 response_format={"type": "json_object"}
             )
-            content = response.choices[0].message.content
-            data = json.loads(content)
+            data = parse_model_json(response.choices[0].message.content or "")
             result_list = data.get("results", []) if isinstance(data, dict) else []
             if not isinstance(result_list, list):
                 result_list = []
