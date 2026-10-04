@@ -22,12 +22,14 @@ if str(ROOT) not in sys.path:
 import get_RSS  # noqa: E402
 import server  # noqa: E402
 from paper_feed import cli, publish_guard  # noqa: E402
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.db import PaperRepository, connect  # noqa: E402
 from paper_feed.ingestion import save_abstracts, save_translations  # noqa: E402
 
 COMMANDS = ["start", "run", "serve", "refresh", "reanalyze", "summarize-favorites", "keywords",
             "fetch-abstracts", "doctor", "backup", "restore", "import-legacy", "publish-guard"]
-CLEAN_ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL", "RSS_KEYWORDS",
+CLEAN_ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL", "AI_BACKEND",
+                  "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH", "RSS_KEYWORDS",
                   "RSS_JOURNALS", "PAPER_FEED_DB", "PAPER_FEED_PORT")
 
 

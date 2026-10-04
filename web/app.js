@@ -2874,6 +2874,47 @@ function configHasApiKey(config) {
   return Boolean(config.api_key_configured);
 }
 
+const DEFAULT_CODEX_MODEL = "gpt-6-luna";
+
+// Whether AI tasks can run. Newer servers report `ai_ready` (Codex CLI or an
+// OpenAI key); older ones only know about the OpenAI key.
+function configAiReady(config) {
+  if (!config) return false;
+  if (typeof config.ai_ready === "boolean") return config.ai_ready;
+  return configHasApiKey(config);
+}
+
+// Backend that AI tasks will actually use: "codex" or "openai".
+function configEffectiveBackend(config) {
+  if (!config) return "openai";
+  if (config.effective_backend === "codex" || config.effective_backend === "openai") return config.effective_backend;
+  if (config.AI_BACKEND === "codex" && config.codex_available !== false && config.effective_backend !== null) return "codex";
+  return "openai";
+}
+
+function configCodexModel(config) {
+  return (config && typeof config.CODEX_MODEL === "string" && config.CODEX_MODEL.trim()) || DEFAULT_CODEX_MODEL;
+}
+
+// Wording for confirm dialogs: what the AI call will consume.
+function aiCostNote(config) {
+  if (configEffectiveBackend(config) === "codex") {
+    return `将通过 Codex CLI 调用 ${configCodexModel(config)}，消耗 ChatGPT 订阅额度`;
+  }
+  return "这会调用 AI 接口并消耗 API 额度";
+}
+
+// Blocks an AI action only when a newer server explicitly reports ai_ready=false.
+function warnIfAiNotReady(config) {
+  if (!config || config.ai_ready !== false) return false;
+  const message = config.AI_BACKEND === "codex"
+    ? "AI 未就绪：未找到可用的 Codex CLI，请安装并登录（npm i -g @openai/codex，然后 codex login），或在 ⚙️ 设置中改用 OpenAI 兼容 API。"
+    : "AI 未就绪：请在 ⚙️ 设置中填写 API Key，或改用 Codex CLI。";
+  setStatus(message);
+  showToast(message, "error");
+  return true;
+}
+
 if (btnSummarizeFavorites) {
   btnSummarizeFavorites.addEventListener("click", async () => {
     btnSummarizeFavorites.blur();
@@ -2882,20 +2923,22 @@ if (btnSummarizeFavorites) {
       return;
     }
 
-    const pending = await fetchPendingSummaries();
+    const [pending, config] = await Promise.all([fetchPendingSummaries(), fetchConfig()]);
+    if (pending && pending.pending <= 0) {
+      const message = "所有收藏都已有 AI 总结或用户补充的摘要，无需生成。";
+      setStatus(message);
+      showToast(message, "info");
+      return;
+    }
+    if (warnIfAiNotReady(config)) return;
+    const costNote = aiCostNote(config);
     let question;
     if (pending) {
-      if (pending.pending <= 0) {
-        const message = "所有收藏都已有 AI 总结或用户补充的摘要，无需生成。";
-        setStatus(message);
-        showToast(message, "info");
-        return;
-      }
       const totalNote = Number.isFinite(pending.total) ? `（共 ${pending.total} 篇收藏）` : "";
-      question = `将为 ${pending.pending} 篇尚无总结的收藏文章生成 AI 总结${totalNote}。\n这会调用 AI 接口并消耗 API 额度。确定吗？`;
+      question = `将为 ${pending.pending} 篇尚无总结的收藏文章生成 AI 总结${totalNote}。\n${costNote}。确定吗？`;
     } else {
       // Older servers have no pending endpoint: fall back to the favourite count.
-      question = `确定要对 ${state.interactions.favorites.length} 篇收藏的文章生成 AI 总结吗？\n这会调用 AI 接口并消耗 API 额度。`;
+      question = `确定要对 ${state.interactions.favorites.length} 篇收藏的文章生成 AI 总结吗？\n${costNote}。`;
     }
     if (!confirm(question)) {
       return;
@@ -2908,7 +2951,9 @@ if (btnSummarizeFavorites) {
 if (btnReanalyze) {
   btnReanalyze.addEventListener("click", async () => {
     closeMoreMenu();
-    if (!confirm("对尚未分析或分类版本已过期的论文进行 AI 翻译与分类？\n这会调用 AI 接口并消耗 API 额度，可能需要一些时间。")) {
+    const config = await fetchConfig();
+    if (warnIfAiNotReady(config)) return;
+    if (!confirm(`对尚未分析或分类版本已过期的论文进行 AI 翻译与分类？\n${aiCostNote(config)}，可能需要一些时间。`)) {
       return;
     }
 
@@ -2917,7 +2962,7 @@ if (btnReanalyze) {
 }
 
 
-const CONFIG_FIELDS = ["OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_PROXY"];
+const CONFIG_FIELDS = ["AI_BACKEND", "CODEX_MODEL", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_PROXY"];
 const CONFIG_SOURCE_LABELS = {
   env: "来源：环境变量 · 由环境变量提供，此处修改不会生效",
   config: "来源：config.json",
@@ -2948,10 +2993,64 @@ function setConnectionResult(text, resultState = "") {
   else delete result.dataset.state;
 }
 
+// True once /api/config reported AI_BACKEND (servers with Codex CLI support).
+let settingsBackendSupported = false;
+// Last config read for the settings modal; used by the connection test copy.
+let settingsConfig = null;
+
+function selectedBackend() {
+  if (!settingsBackendSupported || !form || !form.AI_BACKEND) return "openai";
+  return form.AI_BACKEND.value === "openai" ? "openai" : "codex";
+}
+
+// Shows the Codex or OpenAI fields for the selected backend. Without backend
+// support the OpenAI fields are shown exactly as before.
+function syncBackendSections() {
+  const backend = selectedBackend();
+  const choice = document.getElementById("aiBackendChoice");
+  const codexSection = document.getElementById("codexSettings");
+  const openaiSection = document.getElementById("openaiSettings");
+  const openaiTitle = document.getElementById("openaiSettingsTitle");
+  const clearButton = document.getElementById("btnClearApiKey");
+  if (choice) choice.hidden = !settingsBackendSupported;
+  if (codexSection) codexSection.hidden = backend !== "codex";
+  if (openaiSection) openaiSection.hidden = backend !== "openai";
+  if (openaiTitle) openaiTitle.hidden = !settingsBackendSupported;
+  if (clearButton) clearButton.hidden = backend !== "openai";
+}
+
+function apiKeyStatusText(hasKey) {
+  return hasKey ? "✓ 已配置 API Key" : "✗ 未配置 API Key（AI 翻译、分类和总结将不可用）";
+}
+
+// Backend-aware status line: {text, state}.
+function describeAiStatus(config) {
+  if (!config) return { text: "AI 状态：无法读取服务器配置", state: "missing" };
+  const hasKey = configHasApiKey(config);
+  if (typeof config.AI_BACKEND !== "string") {
+    return { text: hasKey ? "API Key 状态：✓ 已配置" : "API Key 状态：✗ 未配置（AI 翻译、分类和总结将不可用）", state: hasKey ? "ok" : "missing" };
+  }
+  const openaiModel = config.OPENAI_MODEL || "gpt-4o-mini";
+  if (config.AI_BACKEND === "codex") {
+    if (config.codex_available === false) {
+      let text = "AI 状态：✗ 未找到 codex 命令，请安装并登录：npm i -g @openai/codex，然后 codex login";
+      if (config.effective_backend === "openai") text += `（暂时回退到 OpenAI 兼容 API：${openaiModel}）`;
+      return { text, state: "missing" };
+    }
+    if (config.ai_ready === false) {
+      return { text: "AI 状态：✗ Codex CLI 暂不可用，请确认已运行 codex login", state: "missing" };
+    }
+    return { text: `AI 状态：✓ 使用 Codex CLI（${configCodexModel(config)}）`, state: "ok" };
+  }
+  return { text: `AI 状态（OpenAI 兼容 API）：${apiKeyStatusText(hasKey)}`, state: hasKey ? "ok" : "missing" };
+}
+
 async function populateSettings() {
   const keyStatus = document.getElementById("apiKeyStatus");
-  if (keyStatus) keyStatus.textContent = "API Key 状态：读取中…";
+  if (keyStatus) { keyStatus.textContent = "AI 状态：读取中…"; delete keyStatus.dataset.state; }
   const config = await fetchConfig();
+  settingsConfig = config;
+  settingsBackendSupported = Boolean(config && typeof config.AI_BACKEND === "string");
   if (config) {
     const hasKey = configHasApiKey(config);
     form.OPENAI_API_KEY.value = "";
@@ -2959,27 +3058,43 @@ async function populateSettings() {
     if (form.OPENAI_MODEL) form.OPENAI_MODEL.value = config.OPENAI_MODEL || "";
     form.OPENAI_BASE_URL.value = config.OPENAI_BASE_URL || "";
     form.OPENAI_PROXY.value = config.OPENAI_PROXY || "";
+    if (settingsBackendSupported) {
+      if (form.AI_BACKEND) form.AI_BACKEND.value = config.AI_BACKEND === "openai" ? "openai" : "codex";
+      if (form.CODEX_MODEL) form.CODEX_MODEL.value = typeof config.CODEX_MODEL === "string" ? config.CODEX_MODEL : "";
+    }
     renderConfigSources(config.sources);
     const btnClearApiKey = document.getElementById("btnClearApiKey");
     if (btnClearApiKey) btnClearApiKey.disabled = !hasKey;
-    if (keyStatus) {
-      keyStatus.textContent = hasKey ? "API Key 状态：✓ 已配置" : "API Key 状态：✗ 未配置（AI 翻译、分类和总结将不可用）";
-      keyStatus.dataset.state = hasKey ? "ok" : "missing";
-    }
   } else {
     renderConfigSources(null);
-    if (keyStatus) {
-      keyStatus.textContent = "API Key 状态：无法读取服务器配置";
-      keyStatus.dataset.state = "missing";
-    }
+  }
+  syncBackendSections();
+  if (keyStatus) {
+    const status = describeAiStatus(config);
+    keyStatus.textContent = status.text;
+    keyStatus.dataset.state = status.state;
   }
   return config;
 }
 
+if (form && form.AI_BACKEND && typeof form.AI_BACKEND.forEach === "function") {
+  form.AI_BACKEND.forEach((radio) => radio.addEventListener("change", syncBackendSections));
+}
+
+function backendLabel(backend) {
+  if (backend === "codex") return "Codex CLI";
+  if (backend === "openai") return "OpenAI 兼容 API";
+  return backend ? String(backend) : "";
+}
+
 async function testConnection() {
   const button = document.getElementById("btnTestConnection");
+  // The test uses the saved config, so describe the saved effective backend.
+  const savedBackend = settingsBackendSupported ? configEffectiveBackend(settingsConfig) : "openai";
   if (button) { button.disabled = true; button.textContent = "测试中…"; }
-  setConnectionResult("正在发送一次极小的测试请求…");
+  setConnectionResult(savedBackend === "codex"
+    ? "正在测试…Codex 首次调用可能需要几十秒"
+    : "正在发送一次极小的测试请求…");
   try {
     const res = await fetch("/api/test_connection", {
       method: "POST",
@@ -2988,9 +3103,14 @@ async function testConnection() {
     });
     if (res.status === 404 || res.status === 501) throw new Error("当前服务器不支持连接测试，请更新后端。");
     const payload = await res.json().catch(() => ({}));
-    if (!res.ok || !payload.ok) throw new Error(payload.error || payload.message || `HTTP ${res.status}`);
+    const backendText = backendLabel(payload.backend);
+    if (!res.ok || !payload.ok) {
+      const detail = payload.error || payload.message || `HTTP ${res.status}`;
+      throw new Error(backendText ? `${backendText} · ${detail}` : detail);
+    }
     const latency = payload.latency_ms != null && Number.isFinite(Number(payload.latency_ms)) ? ` · ${Math.round(Number(payload.latency_ms))} ms` : "";
-    setConnectionResult(`✓ 连接成功${payload.model ? ` · ${payload.model}` : ""}${latency}`, "ok");
+    const parts = [backendText, payload.model].filter(Boolean).map((part) => ` · ${part}`).join("");
+    setConnectionResult(`✓ 连接成功${parts}${latency}`, "ok");
   } catch (error) {
     setConnectionResult(`✗ 连接失败：${error.message || "网络错误"}`, "error");
   } finally {
@@ -3087,6 +3207,10 @@ if (form && modal) {
       OPENAI_PROXY: form.OPENAI_PROXY.value.trim()
     };
     if (form.OPENAI_MODEL) data.OPENAI_MODEL = form.OPENAI_MODEL.value.trim();
+    if (settingsBackendSupported) {
+      data.AI_BACKEND = selectedBackend();
+      if (form.CODEX_MODEL) data.CODEX_MODEL = form.CODEX_MODEL.value.trim();
+    }
     const saveButton = document.getElementById("btnSaveSettings");
     setFormError("settingsError", "");
 
@@ -3176,9 +3300,12 @@ if (btnRefresh) {
   btnRefresh.addEventListener("click", async () => {
     btnRefresh.blur();
     // Fetching is free; only ask for confirmation when new titles will be
-    // sent to the AI (an API key is configured and therefore costs apply).
+    // sent to the AI (AI is ready and therefore quota/costs apply).
     const config = await fetchConfig();
-    if (configHasApiKey(config) && !confirm("立即从 RSS 源更新？\n新论文的标题会调用 AI 进行翻译和分类，将消耗少量 API 额度。")) {
+    const refreshCost = configEffectiveBackend(config) === "codex"
+      ? `将通过 Codex CLI 调用 ${configCodexModel(config)}，消耗少量 ChatGPT 订阅额度`
+      : "将消耗少量 API 额度";
+    if (configAiReady(config) && !confirm(`立即从 RSS 源更新？\n新论文的标题会调用 AI 进行翻译和分类，${refreshCost}。`)) {
       return;
     }
     await startJob("fetch");

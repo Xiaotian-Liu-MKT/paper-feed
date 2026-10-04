@@ -10,12 +10,14 @@ from unittest.mock import MagicMock, patch
 
 import get_RSS
 import server
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.ingestion import ingest_fetch_results
 from paper_feed.service import PaperFeedService
 
 
 def _clean_env(**extra):
-    env = {key: value for key, value in os.environ.items() if not key.startswith("OPENAI_")}
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("OPENAI_") and key not in get_RSS.CONFIG_KEYS}
     env.update(extra)
     return env
 
@@ -178,7 +180,9 @@ class ConfigEndpointTests(ServerTestCase):
             status, payload = self.request("GET", "/api/config")
         self.assertEqual(status, 200)
         self.assertEqual(payload["sources"], {"OPENAI_API_KEY": "env", "OPENAI_BASE_URL": "config",
-                                              "OPENAI_PROXY": "unset", "OPENAI_MODEL": "default"})
+                                              "OPENAI_PROXY": "unset", "OPENAI_MODEL": "default",
+                                              "AI_BACKEND": "default", "CODEX_MODEL": "default",
+                                              "CODEX_REASONING_EFFORT": "default", "CODEX_PATH": "unset"})
         dumped = json.dumps(payload)
         self.assertNotIn("env-key", dumped)
         self.assertNotIn("file-key", dumped)
@@ -218,6 +222,81 @@ class ConfigEndpointTests(ServerTestCase):
         self.assertFalse(payload["ok"])
         self.assertNotIn("dummy-key", payload["error"])
         self.assertIn("RuntimeError", payload["error"])
+
+
+class CodexBackendEndpointTests(ServerTestCase):
+    FAKE_CODEX = r"C:\fake\codex.cmd"
+
+    def read_config(self):
+        with open(self.config_path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_config_reports_backend_fields(self):
+        with patch.object(server, "get_config", return_value={"OPENAI_API_KEY": None, "OPENAI_MODEL": "m1"}), \
+                patch.object(get_RSS, "find_codex_executable", return_value=self.FAKE_CODEX):
+            status, payload = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual((payload["AI_BACKEND"], payload["effective_backend"], payload["CODEX_MODEL"]),
+                         ("codex", "codex", "gpt-6-luna"))
+        self.assertTrue(payload["codex_available"])
+        self.assertTrue(payload["ai_ready"])
+        self.assertFalse(payload["has_api_key"])  # still "an OpenAI key exists"
+        self.assertIn("AI_BACKEND", payload["sources"])
+
+    def test_config_reports_fallback_and_not_ready(self):
+        with patch.object(server, "get_config", return_value={"OPENAI_API_KEY": "sk-x", "AI_BACKEND": "codex"}):
+            status, fallback = self.request("GET", "/api/config")
+        with patch.object(server, "get_config", return_value={}):
+            _, missing = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual((fallback["effective_backend"], fallback["codex_available"], fallback["ai_ready"]),
+                         ("openai", False, True))
+        self.assertNotIn("sk-x", json.dumps(fallback))
+        self.assertEqual((missing["effective_backend"], missing["ai_ready"]), (None, False))
+        self.assertTrue(missing["ai_reason"])
+
+    def test_save_config_validates_backend_settings(self):
+        status, _ = self.request("POST", "/api/save_config", {"AI_BACKEND": "OpenAI", "CODEX_MODEL": "gpt-6-luna",
+                                                               "CODEX_REASONING_EFFORT": "medium"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.read_config(), {"AI_BACKEND": "openai", "CODEX_MODEL": "gpt-6-luna",
+                                              "CODEX_REASONING_EFFORT": "medium"})
+        for bad in ({"AI_BACKEND": "claude"}, {"CODEX_MODEL": 'x" & calc'}, {"CODEX_REASONING_EFFORT": "low high"}):
+            status, payload = self.request("POST", "/api/save_config", bad)
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(payload["status"], "error")
+        self.assertEqual(self.read_config()["AI_BACKEND"], "openai")
+
+    def test_connection_uses_codex_backend(self):
+        import subprocess
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+        with patch.object(server, "get_config", return_value={"OPENAI_API_KEY": None}), \
+                patch.object(get_RSS, "find_codex_executable", return_value=self.FAKE_CODEX), \
+                patch.object(subprocess, "run", side_effect=fake_run):
+            status, payload = self.request("POST", "/api/test_connection", {})
+        self.assertEqual(status, 200)
+        self.assertEqual((payload["ok"], payload["backend"], payload["model"]), (True, "codex", "gpt-6-luna"))
+        self.assertIsInstance(payload["latency_ms"], int)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["timeout"], server.CODEX_TEST_CONNECTION_TIMEOUT)
+
+    def test_connection_codex_failure_is_reported(self):
+        import subprocess
+        with patch.object(server, "get_config", return_value={}), \
+                patch.object(get_RSS, "find_codex_executable", return_value=self.FAKE_CODEX), \
+                patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("codex", 120)):
+            status, payload = self.request("POST", "/api/test_connection", {})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["backend"], "codex")
+        self.assertIn("CodexCLITimeoutError", payload["error"])
 
 
 class FeatureEndpointTests(ServerTestCase):

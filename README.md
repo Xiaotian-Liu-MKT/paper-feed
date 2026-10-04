@@ -14,13 +14,13 @@
 > 2. **双击 `run_web.bat`**（或在终端运行 `run_web.bat start`；macOS/Linux：`./run_web.sh`）。
 >    双击**只启动**：不刷新 RSS、不联网、不调用 AI、不产生费用，浏览器会打开 `http://127.0.0.1:8000`。
 >    首次启动会创建一个**空数据库**（`data/paper_feed.sqlite3`），仓库里已有的 `filtered_feed.xml` / `web/feed.json` 不会被自动导入；想导入这些已有论文，先运行一次 `.\.venv\Scripts\python.exe -m paper_feed import-legacy`。
-> 3. **在网页里完成配置后再更新**：点 ⚙️ **设置** 填入 API Key（可选），点 🔑 **关键词** 编辑并预览关键词，在 **期刊** 页勾选要订阅的期刊，最后点 **立即更新** 抓取新论文。以后想“先抓取再打开”，运行 `run_web.bat run`。
+> 3. **在网页里完成配置后再更新**：AI 分析默认使用本机的 **Codex CLI**（`npm i -g @openai/codex` 后运行 `codex login` 用 ChatGPT 账号登录，无需 API Key）；也可在 ⚙️ **设置** 中改用 OpenAI 兼容 API 并填入 API Key（均可选），点 🔑 **关键词** 编辑并预览关键词，在 **期刊** 页勾选要订阅的期刊，最后点 **立即更新** 抓取新论文。以后想“先抓取再打开”，运行 `run_web.bat run`。
 
 ## 主要功能
 
 - **多源聚合**：从多个学术期刊 RSS 源获取最新论文，期刊可在网页中从目录勾选订阅。
 - **智能过滤**：基于自定义关键词规则（AND / 排除 / 短语）筛选相关论文，并可在保存前预览命中情况。
-- **双语与 AI 功能**：可选的 OpenAI 兼容接口（含 DeepSeek 等）用于标题翻译、分类和收藏论文总结。
+- **双语与 AI 功能**：默认通过本机 Codex CLI（ChatGPT 登录）做标题翻译、分类和收藏论文总结；也可改用 OpenAI 兼容接口（含 DeepSeek 等）。
 - **现代化 Web 界面**：关键词、期刊和摘要搜索；日期与期刊筛选；待筛选/收藏/归档/已隐藏四个视图；收件箱刷卡和撤销；键盘快捷键；收藏 RIS 导出。
 - **本地优先数据**：SQLite 保存论文、状态和分析结果；兼容保留 RSS/XML/JSON 导出。
 
@@ -55,14 +55,24 @@ python3 -m venv .venv
 
 ### 1. AI 设置（可选）
 
-两种方式任选其一：
+AI 后端由 `AI_BACKEND` 决定，**默认 `codex`**：
 
-- **网页设置**：启动后点击 ⚙️ **设置**，填写 API Key、Base URL、模型名等，保存后写入本地 `config.json`。
+- **Codex CLI（默认）**：安装 Node.js 后运行 `npm i -g @openai/codex`，再运行一次 `codex login` 用 ChatGPT 账号登录。Paper Feed 会以 `codex exec`（只读沙箱、临时目录、`--ephemeral`）调用它，模型默认 `gpt-6-luna`。不需要 API Key、不产生 API 费用，但会消耗 ChatGPT 订阅额度：每次调用约有 2 万 token 的 Codex 系统提示开销，所以标题分析按每次约 25 个标题、最多 2 个并发进程批量进行。
+- **OpenAI 兼容 API**：在 ⚙️ 设置中把 AI 后端切换为 OpenAI，或设置 `AI_BACKEND=openai`，并填写 `OPENAI_API_KEY`（DeepSeek 等兼容服务另填 `OPENAI_BASE_URL` / `OPENAI_MODEL`）。按 token 计费。
+- **自动回退**：`AI_BACKEND=codex` 但本机找不到 Codex CLI（例如 GitHub Actions）时，若配置了 `OPENAI_API_KEY` 会自动改用 OpenAI API；两者都没有时跳过 AI（与以前“无密钥”行为相同）。⚙️ 设置中的“测试连接”会测试当前实际生效的后端，`doctor` 会显示实际后端与 `codex --version`。
+
+修改方式任选其一：
+
+- **网页设置**：启动后点击 ⚙️ **设置**，选择 AI 后端，填写 API Key、Base URL、模型名等，保存后写入本地 `config.json`。
 - **手动复制**：把 `config.json.example` 复制为 `config.json`（已被 `.gitignore` 忽略）后编辑。
 
 | 字段 | 是否必填 | 说明 |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | 使用 AI 时必填 | 保留 `your-api-key-here` 等以 `your-` 开头的占位值视为“未配置” |
+| `AI_BACKEND` | 可选 | `codex`（默认）或 `openai` |
+| `CODEX_MODEL` | 可选 | Codex CLI 使用的模型，默认 `gpt-6-luna` |
+| `CODEX_REASONING_EFFORT` | 可选 | Codex 推理强度，默认 `low` |
+| `CODEX_PATH` | 可选 | Codex 可执行文件的完整路径；留空时在 `PATH` 中查找 `codex` |
+| `OPENAI_API_KEY` | 使用 OpenAI 后端时必填 | 保留 `your-api-key-here` 等以 `your-` 开头的占位值视为“未配置” |
 | `OPENAI_BASE_URL` | 可选 | 留空使用 OpenAI 官方地址；使用 DeepSeek 等兼容服务时填其地址，如 `https://api.deepseek.com` |
 | `OPENAI_MODEL` | 可选 | 默认 `gpt-4o-mini`；使用 DeepSeek 时可填 `deepseek-chat` |
 | `OPENAI_PROXY` | 可选 | HTTP 代理地址，如 `http://127.0.0.1:7890` |
@@ -70,7 +80,7 @@ python3 -m venv .venv
 
 **配置优先级**：非空环境变量 > `config.json` 中的非空、非占位值 > 默认值。项目不会自动加载 `.env`。
 
-不配置 AI 也能抓取 RSS、浏览和分流论文，只是标题翻译、AI 分类和 AI 总结会被跳过。AI 调用可能产生费用；不要将真实密钥写入文档、测试、日志或提交记录。
+没有可用的 AI 后端也能抓取 RSS、浏览和分流论文，只是标题翻译、AI 分类和 AI 总结会被跳过。OpenAI API 调用会产生费用，Codex CLI 消耗 ChatGPT 订阅额度；不要将真实密钥写入文档、测试、日志或提交记录。
 
 ### 2. 关键词（`keywords.dat` 或网页 🔑 关键词）
 
@@ -192,15 +202,15 @@ $env:PAPER_FEED_BOOTSTRAP_FROM_EXPORTS = "1"; .\.venv\Scripts\python.exe -m pape
 | 命令 | 作用 | 联网 / AI 费用 |
 | --- | --- | --- |
 | `start [--port N] [--host H] [--no-browser]` | 用现有本地数据启动服务并打开浏览器；若该端口上已有 Paper Feed，直接打开它；端口被其他程序占用时报错退出 | 否 |
-| `run [--port N] [--host H] [--no-browser]` | 先 `refresh`，再像 `start` 一样启动/打开；刷新失败时仍打开已有数据；配置了 OpenAI 密钥时会提示费用 | 是 |
+| `run [--port N] [--host H] [--no-browser]` | 先 `refresh`，再像 `start` 一样启动/打开；刷新失败时仍打开已有数据；会提示 AI 消耗（Codex CLI：ChatGPT 订阅额度；OpenAI API：费用） | 是 |
 | `serve [--port N] [--host 127.0.0.1] [--open]` | 只启动本地 Web/API 服务（`--open` 启动后打开浏览器） | 否（后台任务按需） |
-| `refresh` | 抓取 RSS、按关键词过滤、写入 SQLite、AI 标题分析（若配置密钥）、重新生成 `filtered_feed.xml` / `web/feed.json` 等导出。退出码：`0` 已发布；`1` 所有 RSS 源都失败；`2` `journals.dat` 或关键词为空 | 是 |
+| `refresh` | 抓取 RSS、按关键词过滤、写入 SQLite、AI 标题分析（若有可用 AI 后端）、重新生成 `filtered_feed.xml` / `web/feed.json` 等导出。退出码：`0` 已发布；`1` 所有 RSS 源都失败；`2` `journals.dat` 或关键词为空 | 是 |
 | `reanalyze [--dry-run] [--yes]` | 对未分类或分类版本过旧的论文做 AI 标题分析；先显示数量并确认，`--dry-run` 只统计 | AI |
-| `summarize-favorites [--dry-run] [--yes]` | 为尚无 AI 总结的收藏生成总结（缺原始摘要时先按 DOI 免费查找）；先显示数量并确认，`--dry-run` 只统计。未配置密钥时只做免费摘要查找、跳过 AI 总结 | AI（无密钥时仅联网） |
+| `summarize-favorites [--dry-run] [--yes]` | 为尚无 AI 总结的收藏生成总结（缺原始摘要时先按 DOI 免费查找）；先显示数量并确认，`--dry-run` 只统计。没有可用 AI 后端时只做免费摘要查找、跳过 AI 总结 | AI（无 AI 后端时仅联网） |
 | `fetch-abstracts [--view favorite\|all\|inbox\|archived] [--yes]` | 按 DOI 依次通过 Crossref → OpenAlex → Semantic Scholar 免费获取尚无摘要论文的原始摘要（默认只处理收藏）；不需要 API Key、不消耗 token | 联网，免费 |
 | `keywords show` | 显示当前生效的关键词规则及来源（`RSS_KEYWORDS` 环境变量会覆盖 `keywords.dat`） | 否 |
 | `keywords preview [--text T \| --file F] [--json]` | 用库中已有论文预览规则命中数与示例（默认使用当前规则） | 否 |
-| `doctor [--port N] [--ascii]` | 环境自检：Python 版本、依赖（含 httpx 代理兼容）、每项配置的来源（不显示密钥）、`journals.dat`/`keywords.dat`、数据库完整性与各状态论文数、端口、`web/` 文件；有阻塞问题时退出码为 1 | 否 |
+| `doctor [--port N] [--ascii]` | 环境自检：Python 版本、依赖（含 httpx 代理兼容）、实际生效的 AI 后端与 `codex --version`（找不到 Codex 只是警告）、每项配置的来源（不显示密钥）、`journals.dat`/`keywords.dat`、数据库完整性与各状态论文数、端口、`web/` 文件；有阻塞问题时退出码为 1 | 否 |
 | `backup [--out DIR] [--json]` | 用 sqlite3 备份 API 生成一致的数据库副本（服务运行时也安全），打印备份文件路径；`--json` 输出机器可读结果 | 否 |
 | `restore <备份文件> [--yes]` | 用备份替换当前数据库（见下方“备份与恢复”）；服务运行时拒绝执行 | 否 |
 | `import-legacy [--root R] [--database D] [--dry-run]` | 将旧版 `filtered_feed.xml`、`web/*.json` 单向、幂等地导入 SQLite | 否 |
@@ -243,7 +253,7 @@ $env:PAPER_FEED_BOOTSTRAP_FROM_EXPORTS = "1"; .\.venv\Scripts\python.exe -m pape
    | Secret | 是否必填 | 说明 |
    | --- | --- | --- |
    | `RSS_KEYWORDS` | 推荐 | 关键词规则，多条用换行或 `;` 分隔；不设置时使用仓库中的 `keywords.dat` |
-   | `OPENAI_API_KEY` | 可选 | 不设置则跳过 AI 翻译与分类 |
+   | `OPENAI_API_KEY` | 可选 | Actions 环境里没有安装 Codex CLI，会自动回退到这个密钥调用 OpenAI 兼容 API；不设置则跳过 AI 翻译与分类 |
    | `OPENAI_BASE_URL` | 可选 | 兼容接口地址（如 DeepSeek） |
    | `OPENAI_MODEL` | 可选 | 模型名，默认 `gpt-4o-mini` |
 
@@ -257,7 +267,7 @@ $env:PAPER_FEED_BOOTSTRAP_FROM_EXPORTS = "1"; .\.venv\Scripts\python.exe -m pape
 需要了解的几点：
 
 - **测试失败会阻止 RSS 更新**：工作流先运行全部测试，任何测试失败都会让本次运行失败，不会抓取或提交新的导出。修好测试后手动 **Run workflow** 即可恢复。
-- **自动化中的 SQLite 只是临时缓存**，每次运行都会删除并从已提交的导出重建，不会被提交。重建时会保留导出中的 `paper_id` 和标题翻译/分类，所以配置了 `OPENAI_API_KEY` 时只有新论文会调用 AI，不会每次都重新分析全部论文。
+- **自动化中的 SQLite 只是临时缓存**，每次运行都会删除并从已提交的导出重建，不会被提交。重建时会保留导出中的 `paper_id` 和标题翻译/分类，所以配置了 `OPENAI_API_KEY`（CI 中 Codex 不可用，会回退到 OpenAI API）时只有新论文会调用 AI，不会每次都重新分析全部论文。
 - **本地数据库与 CI 不同步**：收藏、归档、隐藏等分流状态只存在于你本机的 `data/paper_feed.sqlite3`；CI 提交的导出不包含这些状态，`git pull` 拉下来的新导出也不会自动写入本地数据库（本地用 `run_web.bat run` 自行抓取即可）。请用 `backup` 保护本地数据库。
 - 同一时间只会运行一个更新任务（`concurrency: rss-publish`）；推送被拒时会先 `git pull --rebase` 再重试。
 
@@ -299,7 +309,7 @@ paper-feed/
 - **先运行自检**：`.\.venv\Scripts\python.exe -m paper_feed doctor` 会逐项检查依赖、配置来源、关键词/期刊文件、数据库和端口，并标出阻塞问题。
 - **`ModuleNotFoundError` / 缺少依赖**：确认使用的是 `.venv` 中的 Python，并重新执行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`。启动器提示找不到 `.venv\Scripts\python.exe` 时，说明还没有创建虚拟环境。
 - **端口被占用**：启动器发现 8000 端口被其他程序占用时会报错退出，并打印可直接复制的完整命令（含当前 Python 路径）。关闭占用程序；若需换端口，请运行 `run_web.bat start 8010` 或 `.\.venv\Scripts\python.exe -m paper_feed start --port 8010`（也可设置 `PAPER_FEED_PORT`）。若占用者本身就是 Paper Feed，启动器会直接打开它。
-- **AI 功能被跳过 / 没有翻译**：通常是未配置 API Key，或仍是 `your-api-key-here` 这样的占位值。在 ⚙️ 设置中检查“已配置密钥”状态；也要检查环境变量里是否有一个错误的 `OPENAI_API_KEY`（环境变量优先于 `config.json`）。
+- **AI 功能被跳过 / 没有翻译**：默认的 Codex 后端需要 `codex` 在 `PATH` 中（或设置 `CODEX_PATH`）并已 `codex login`；运行 `doctor` 查看实际后端，在 ⚙️ 设置中点“测试连接”。Codex 报错未登录时重新运行 `codex login`。使用 OpenAI 后端时，通常是未配置 API Key，或仍是 `your-api-key-here` 这样的占位值。在 ⚙️ 设置中检查“已配置密钥”状态；也要检查环境变量里是否有一个错误的 `OPENAI_API_KEY`（环境变量优先于 `config.json`）。
 - **任务状态为 `partial_failed`**：任务整体完成，但部分条目失败（例如个别 RSS 源超时、少数 AI 请求出错）。任务结果中会列出失败数量和简短错误信息；通常稍后重试即可，不需要重置数据。
 - **期刊抓取失败**：部分期刊需要机构网络或 VPN；也可能是 RSS 链接已失效，可在期刊页替换。
 - **`refresh`（`get_RSS.py`）退出码**：`0` 已发布；`1` 所有 RSS 源都抓取失败；`2` `journals.dat` 或关键词为空。`run` / `run_web.bat run` 遇到 1/2 会提示并打开已有数据；GitHub Actions 中会让运行显示为失败。
@@ -308,7 +318,7 @@ paper-feed/
 
 ## 注意事项
 
-1. AI 调用可能产生费用；刷新间隔建议至少一小时，避免给期刊站点造成压力。
+1. OpenAI API 调用会产生费用，Codex CLI 消耗 ChatGPT 订阅额度；刷新间隔建议至少一小时，避免给期刊站点造成压力。
 2. `RSS_JOURNALS`、`RSS_KEYWORDS` 环境变量会覆盖 `journals.dat`、`keywords.dat`（多条用换行或 `;` 分隔）；设置 `RSS_KEYWORDS` 时 `web/feed.json` 不写入 `keywords` 字段。
 3. `/api/fetch`、`/api/reanalyze`、`/api/summarize_favorites` 可能联网、写入或调用 AI；测试和演示时不要无意触发。
 4. 本地 API 无认证，尽管服务仅绑定 loopback，仍不应公开部署。

@@ -42,15 +42,29 @@ KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.dat")
 
 # OpenAI 配置
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-CONFIG_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
+CONFIG_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL",
+               "AI_BACKEND", "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH")
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
-CONFIG_DEFAULTS = {"OPENAI_MODEL": DEFAULT_OPENAI_MODEL}
+# AI backends: "codex" runs the locally installed Codex CLI (`codex exec`, ChatGPT
+# login, subscription quota); "openai" calls an OpenAI-compatible HTTP API.
+AI_BACKENDS = ("codex", "openai")
+DEFAULT_AI_BACKEND = "codex"
+DEFAULT_CODEX_MODEL = "gpt-6-luna"
+DEFAULT_CODEX_REASONING_EFFORT = "low"
+CONFIG_DEFAULTS = {"OPENAI_MODEL": DEFAULT_OPENAI_MODEL, "AI_BACKEND": DEFAULT_AI_BACKEND,
+                   "CODEX_MODEL": DEFAULT_CODEX_MODEL, "CODEX_REASONING_EFFORT": DEFAULT_CODEX_REASONING_EFFORT}
 OPENAI_RETRY_ATTEMPTS = 3
 OPENAI_RETRY_BASE_DELAY = 2.0
 # Per-request ceiling.  Timeouts are not retried and a shared CircuitBreaker
 # stops a job after repeated timeouts, so a hung endpoint costs ~1-2 timeouts.
 OPENAI_TIMEOUT_SECONDS = 60
 OPENAI_BREAKER_THRESHOLD = 2
+# Codex CLI: every `codex exec` carries ~20k tokens of system-prompt overhead
+# (ChatGPT subscription quota), so it gets fewer, larger calls.
+CODEX_TIMEOUT_SECONDS = 180
+CODEX_ANALYSIS_CHUNK_SIZE = 25
+CODEX_ANALYSIS_WORKERS = 2
+OPENAI_ANALYSIS_CHUNK_SIZE = 10
 # Free abstract sources (no tokens): short timeouts, never raise to callers.
 ABSTRACT_HTTP_TIMEOUT = (5, 10)
 ABSTRACT_MIN_LENGTH = 100
@@ -133,6 +147,275 @@ def config_model(config):
     return (config or {}).get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
 
 
+# --- AI backend selection (Codex CLI by default, OpenAI-compatible API optional) ---
+
+# Values passed on the command line of `codex exec` must be plain tokens: the
+# npm shim is a Windows .cmd file, so quotes or shell metacharacters would be
+# re-interpreted by cmd.exe.
+_CODEX_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+_CODEX_FALLBACK_LOGGED = False
+
+
+def is_safe_codex_token(value):
+    return isinstance(value, str) and bool(_CODEX_TOKEN_RE.match(value)) and len(value) <= 100
+
+
+def configured_backend(config):
+    """The configured AI_BACKEND ("codex" or "openai"); unknown values mean the default."""
+    value = str((config or {}).get("AI_BACKEND") or "").strip().lower()
+    return value if value in AI_BACKENDS else DEFAULT_AI_BACKEND
+
+
+def find_codex_executable(config=None):
+    """Path of the Codex CLI executable, or None.
+
+    An explicit CODEX_PATH wins (a bare npm shim path without extension is
+    mapped to its ``.cmd`` sibling on Windows); otherwise ``codex`` is looked
+    up on PATH.  This is the single discovery point (tests patch it).
+    """
+    import shutil
+    explicit = (config or {}).get("CODEX_PATH")
+    if isinstance(explicit, str) and explicit.strip():
+        path = os.path.expandvars(os.path.expanduser(explicit.strip().strip('"')))
+        if os.name == "nt" and not os.path.splitext(path)[1]:
+            for suffix in (".cmd", ".exe", ".bat"):
+                if os.path.isfile(path + suffix):
+                    return path + suffix
+        if os.path.isfile(path):
+            return path
+        return shutil.which(path)
+    return shutil.which("codex")
+
+
+class CodexCLISettings:
+    """Settings of the Codex CLI backend.
+
+    Passed in place of ``api_key`` to the AI helpers (``batch_analyze_papers``,
+    ``generate_abstract_with_gpt``, ``summarize_abstract_with_gpt``,
+    ``make_openai_client``): it is truthy, so the existing "no key -> skip"
+    guards keep working, and ``make_openai_client`` turns it into a
+    ``CodexCLIClient``.  It holds no secret.
+    """
+
+    def __init__(self, executable, model=None, reasoning_effort=None, timeout=CODEX_TIMEOUT_SECONDS):
+        self.executable = executable
+        self.model = model or DEFAULT_CODEX_MODEL
+        self.reasoning_effort = reasoning_effort or DEFAULT_CODEX_REASONING_EFFORT
+        self.timeout = timeout
+
+    def __bool__(self):
+        return True
+
+    def __repr__(self):
+        return f"CodexCLISettings(model={self.model!r}, reasoning_effort={self.reasoning_effort!r})"
+
+    __str__ = __repr__
+
+
+def is_codex_backend(api_key):
+    return isinstance(api_key, CodexCLISettings)
+
+
+def ai_settings(config=None, log=False):
+    """Resolve the effective AI backend.
+
+    Returns ``{backend, configured_backend, api_key, base_url, proxy, model,
+    ready, reason, codex_available, codex_path}``.  ``backend`` is "codex",
+    "openai" or None (not ready: AI steps are skipped).  For codex,
+    ``api_key`` is a ``CodexCLISettings`` (see there) and ``model`` the Codex
+    model.  AI_BACKEND=codex without an installed Codex CLI (e.g. GitHub
+    Actions) falls back to the OpenAI API when OPENAI_API_KEY is set.
+    """
+    global _CODEX_FALLBACK_LOGGED
+    config = get_config() if config is None else config
+    configured = configured_backend(config)
+    openai_key = config.get("OPENAI_API_KEY")
+    settings = {"backend": None, "configured_backend": configured, "api_key": None,
+                "base_url": config.get("OPENAI_BASE_URL"), "proxy": config.get("OPENAI_PROXY"),
+                "model": None, "ready": False, "reason": "", "codex_available": False, "codex_path": None}
+    codex_path = find_codex_executable(config) if configured == "codex" else None
+    settings["codex_available"] = bool(codex_path)
+    settings["codex_path"] = codex_path
+    if configured == "codex" and codex_path:
+        model = config.get("CODEX_MODEL") or DEFAULT_CODEX_MODEL
+        effort = config.get("CODEX_REASONING_EFFORT") or DEFAULT_CODEX_REASONING_EFFORT
+        if not (is_safe_codex_token(model) and is_safe_codex_token(effort)):
+            settings["reason"] = ("CODEX_MODEL / CODEX_REASONING_EFFORT contain unsupported characters "
+                                  "(letters, digits and . _ : / - only)")
+            return settings
+        settings.update(backend="codex", model=model, ready=True,
+                        api_key=CodexCLISettings(codex_path, model, effort))
+        return settings
+    if openai_key:
+        if configured == "codex" and log and not _CODEX_FALLBACK_LOGGED:
+            _CODEX_FALLBACK_LOGGED = True
+            print("Codex CLI not found; falling back to the OpenAI API (OPENAI_API_KEY). "
+                  "未找到 Codex CLI，改用 OpenAI API。")
+        settings.update(backend="openai", api_key=openai_key, model=config_model(config), ready=True)
+        return settings
+    if configured == "codex":
+        settings["reason"] = ("Codex CLI not found and no OPENAI_API_KEY configured "
+                              "(install it with `npm i -g @openai/codex` and run `codex login`, or set CODEX_PATH)")
+    else:
+        settings["reason"] = "no OPENAI_API_KEY configured (AI_BACKEND=openai)"
+    return settings
+
+
+def ai_backend_label(settings):
+    if (settings or {}).get("backend") == "codex":
+        return f"Codex CLI ({settings.get('model')})"
+    if (settings or {}).get("backend") == "openai":
+        return f"OpenAI API ({settings.get('model')})"
+    return "no AI backend"
+
+
+def ai_skip_message(settings):
+    return f"no AI backend available: {(settings or {}).get('reason') or 'not configured'}"
+
+
+class CodexCLIError(RuntimeError):
+    """Base class of Codex CLI failures (messages carry the stderr tail, never secrets)."""
+
+
+class CodexCLINotFoundError(CodexCLIError):
+    """The executable is missing: fail fast, never retried."""
+
+
+class CodexCLITimeoutError(CodexCLIError):
+    """`codex exec` exceeded its timeout: counts toward the circuit breaker."""
+
+
+class CodexCLIProcessError(CodexCLIError):
+    """Non-zero exit or empty output: counts toward the circuit breaker."""
+
+
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(part for part in parts if part)
+    return "" if content is None else str(content)
+
+
+def flatten_messages(messages, json_output=False):
+    """One prompt for `codex exec`: system messages first, then the conversation."""
+    messages = [message for message in (messages or []) if isinstance(message, dict)]
+    system = [_message_text(m.get("content")) for m in messages if m.get("role") == "system"]
+    rest = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            continue
+        text = _message_text(message.get("content"))
+        rest.append(text if role in (None, "user") else f"[{role}]\n{text}")
+    blocks = [text.strip() for text in system + rest if text and text.strip()]
+    if json_output:
+        blocks.append("Output only valid JSON, no code fences and no other text.")
+    return "\n\n".join(blocks)
+
+
+_FENCE_RE = re.compile(r"^\s*```[A-Za-z0-9_-]*[ \t]*\n(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def strip_code_fences(text):
+    text = (text or "").strip()
+    match = _FENCE_RE.match(text)
+    return match.group(1).strip() if match else text
+
+
+def _stderr_tail(data, limit=300):
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    text = " ".join(str(data or "").split())
+    for name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        secret = os.environ.get(name)
+        if secret and len(secret) > 4:
+            text = text.replace(secret, "***")
+    return text[-limit:]
+
+
+def build_codex_command(settings, output_path):
+    return [settings.executable, "exec", "-m", settings.model,
+            "-c", f"model_reasoning_effort={settings.reasoning_effort}",
+            "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--ignore-rules",
+            "-o", output_path, "-"]
+
+
+def run_codex_exec(settings, prompt, timeout=None):
+    """Run `codex exec` once with *prompt* on stdin; return the final message text."""
+    import subprocess
+    import shutil
+    timeout = timeout or settings.timeout or CODEX_TIMEOUT_SECONDS
+    if not settings.executable:
+        raise CodexCLINotFoundError("Codex CLI executable not found (npm i -g @openai/codex, or set CODEX_PATH)")
+    workdir = tempfile.mkdtemp(prefix="paper-feed-codex-")
+    try:
+        output_path = os.path.join(workdir, "last_message.txt")
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(build_codex_command(settings, output_path),
+                                       input=(prompt or "").encode("utf-8"), capture_output=True,
+                                       cwd=workdir, timeout=timeout, **kwargs)
+        except FileNotFoundError as error:
+            raise CodexCLINotFoundError(f"Codex CLI executable not found: {settings.executable}") from error
+        except subprocess.TimeoutExpired as error:
+            raise CodexCLITimeoutError(f"codex exec timed out after {timeout:.0f}s; "
+                                       f"stderr: {_stderr_tail(error.stderr)}") from None
+        if completed.returncode != 0:
+            raise CodexCLIProcessError(f"codex exec exited with code {completed.returncode}; "
+                                       f"stderr: {_stderr_tail(completed.stderr)}")
+        try:
+            with open(output_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError:
+            content = ""
+        content = strip_code_fences(content)
+        if not content:
+            raise CodexCLIProcessError(f"codex exec produced no output; stderr: {_stderr_tail(completed.stderr)}")
+        return content
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+class _Namespace:
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+
+class CodexCLIClient:
+    """Minimal stand-in for the OpenAI client backed by `codex exec`.
+
+    Supports ``client.chat.completions.create(model=..., messages=[...], ...)``
+    (the OpenAI model name, max_tokens and temperature are ignored: Codex uses
+    CODEX_MODEL) and ``client.with_options(timeout=...)``.  The response has
+    ``.choices[0].message.content`` and ``.usage = None``.
+    """
+
+    def __init__(self, settings, timeout=None):
+        self.settings = settings
+        self.timeout = timeout or settings.timeout or CODEX_TIMEOUT_SECONDS
+        self.chat = _Namespace(completions=_Namespace(create=self._create))
+
+    def with_options(self, max_retries=None, timeout=None, **ignored):
+        return CodexCLIClient(self.settings, timeout if timeout is not None else self.timeout)
+
+    def _create(self, model=None, messages=None, max_tokens=None, temperature=None,
+                response_format=None, **ignored):
+        json_output = isinstance(response_format, dict) and response_format.get("type") in ("json_object", "json_schema")
+        content = run_codex_exec(self.settings, flatten_messages(messages, json_output), self.timeout)
+        message = _Namespace(role="assistant", content=content)
+        return _Namespace(choices=[_Namespace(index=0, message=message, finish_reason="stop")],
+                          usage=None, model=self.settings.model)
+
+
 def add_error(report, message):
     """Record a failure in a job report; the error list is capped for the UI."""
     if report is None:
@@ -147,8 +430,11 @@ def make_openai_client(api_key, base_url=None, proxy=None):
 
     The SDK's own retries are disabled (``max_retries=0``) so that
     ``chat_completion_with_retry`` is the single retry mechanism, and every
-    request is bounded by ``OPENAI_TIMEOUT_SECONDS``.
+    request is bounded by ``OPENAI_TIMEOUT_SECONDS``.  When *api_key* is a
+    ``CodexCLISettings`` (see ``ai_settings``) a ``CodexCLIClient`` is returned.
     """
+    if is_codex_backend(api_key):
+        return CodexCLIClient(api_key)
     from openai import OpenAI
     import httpx
 
@@ -192,6 +478,9 @@ class CircuitOpenError(RuntimeError):
 
 def is_timeout_like_openai_error(error):
     """Timeouts and connection failures: the endpoint is hung or unreachable."""
+    if isinstance(error, CodexCLIError):
+        # Missing executable, timeouts and failing runs all mean "stop calling".
+        return True
     try:
         import openai
     except ImportError:
@@ -201,6 +490,10 @@ def is_timeout_like_openai_error(error):
 
 
 def is_retryable_openai_error(error):
+    if isinstance(error, CodexCLIError):
+        # codex retries its own transport; retrying a timeout, a missing
+        # executable or a failed run would only burn quota again.
+        return False
     try:
         import openai
     except ImportError:
@@ -678,21 +971,24 @@ def batch_analyze_papers(titles, api_key, base_url=None, proxy=None, model=None,
     if not titles or not api_key:
         return {}
 
-    if proxy:
+    codex = is_codex_backend(api_key)
+    if proxy and not codex:
         print(f"Using proxy: {proxy}")
     try:
         client = make_openai_client(api_key, base_url, proxy)
     except Exception as e:
         # A bad proxy URL or missing dependency must not abort the RSS refresh.
-        print(f"Could not create OpenAI client; skipping AI analysis: {e}")
+        print(f"Could not create AI client; skipping AI analysis: {e}")
         if report is not None:
             report["failed"] += len(titles)
-        add_error(report, f"OpenAI client error: {type(e).__name__}: {e}")
+        add_error(report, f"AI client error: {type(e).__name__}: {e}")
         return {}
-    model = model or DEFAULT_OPENAI_MODEL
+    # Codex CLI ignores the OpenAI model name; show the model that really runs.
+    model = api_key.model if codex else (model or DEFAULT_OPENAI_MODEL)
 
     analysis_results = {}
-    chunk_size = 10
+    # Each `codex exec` costs a large fixed prompt overhead: fewer, larger calls.
+    chunk_size = CODEX_ANALYSIS_CHUNK_SIZE if codex else OPENAI_ANALYSIS_CHUNK_SIZE
     chunks = [titles[i:i + chunk_size] for i in range(0, len(titles), chunk_size)]
 
     categories = load_categories() or {}
@@ -720,7 +1016,7 @@ def batch_analyze_papers(titles, api_key, base_url=None, proxy=None, model=None,
     method_fallback = fallback_label(method_names, "Qualitative")
     topic_fallback = fallback_label(topic_names, "Other Marketing")
 
-    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "OpenAI endpoint")
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "Codex CLI" if codex else "OpenAI endpoint")
 
     def analyze_chunk(chunk):
         """Return (pairs, error_message, failed_count); error_message is None on full success."""
@@ -788,7 +1084,7 @@ Example:
             print(f"Analysis error for chunk: {e}")
             return [], f"{type(e).__name__}: {e}", len(chunk)
 
-    worker_count = min(AI_ANALYSIS_WORKERS, len(chunks))
+    worker_count = min(CODEX_ANALYSIS_WORKERS if codex else AI_ANALYSIS_WORKERS, len(chunks))
     print(f"Starting concurrent analysis with {worker_count} workers for {len(chunks)} chunks (model: {model})...")
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_to_chunk = {executor.submit(analyze_chunk, chunk): chunk for chunk in chunks}
@@ -1240,9 +1536,10 @@ def write_feed_json(items, queries):
 
     # 加载配置
     config = get_config()
-    api_key = config.get("OPENAI_API_KEY")
-    base_url = config.get("OPENAI_BASE_URL")
-    proxy = config.get("OPENAI_PROXY")
+    ai = ai_settings(config, log=True)
+    api_key = ai["api_key"]
+    base_url = ai["base_url"]
+    proxy = ai["proxy"]
 
     # 加载已有的翻译缓存
     translation_cache = load_translations()
@@ -1282,12 +1579,12 @@ def write_feed_json(items, queries):
                 titles_to_analyze.append(raw_title)
 
     if not api_key:
-        print("AI analysis skipped: no OPENAI_API_KEY configured (set it in config.json or the environment).")
+        print(f"AI analysis skipped: {ai_skip_message(ai)}.")
 
     # 执行分析
     if titles_to_analyze:
-        print(f"Analyzing {len(titles_to_analyze)} papers (Translation + Classification)...")
-        new_results = batch_analyze_papers(titles_to_analyze, api_key, base_url, proxy, model=config_model(config))
+        print(f"Analyzing {len(titles_to_analyze)} papers (Translation + Classification) with {ai_backend_label(ai)}...")
+        new_results = batch_analyze_papers(titles_to_analyze, api_key, base_url, proxy, model=ai["model"])
         if new_results:
             translation_cache.update(new_results)
             save_translations(translation_cache)
@@ -1414,18 +1711,18 @@ def analyze_database_items(database, items, config=None, report=None):
     if report is not None:
         report.setdefault("failed", 0)
         report.setdefault("errors", [])
-    config = config or get_config()
-    api_key = config.get("OPENAI_API_KEY")
+    config = get_config() if config is None else config
     stale = stale_analysis_items(items)
     if not stale:
         return 0
-    if not api_key:
-        print(f"AI analysis skipped for {len(stale)} papers: no OPENAI_API_KEY configured "
-              "(set it in config.json or the environment).")
+    ai = ai_settings(config, log=True)
+    if not ai["ready"]:
+        print(f"AI analysis skipped for {len(stale)} papers: {ai_skip_message(ai)}.")
         return 0
     titles = list(dict.fromkeys(item["title"] for item in stale))
-    results = batch_analyze_papers(titles, api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
-                                   model=config_model(config), report=report) or {}
+    print(f"Analyzing {len(titles)} title(s) with {ai_backend_label(ai)}...")
+    results = batch_analyze_papers(titles, ai["api_key"], ai["base_url"], ai["proxy"],
+                                   model=ai["model"], report=report) or {}
     durable = {item["paper_id"]: results[item["title"]] for item in stale if item["title"] in results}
     return save_db_translations(database, durable)
 
@@ -1531,9 +1828,11 @@ def run_reanalysis_flow():
     """Reanalyse the durable store and regenerate compatibility exports from it."""
     print("Starting AI Re-analysis...")
     config = get_config()
-    if not config.get("OPENAI_API_KEY"):
-        print("AI re-analysis skipped: no OPENAI_API_KEY configured.")
-        return {"status": "error", "message": "No API Key configured.", "failed": 0, "errors": []}
+    ai = ai_settings(config, log=True)
+    if not ai["ready"]:
+        print(f"AI re-analysis skipped: {ai_skip_message(ai)}.")
+        return {"status": "error", "message": f"No AI backend available: {ai['reason']}",
+                "failed": 0, "errors": []}
     database = _database_path()
     queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
     # Reanalysis enriches every durable paper; current fetch keywords do not
@@ -1662,21 +1961,23 @@ def summarize_specific_papers(target_ids):
     """
     print(f"Request to summarize {len(target_ids)} papers...")
     config = get_config()
-    api_key = config.get("OPENAI_API_KEY")
+    ai = ai_settings(config, log=True)
+    api_key = ai["api_key"]
     database = _database_path()
     pending = pending_summary_items(database, target_ids)
     fetched_payloads, fetch_stats = _fetch_raw_abstracts(database, pending, config)
     fetched_count = save_db_abstracts(database, fetched_payloads) if fetched_payloads else 0
     queries = load_config(KEYWORDS_FILE, 'RSS_KEYWORDS')
-    if not api_key:
-        print("AI summary skipped: no OPENAI_API_KEY configured.")
+    if not ai["ready"]:
+        print(f"AI summary skipped: {ai_skip_message(ai)}.")
         if fetched_count:
             generate_rss_xml(database_items(database), queries)
-            return {"status": "ok", "message": f"Fetched {fetched_count} abstracts; AI summary skipped: No API Key configured.",
+            return {"status": "ok", "message": f"Fetched {fetched_count} abstracts; AI summary skipped: No AI backend available.",
                     "updated": 0, "fetched": fetched_count, "ai_skipped": True, "failed": 0, "errors": []}
-        return {"status": "error", "message": "No API Key configured.", "fetched": 0, "failed": 0, "errors": []}
-    model = config_model(config)
-    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "OpenAI endpoint")
+        return {"status": "error", "message": f"No AI backend available: {ai['reason']}",
+                "fetched": 0, "failed": 0, "errors": []}
+    model = ai["model"]
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "Codex CLI" if ai["backend"] == "codex" else "OpenAI endpoint")
     report = {"failed": 0, "errors": []}
     updates = {}
     for item in pending:
@@ -1686,11 +1987,11 @@ def summarize_specific_papers(target_ids):
         raw_source = existing.get("source") if existing_raw_abstract(item) else (fetched or {}).get("source")
         call_errors = []
         if raw:
-            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
+            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, ai["base_url"], ai["proxy"],
                                                   model=model, errors=call_errors, breaker=breaker)
             source = "gpt_summarized"
         else:
-            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"),
+            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, ai["base_url"], ai["proxy"],
                                                  model=model, errors=call_errors, breaker=breaker)
             source = "gpt_generated"
         if summary:

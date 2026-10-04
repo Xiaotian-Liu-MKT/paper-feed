@@ -44,10 +44,13 @@ JOURNALS_META_FILE = os.path.join(BASE_DIR, "journals_meta.json")
 RSS_LIST_FILE = os.path.join(BASE_DIR, "RSS list.md")
 FILE_LOCK = threading.RLock()
 MAX_LISTED_JOBS = 20
-CONFIG_SAVE_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
+CONFIG_SAVE_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL",
+                    "AI_BACKEND", "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH")
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 MAX_ABSTRACT_CHARS = 50_000
 TEST_CONNECTION_TIMEOUT = 20
+# One `codex exec` start-up (login check, ~20k-token system prompt) takes seconds.
+CODEX_TEST_CONNECTION_TIMEOUT = 120
 # Abstract sources that are real (non-AI) text and may be exported as RIS AB.
 RIS_ABSTRACT_SOURCES = {"user_provided", "crossref", "semantic_scholar", "openalex"}
 
@@ -1056,27 +1059,77 @@ def _redact(text, secret):
     return text[:400]
 
 
-def check_openai_connection():
-    """Send one minimal chat completion with the effective config (no retries)."""
+def validate_config_updates(updates):
+    """Normalize/validate the non-secret AI backend settings; raises ValueError."""
+    import get_RSS
+    if "AI_BACKEND" in updates:
+        backend = updates["AI_BACKEND"].lower()
+        if backend and backend not in get_RSS.AI_BACKENDS:
+            raise ValueError(f"AI_BACKEND must be one of {', '.join(get_RSS.AI_BACKENDS)}")
+        updates["AI_BACKEND"] = backend
+    for key in ("CODEX_MODEL", "CODEX_REASONING_EFFORT"):
+        value = updates.get(key)
+        if value and not get_RSS.is_safe_codex_token(value):
+            raise ValueError(f"{key} may only contain letters, digits and . _ : / -")
+    if any(ch in updates.get("CODEX_PATH", "") for ch in '"\r\n'):
+        raise ValueError("CODEX_PATH must be a plain file path")
+    return updates
+
+
+def ai_status(config=None):
+    """Public (secret-free) summary of the configured and effective AI backend."""
+    import get_RSS
+    config = get_config() if config is None else config
+    settings = get_RSS.ai_settings(config)
+    return {
+        "AI_BACKEND": settings["configured_backend"],
+        "effective_backend": settings["backend"],
+        "CODEX_MODEL": config.get("CODEX_MODEL") or get_RSS.DEFAULT_CODEX_MODEL,
+        "CODEX_REASONING_EFFORT": config.get("CODEX_REASONING_EFFORT") or get_RSS.DEFAULT_CODEX_REASONING_EFFORT,
+        "CODEX_PATH": config.get("CODEX_PATH") or "",
+        "codex_available": bool(settings["codex_available"]),
+        "ai_ready": bool(settings["ready"]),
+        "ai_model": settings["model"],
+        "ai_reason": settings["reason"],
+    }
+
+
+def check_ai_connection():
+    """Send one minimal request through the effective AI backend (no retries).
+
+    Returns ``{ok, backend, model, latency_ms, error?}``.
+    """
     import time
     import get_RSS
     config = get_config()
-    model = config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
-    api_key = config.get("OPENAI_API_KEY")
-    if not api_key:
-        return {"ok": False, "model": model, "latency_ms": None,
-                "error": "未配置 API Key，请先在设置中填写。 / No API key configured."}
+    settings = get_RSS.ai_settings(config)
+    backend = settings["backend"]
+    model = settings["model"] or config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+    if not settings["ready"]:
+        return {"ok": False, "backend": None, "model": model, "latency_ms": None,
+                "error": "未配置可用的 AI 后端（未找到 Codex CLI，也未配置 API Key）。 / "
+                         f"No AI backend available: {settings['reason']}"}
+    secret = config.get("OPENAI_API_KEY")
     started = time.perf_counter()
     try:
-        client = get_RSS.make_openai_client(api_key, config.get("OPENAI_BASE_URL"), config.get("OPENAI_PROXY"))
-        client = client.with_options(max_retries=0, timeout=TEST_CONNECTION_TIMEOUT)
-        client.chat.completions.create(model=model, max_tokens=1,
-                                       messages=[{"role": "user", "content": "ping"}])
+        client = get_RSS.make_openai_client(settings["api_key"], settings["base_url"], settings["proxy"])
+        if backend == "codex":
+            client = client.with_options(max_retries=0, timeout=CODEX_TEST_CONNECTION_TIMEOUT)
+            client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Reply with: ok"}])
+        else:
+            client = client.with_options(max_retries=0, timeout=TEST_CONNECTION_TIMEOUT)
+            client.chat.completions.create(model=model, max_tokens=1,
+                                           messages=[{"role": "user", "content": "ping"}])
     except Exception as error:
         latency = int((time.perf_counter() - started) * 1000)
-        return {"ok": False, "model": model, "latency_ms": latency,
-                "error": f"连接失败 / Connection failed: {type(error).__name__}: {_redact(error, api_key)}"}
-    return {"ok": True, "model": model, "latency_ms": int((time.perf_counter() - started) * 1000)}
+        return {"ok": False, "backend": backend, "model": model, "latency_ms": latency,
+                "error": f"连接失败 / Connection failed: {type(error).__name__}: {_redact(error, secret)}"}
+    return {"ok": True, "backend": backend, "model": model,
+            "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+
+# Backward-compatible name.
+check_openai_connection = check_ai_connection
 
 
 
@@ -1283,6 +1336,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 "OPENAI_MODEL": config.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
                 "sources": config_sources(),
             }
+            safe_config.update(ai_status(config))
             self.send_json(200, safe_config)
             return
 
@@ -1566,6 +1620,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 # read APIs deliberately never return secrets to the browser.
                 if not updates.get("OPENAI_API_KEY"):
                     updates.pop("OPENAI_API_KEY", None)
+                validate_config_updates(updates)
                 current_config.update(updates)
                 if new_config.get("clear_api_key") is True:
                     current_config.pop("OPENAI_API_KEY", None)
@@ -1667,7 +1722,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         if path == '/api/test_connection':
-            self.send_json(200, check_openai_connection())
+            self.send_json(200, check_ai_connection())
             return
 
         if path == '/api/reanalyze':

@@ -3,6 +3,7 @@ import time
 import unittest
 
 from server import JobRunner
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 
 
 class JobRunnerTests(unittest.TestCase):

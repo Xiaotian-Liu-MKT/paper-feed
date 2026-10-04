@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.3" />
+    <link rel="stylesheet" href="styles.css?v=2.4" />
   </head>
   <body>
     <div id="offlineBanner" class="offline-banner" role="status" hidden>
@@ -190,10 +190,34 @@
 
     <dialog id="settingsModal" class="modal">
       <form id="settingsForm" method="dialog">
-        <h3>⚙️ 设置 API</h3>
-        <p class="modal__desc">配置 OpenAI / DeepSeek 等兼容接口以启用翻译、分类和摘要生成。保存后立即用于下次 AI 任务。</p>
-        <p id="apiKeyStatus" class="api-key-status">API Key 状态：读取中…</p>
+        <h3>⚙️ AI 设置</h3>
+        <p class="modal__desc">选择用于翻译、分类和摘要生成的 AI 后端：默认通过本机 Codex CLI 使用 ChatGPT 订阅额度，也可改用 OpenAI / DeepSeek 等兼容接口。保存后立即用于下次 AI 任务。</p>
+        <p id="apiKeyStatus" class="api-key-status">AI 状态：读取中…</p>
 
+        <fieldset id="aiBackendChoice" class="ai-backend-choice" hidden>
+          <legend>AI 后端</legend>
+          <label class="ai-backend-choice__option">
+            <input type="radio" name="AI_BACKEND" value="codex" aria-describedby="sourceAI_BACKEND">
+            <span>Codex CLI（推荐，使用 ChatGPT 订阅额度，无需 API Key）</span>
+          </label>
+          <label class="ai-backend-choice__option">
+            <input type="radio" name="AI_BACKEND" value="openai" aria-describedby="sourceAI_BACKEND">
+            <span>OpenAI 兼容 API（需要 API Key）</span>
+          </label>
+          <small id="sourceAI_BACKEND" class="field-source" data-source-for="AI_BACKEND" hidden></small>
+        </fieldset>
+
+        <div id="codexSettings" class="settings-section" hidden>
+          <label class="control">
+            <span>Codex 模型 (CODEX_MODEL)</span>
+            <input name="CODEX_MODEL" type="text" placeholder="gpt-6-luna" autocomplete="off" aria-describedby="sourceCODEX_MODEL">
+            <small id="sourceCODEX_MODEL" class="field-source" data-source-for="CODEX_MODEL" hidden></small>
+          </label>
+          <p class="modal__hint">需先安装并登录 Codex CLI：<code>npm i -g @openai/codex</code>，然后运行 <code>codex login</code>。</p>
+        </div>
+
+        <div id="openaiSettings" class="settings-section">
+        <h4 id="openaiSettingsTitle" class="settings-section__title" hidden>OpenAI API 设置</h4>
         <label class="control">
           <span>API Key</span>
           <input name="OPENAI_API_KEY" type="password" placeholder="sk-..." autocomplete="off" aria-describedby="sourceOPENAI_API_KEY">
@@ -217,13 +241,14 @@
           <input name="OPENAI_PROXY" type="text" placeholder="http://127.0.0.1:7890" aria-describedby="sourceOPENAI_PROXY">
           <small id="sourceOPENAI_PROXY" class="field-source" data-source-for="OPENAI_PROXY" hidden></small>
         </label>
+        </div>
 
         <div class="settings-tools">
           <button id="btnTestConnection" class="btn btn--secondary btn--small" type="button" title="用已保存的配置发送一次极小的请求（消耗极少额度）">🔌 测试连接</button>
           <button id="btnClearApiKey" class="btn btn--danger btn--small" type="button">🗑️ 清除密钥</button>
           <span id="testConnectionResult" class="settings-tools__result" role="status" aria-live="polite"></span>
         </div>
-        <p class="modal__hint">“测试连接”使用<strong>已保存</strong>的配置向模型发送一次极小的请求；如有未保存的修改，请先保存。</p>
+        <p class="modal__hint">“测试连接”使用<strong>已保存</strong>的配置（含所选 AI 后端）向模型发送一次极小的请求；如有未保存的修改，请先保存。</p>
 
         <p id="settingsError" class="form-error" role="alert" hidden></p>
         <div class="modal__actions">
@@ -396,6 +421,6 @@
     </dialog>
 
     <script src="nav.js" defer></script>
-    <script src="app.js?v=2.4"></script>
+    <script src="app.js?v=2.5"></script>
   </body>
 </html>

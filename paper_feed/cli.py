@@ -27,8 +27,12 @@ MIN_PYTHON = (3, 10)          # publish_guard uses `X | None` annotations
 RECOMMENDED_PYTHON = (3, 11)  # README / GitHub Actions
 # Mirrors get_RSS.CONFIG_KEYS / CONFIG_DEFAULTS (kept here so `doctor` works even
 # when get_RSS cannot be imported because a dependency is missing).
-CONFIG_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL")
-CONFIG_DEFAULTS = {"OPENAI_MODEL": "gpt-4o-mini"}
+CONFIG_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL",
+               "AI_BACKEND", "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH")
+CONFIG_DEFAULTS = {"OPENAI_MODEL": "gpt-4o-mini", "AI_BACKEND": "codex",
+                   "CODEX_MODEL": "gpt-6-luna", "CODEX_REASONING_EFFORT": "low"}
+AI_BACKENDS = ("codex", "openai")
+CODEX_VERSION_TIMEOUT = 15
 REQUIRED_MODULES = ("feedparser", "rfeed", "requests")
 AI_MODULES = ("openai", "httpx")
 REQUIRED_WEB_ASSETS = ("index.html", "app.js")
@@ -174,11 +178,26 @@ def refresh_exit_code(outcome):
     return 1
 
 
-def _ai_key_configured(rss):
+def _ai_settings(rss, config=None):
+    """Effective AI backend (``get_RSS.ai_settings``); None when it cannot be resolved."""
     try:
-        return bool(rss.get_config().get("OPENAI_API_KEY"))
+        return rss.ai_settings(rss.get_config() if config is None else config)
     except Exception:
-        return False
+        return None
+
+
+def _ai_cost_phrase(settings):
+    """How an AI call is paid for, for confirmation prompts."""
+    if (settings or {}).get("backend") == "codex":
+        return ("This runs Codex CLI and uses your ChatGPT subscription quota. "
+                "将调用 Codex CLI，消耗 ChatGPT 订阅额度")
+    return "This calls the OpenAI API and costs money. 将调用 OpenAI API 并产生费用"
+
+
+def _ai_unavailable_line(settings):
+    reason = (settings or {}).get("reason") or "not configured"
+    return (f"No AI backend available: {reason}.\n"
+            "没有可用的 AI 后端：未找到 Codex CLI，且未配置 OPENAI_API_KEY（或 AI_BACKEND=openai 但未配置密钥）。")
 
 
 # --- command handlers ------------------------------------------------------------
@@ -209,7 +228,12 @@ def _start(args, refresh):
     if refresh:
         rss = _load_rss()
         print("Refresh accesses RSS networks and rewrites generated files. 刷新会联网抓取 RSS 并改写导出文件。")
-        if _ai_key_configured(rss):
+        ai = _ai_settings(rss) or {}
+        if ai.get("backend") == "codex":
+            print(f"NOTE: new papers will be translated/classified with Codex CLI ({ai.get('model')}), which uses "
+                  "your ChatGPT subscription quota (no API charges). 新论文的标题分析将通过 Codex CLI 进行，"
+                  "消耗 ChatGPT 订阅额度（不产生 API 费用）。 Use `python -m paper_feed start` to skip the refresh.")
+        elif ai.get("backend") == "openai":
             print("NOTE: OPENAI_API_KEY is configured - new papers will be translated/classified with OpenAI, "
                   "which costs money. 已配置 OpenAI 密钥：新论文的标题分析会产生 API 费用。"
                   " Use `python -m paper_feed start` to skip the refresh.")
@@ -257,14 +281,14 @@ def cmd_reanalyze(args):
         print("Nothing to do. 无需处理。")
         return EXIT_OK
     config = rss.get_config()
-    if not config.get("OPENAI_API_KEY"):
-        print("OPENAI_API_KEY is not configured; AI analysis is unavailable. 未配置 OPENAI_API_KEY。")
+    ai = _ai_settings(rss, config) or {}
+    if not ai.get("ready"):
+        print(_ai_unavailable_line(ai) + " AI analysis is unavailable. 无法进行 AI 分析。")
         return EXIT_OK if args.dry_run else EXIT_FAILURE
     if args.dry_run:
-        print("--dry-run: OpenAI was not called. 仅统计，未调用 OpenAI。")
+        print("--dry-run: the AI backend was not called. 仅统计，未调用 AI。")
         return EXIT_OK
-    question = (f"Analyse {titles} title(s) with {rss.config_model(config)}? This calls OpenAI and costs money. "
-                "将调用 OpenAI 并产生费用，继续？")
+    question = f"Analyse {titles} title(s) with {rss.ai_backend_label(ai)}? {_ai_cost_phrase(ai)}，继续？"
     if not confirm(question, args.yes):
         print("Cancelled. 已取消。")
         return EXIT_FAILURE
@@ -288,10 +312,11 @@ def cmd_summarize_favorites(args):
         print("Nothing to do. 无需处理。")
         return EXIT_OK
     config = rss.get_config()
-    if not config.get("OPENAI_API_KEY"):
-        print("OPENAI_API_KEY is not configured: AI summaries are skipped. Free original abstracts can still be\n"
+    ai = _ai_settings(rss, config) or {}
+    if not ai.get("ready"):
+        print(_ai_unavailable_line(ai) + "\nAI summaries are skipped. Free original abstracts can still be\n"
               "looked up by DOI (Crossref -> OpenAlex -> Semantic Scholar; no key, no tokens).\n"
-              "未配置 OPENAI_API_KEY：跳过 AI 总结；仍可按 DOI 免费查找原始摘要（不需要密钥、不消耗 token）。")
+              "跳过 AI 总结；仍可按 DOI 免费查找原始摘要（不需要密钥、不消耗 token）。")
         if args.dry_run:
             print("--dry-run: nothing was fetched. 仅统计，未联网。")
             return EXIT_OK
@@ -304,10 +329,10 @@ def cmd_summarize_favorites(args):
         _print_fetch_result(result)
         return EXIT_OK if result.get("status") == "ok" else EXIT_FAILURE
     if args.dry_run:
-        print("--dry-run: OpenAI was not called. 仅统计，未调用 OpenAI。")
+        print("--dry-run: the AI backend was not called. 仅统计，未调用 AI。")
         return EXIT_OK
-    question = (f"Summarize {len(pending)} favorite(s) with {rss.config_model(config)}? "
-                "This calls OpenAI and costs money. 将调用 OpenAI 并产生费用，继续？")
+    question = (f"Summarize {len(pending)} favorite(s) with {rss.ai_backend_label(ai)}? "
+                f"{_ai_cost_phrase(ai)}，继续？")
     if not confirm(question, args.yes):
         print("Cancelled. 已取消。")
         return EXIT_FAILURE
@@ -316,7 +341,7 @@ def cmd_summarize_favorites(args):
     if result.get("fetched"):
         print(f"Free abstracts fetched by DOI: {result['fetched']}. 已免费获取 {result['fetched']} 篇原始摘要。")
     if result.get("ai_skipped"):
-        print("AI summary skipped (no API key). 已跳过 AI 总结（未配置密钥）。")
+        print("AI summary skipped (no AI backend). 已跳过 AI 总结（没有可用的 AI 后端）。")
     return EXIT_OK if result.get("status") == "ok" and not result.get("failed") else EXIT_FAILURE
 
 
@@ -528,7 +553,7 @@ def _usable(value):
 
 def _display_value(key, value):
     """Never print secrets: keys/proxies are only reported as set."""
-    if key == "OPENAI_MODEL":
+    if key in ("OPENAI_MODEL", "AI_BACKEND", "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH"):
         return str(value)
     if key == "OPENAI_BASE_URL":
         from urllib.parse import urlparse
@@ -565,6 +590,82 @@ def resolve_config_sources(root):
                           (isinstance(env_value, str) and env_value.strip() != "")
             resolved[key] = ("unset", "placeholder ignored / 占位值已忽略" if placeholder else "not set / 未设置")
     return resolved, problems
+
+
+def find_codex_executable(explicit=None):
+    """Mirror of get_RSS.find_codex_executable: CODEX_PATH, else `codex` on PATH."""
+    import shutil
+    if isinstance(explicit, str) and explicit.strip():
+        path = os.path.expandvars(os.path.expanduser(explicit.strip().strip('"')))
+        if os.name == "nt" and not os.path.splitext(path)[1]:
+            for suffix in (".cmd", ".exe", ".bat"):
+                if os.path.isfile(path + suffix):
+                    return path + suffix
+        if os.path.isfile(path):
+            return path
+        return shutil.which(path)
+    return shutil.which("codex")
+
+
+def codex_version(executable, timeout=CODEX_VERSION_TIMEOUT):
+    """(ok, text) from `codex --version`; never raises."""
+    import subprocess
+    kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
+    try:
+        completed = subprocess.run([executable, "--version"], capture_output=True, timeout=timeout,
+                                   stdin=subprocess.DEVNULL, **kwargs)
+    except subprocess.TimeoutExpired:
+        return False, f"`codex --version` timed out after {timeout}s"
+    except OSError as error:
+        return False, f"{type(error).__name__}: {error}"
+    output = (completed.stdout or completed.stderr or b"").decode("utf-8", errors="replace").strip()
+    first_line = output.splitlines()[0] if output else ""
+    if completed.returncode != 0:
+        return False, f"`codex --version` exited with {completed.returncode} {first_line}".strip()
+    return True, first_line or "unknown version"
+
+
+def _raw_config_value(root, key):
+    """Effective raw value of a non-secret setting (env > config.json > default)."""
+    env_value = os.environ.get(key)
+    if _usable(env_value):
+        return env_value.strip()
+    try:
+        local = json.loads((Path(root) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        local = {}
+    value = local.get(key) if isinstance(local, dict) else None
+    if _usable(value):
+        return value.strip() if isinstance(value, str) else value
+    return CONFIG_DEFAULTS.get(key)
+
+
+def _doctor_ai_backend(root, config, add):
+    """Report the effective AI backend; a missing Codex CLI is a WARN, never a FAIL."""
+    configured = str(_raw_config_value(root, "AI_BACKEND") or "").lower()
+    if configured not in AI_BACKENDS:
+        add(WARN, "AI_BACKEND", f"unknown value {configured!r}; using codex / 未知取值，按 codex 处理")
+        configured = "codex"
+    has_key = config["OPENAI_API_KEY"][0] != "unset"
+    codex_ok = False
+    if configured == "codex":
+        executable = find_codex_executable(_raw_config_value(root, "CODEX_PATH"))
+        if executable:
+            codex_ok, version = codex_version(executable)
+            add(OK if codex_ok else WARN, "Codex CLI", f"{version} ({executable})")
+        else:
+            add(WARN, "Codex CLI", "not found - install with `npm i -g @openai/codex`, then `codex login` "
+                                   "(or set CODEX_PATH) / 未找到 Codex CLI")
+    model = _raw_config_value(root, "CODEX_MODEL")
+    if configured == "codex" and codex_ok:
+        add(OK, "AI backend", f"codex (Codex CLI, model {model}; ChatGPT subscription quota) / 使用 Codex CLI")
+    elif has_key:
+        note = " (fallback: Codex CLI unavailable / Codex 不可用，回退)" if configured == "codex" else ""
+        add(OK, "AI backend", f"openai (OpenAI-compatible API){note}")
+    else:
+        add(WARN, "AI backend", "none - AI translation/classification/summaries are skipped "
+                                "/ 无可用 AI 后端，跳过 AI 分析")
+    return configured == "codex" and codex_ok
 
 
 def run_doctor(root=PROJECT_DIR, port=None, database=None):
@@ -615,10 +716,14 @@ def run_doctor(root=PROJECT_DIR, port=None, database=None):
 
     for problem in problems:
         add(WARN, "config.json", problem)
+    codex_ready = _doctor_ai_backend(root, config, add)
     for key in CONFIG_KEYS:
         source, display = config[key]
         if key == "OPENAI_API_KEY" and source == "unset":
-            add(WARN, key, f"{display} - AI translation/classification/summaries are skipped")
+            if codex_ready:
+                add(INFO, key, f"{display} - not needed while the Codex CLI backend is used")
+            else:
+                add(WARN, key, f"{display} - AI translation/classification/summaries are skipped")
         else:
             add(OK if source != "unset" else INFO, key, f"{display} (source: {source})")
 
@@ -736,7 +841,7 @@ def _add_ai_options(parser):
     parser.add_argument("--yes", "-y", action="store_true",
                         help="do not ask for confirmation (required when not on a terminal) / 跳过确认")
     parser.add_argument("--dry-run", action="store_true",
-                        help="only print how many papers would be processed; never calls OpenAI / 仅统计数量")
+                        help="only print how many papers would be processed; never calls the AI backend / 仅统计数量")
 
 
 def _add_import_options(parser):
@@ -765,15 +870,15 @@ def build_parser():
         return sub
 
     sub = add("start", cmd_start, "open existing local data without refreshing / 打开现有数据（不联网）",
-              "Start the local server on existing data and open the browser. No RSS fetch, no OpenAI.\n"
+              "Start the local server on existing data and open the browser. No RSS fetch, no AI calls.\n"
               "If Paper Feed is already running on the port, just open it.\n"
-              "使用现有本地数据启动服务并打开浏览器；不联网、不调用 OpenAI。若已在运行则直接打开。")
+              "使用现有本地数据启动服务并打开浏览器；不联网、不调用 AI。若已在运行则直接打开。")
     _add_server_options(sub, open_flag=False)
 
     sub = add("run", cmd_run, "refresh RSS, then start / 先刷新 RSS 再打开",
-              "Refresh RSS (network; OpenAI if a key is configured, which costs money), then start the\n"
+              "Refresh RSS (network; AI title analysis via Codex CLI = ChatGPT quota, or OpenAI API = money), then start the\n"
               "server and open the browser. A failed refresh still opens the existing data.\n"
-              "先刷新 RSS（联网；若配置了 OpenAI 密钥会产生费用），再启动并打开浏览器；刷新失败时仍打开现有数据。")
+              "先刷新 RSS（联网；AI 标题分析默认用 Codex CLI 消耗 ChatGPT 额度，OpenAI API 则产生费用），再启动并打开浏览器；刷新失败时仍打开现有数据。")
     _add_server_options(sub, open_flag=False)
 
     sub = add("serve", cmd_serve, "run the local web server / 仅启动本地 Web 服务",
@@ -784,7 +889,8 @@ def build_parser():
 
     add("refresh", cmd_refresh, "fetch RSS, store in SQLite, regenerate exports / 抓取 RSS",
         "Fetch the feeds in journals.dat, keep entries matching keywords.dat, store them in SQLite,\n"
-        "run AI title analysis when OPENAI_API_KEY is set, and regenerate filtered_feed.xml / web/feed.json.\n"
+        "run AI title analysis when an AI backend is available (Codex CLI by default, or OPENAI_API_KEY),\n"
+        "and regenerate filtered_feed.xml / web/feed.json.\n"
         "抓取 journals.dat 中的期刊，按 keywords.dat 过滤后入库，并重新生成导出文件。",
         epilog="exit codes / 退出码:\n"
                "  0  published (possibly with some failed sources) / 已发布\n"
@@ -793,15 +899,15 @@ def build_parser():
 
     sub = add("reanalyze", cmd_reanalyze, "AI title analysis for unclassified/stale papers / 重新分析标题",
               "Translate and classify titles that have no analysis or an outdated classification version.\n"
-              "Prints the count and asks before calling OpenAI.\n"
-              "为未分类或分类版本过旧的论文调用 OpenAI 翻译/分类；执行前显示数量并确认。",
+              "Prints the count and asks before calling the AI backend (Codex CLI or OpenAI API).\n"
+              "为未分类或分类版本过旧的论文调用 AI（Codex CLI 或 OpenAI API）翻译/分类；执行前显示数量并确认。",
               epilog="exit codes: 0 done / nothing to do / dry run; 1 cancelled, no API key, or failures")
     _add_ai_options(sub)
 
     sub = add("summarize-favorites", cmd_summarize_favorites, "AI summaries for favorites / 为收藏生成 AI 总结",
               "Generate AI summaries for favorites that do not have one yet (uses the stored abstract when\n"
               "present or found for free by DOI, otherwise predicts from the title). Prints the count and\n"
-              "asks first. Without OPENAI_API_KEY only the free abstract lookup runs (AI summary skipped).\n"
+              "asks first. Without an AI backend only the free abstract lookup runs (AI summary skipped).\n"
               "为尚无 AI 总结的收藏生成总结；执行前显示数量并确认。未配置密钥时只免费查找原始摘要，跳过 AI 总结。",
               epilog="exit codes: 0 done / nothing to do / dry run; 1 cancelled or failures")
     _add_ai_options(sub)

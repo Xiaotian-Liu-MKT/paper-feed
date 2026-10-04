@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import get_RSS
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 
 
 RSS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>

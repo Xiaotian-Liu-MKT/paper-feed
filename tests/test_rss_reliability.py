@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import get_RSS
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.db import connect
 from paper_feed.ingestion import ensure_database
 

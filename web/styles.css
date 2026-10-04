@@ -2735,6 +2735,50 @@ kbd {
   font-size: 0.8rem;
 }
 
+.modal__hint code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: #f1f5f9;
+  color: #334155;
+}
+
+/* Settings modal: AI backend choice */
+.ai-backend-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.ai-backend-choice legend {
+  padding: 0 4px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.ai-backend-choice__option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.ai-backend-choice__option input { margin-top: 3px; }
+
+.settings-section { margin-bottom: 4px; }
+.settings-section[hidden] { display: none; }
+
+.settings-section__title {
+  margin: 4px 0 8px;
+  font-size: 0.875rem;
+  color: #334155;
+}
+
 /* Journals page: unsaved-changes indicator */
 .dirty-indicator {
   align-self: center;

@@ -14,6 +14,7 @@ import openai
 
 import get_RSS
 import server
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.backup import backup_database
 from paper_feed.ingestion import ingest_fetch_results
 

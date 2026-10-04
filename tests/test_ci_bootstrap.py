@@ -13,6 +13,7 @@ from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 import get_RSS
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.exporter import DEFAULT_CHANNEL_LINK, database_items, export_items
 from paper_feed.importer import LegacyImporter, feed_translation_payload
 

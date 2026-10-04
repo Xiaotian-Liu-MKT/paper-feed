@@ -11,7 +11,9 @@
 
 ## 1. 核心功能：AI 深度分类与分析
 
-本系统通过集成 OpenAI 兼容模型（`OPENAI_MODEL`，默认 `gpt-4o-mini`，也可用 DeepSeek 等兼容端点），为每篇论文提供三个维度的智能分析：
+本系统默认通过本机 **Codex CLI**（`AI_BACKEND=codex`，`codex exec`，ChatGPT 登录，模型 `CODEX_MODEL` 默认 `gpt-6-luna`）进行 AI 分析；也可设 `AI_BACKEND=openai` 使用 OpenAI 兼容模型（`OPENAI_MODEL`，默认 `gpt-4o-mini`，也可用 DeepSeek 等兼容端点）。为每篇论文提供三个维度的智能分析：
+
+> **AI 后端解析**：`get_RSS.ai_settings(config)` → `{backend, api_key, base_url, proxy, model, ready, reason, ...}`。`codex` 且找到可执行文件（`CODEX_PATH` 或 `PATH` 中的 `codex`，经 `find_codex_executable`）→ codex；找不到但有 `OPENAI_API_KEY`（如 GitHub Actions）→ 回退 openai 并打印一行日志；都没有 → `ready=False`，AI 步骤跳过。codex 时 `api_key` 是 `CodexCLISettings` 对象（真值、无密钥），`make_openai_client` 据此返回 `CodexCLIClient`（模拟 `chat.completions.create` / `with_options`，以子进程运行 `codex exec ... -o <临时文件> -`，提示词走 stdin）。所有 AI 门控一律用 `ai_settings(...)["ready"]`，不要再直接判断 `OPENAI_API_KEY`。每次 codex 调用约有 2 万 token 系统提示开销，故标题分析每批 25 个标题、最多 2 个进程；超时/非零退出/缺可执行文件不重试并计入 CircuitBreaker。测试必须离线：引入 `tests/ai_test_guard.py` 的 `setUpModule/tearDownModule`，并 mock `subprocess.run`。
 1. **中文翻译**: 学术风格的标题翻译。
 2. **研究方法分类**: 识别论文采用的主要研究范式（如实验、实证、理论等）。
 3. **核心话题分类**: 基于定制化的商科/消费者行为话题（如 AI、CSR、情绪等）。
@@ -105,11 +107,12 @@
 | 命令 | 实现 |
 | --- | --- |
 | `refresh` | `get_RSS.run_rss_flow` + `cli.refresh_exit_code`（0 已发布 / 1 全部源失败 / 2 配置为空） |
+| （AI 门控） | `cli._ai_settings` → `get_RSS.ai_settings`；`run` 的提示与 `reanalyze`/`summarize-favorites` 的确认语按后端区分（codex：ChatGPT 订阅额度；openai：API 费用）。`cli.CONFIG_KEYS`/`CONFIG_DEFAULTS`/`find_codex_executable` 是 `get_RSS` 的镜像 |
 | `serve [--port] [--host] [--open]` | `server.run_server(port, host, on_ready)` |
 | `start` / `run` | `cli._start`：`probe_port` 探测 `/api/interactions`；已有 Paper Feed 则只打开浏览器，其他程序占用则退出 1；`run` 先 refresh（失败仍打开）并在配置密钥时提示费用 |
 | `reanalyze` / `summarize-favorites` | 计数（`get_RSS.stale_analysis_items` / `get_RSS.pending_summary_items`）→ 确认（`--yes`）→ `run_reanalysis_flow` / `summarize_specific_papers`；`--dry-run` 只计数 |
 | `keywords show` / `keywords preview` | 规则来源与 `get_RSS.load_config` 相同；预览调用 `server.keyword_preview`（SQLite） |
-| `doctor` | `cli.run_doctor`：Python、依赖、httpx `proxy=`、配置来源（不打印密钥）、期刊/关键词、数据库 `integrity_check` 与各状态计数、端口、`web/` 资源；有 FAIL 时退出 1 |
+| `doctor` | `cli.run_doctor`：Python、依赖、httpx `proxy=`、实际 AI 后端（codex 时运行 `codex --version`，找不到 codex 为 WARN 非 FAIL）、配置来源（不打印密钥）、期刊/关键词、数据库 `integrity_check` 与各状态计数、端口、`web/` 资源；有 FAIL 时退出 1 |
 | `backup [--json]` / `restore <文件> [--yes]` | `paper_feed.backup`（`restore` 在服务运行时拒绝执行，先校验 `integrity_check` 并保存 `pre-restore` 副本） |
 | `fetch-abstracts [--view] [--yes]` | `get_RSS.fetch_missing_abstracts`：按 DOI 免费抓取原始摘要，不消耗 token |
 | `import-legacy` / `publish-guard` | `paper_feed.importer` / `paper_feed.publish_guard.run` |
@@ -123,9 +126,9 @@
 *   `GET /api/papers?view=inbox|favorite|archived|hidden|all`: 按视图列出论文。
 *   `GET /api/papers/<paper_id>`: 单篇论文。
 *   `POST /api/papers/<paper_id>/review`: 分流动作 like/unlike/archive/unarchive/hide/unhide。
-*   `GET /api/config`: 获取配置（密钥脱敏，返回 `has_api_key`、`OPENAI_MODEL` 等）。
-*   `POST /api/save_config`: 保存配置（仅 `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`/`OPENAI_PROXY` 白名单；`{"clear_api_key": true}` 清除密钥）。优先级：非空环境变量 > config.json 非空非占位值 > 默认值；`GET /api/config` 的 `sources` 标明每项来源（`env`/`config`/`default`/`unset`）。
-*   `POST /api/test_connection`: 用已保存配置发一次 `max_tokens=1` 请求，返回 `{ok, model, latency_ms, error?}`。
+*   `GET /api/config`: 获取配置（密钥脱敏，返回 `has_api_key`（是否有 OpenAI 密钥）、`OPENAI_MODEL`、`AI_BACKEND`（配置值）、`effective_backend`（`"codex"`/`"openai"`/`null`）、`CODEX_MODEL`、`CODEX_REASONING_EFFORT`、`CODEX_PATH`、`codex_available`、`ai_ready`、`ai_model`、`ai_reason` 等）。
+*   `POST /api/save_config`: 保存配置（白名单：`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`/`OPENAI_PROXY`/`AI_BACKEND`（仅 `codex`/`openai`/空）/`CODEX_MODEL`/`CODEX_REASONING_EFFORT`/`CODEX_PATH`，非法值返回 400；`{"clear_api_key": true}` 清除密钥）。优先级：非空环境变量 > config.json 非空非占位值 > 默认值；`GET /api/config` 的 `sources` 标明每项来源（`env`/`config`/`default`/`unset`）。
+*   `POST /api/test_connection`: 用实际生效的 AI 后端发一次最小请求（openai：`max_tokens=1`；codex：一次 `codex exec`，超时 120 s），返回 `{ok, backend, model, latency_ms, error?}`。
 *   `GET /api/keywords` / `POST /api/keywords`: 读写 `keywords.dat`，返回 `{text, keywords}`。
 *   `POST /api/keywords/preview`: 用与入库相同的匹配器预览规则在已入库论文中的命中情况。
 *   `GET /api/journals` / `POST /api/journals`: 读写订阅列表（非 http(s) 地址返回 400）。

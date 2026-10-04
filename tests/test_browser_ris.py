@@ -6,6 +6,7 @@ import threading
 import unittest
 
 import server
+from ai_test_guard import setUpModule, tearDownModule  # noqa: E402,F401 (no real Codex CLI)
 from paper_feed.db import PaperRepository, connect, now
 from paper_feed.service import PaperFeedService
 

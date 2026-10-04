@@ -295,6 +295,27 @@ async function run() {
   assert.strictEqual(vm.runInContext('createDoiLink({ doi: "10.1000/a b" }).href', context), "https://doi.org/10.1000/a%20b");
   assert.match(source, /📖 OpenAlex/);
 
+  // AI readiness: ai_ready wins when present, otherwise fall back to has_api_key.
+  const aiReady = (config) => vm.runInContext(`configAiReady(${JSON.stringify(config)})`, context);
+  assert.strictEqual(aiReady(null), false);
+  assert.strictEqual(aiReady({ has_api_key: true }), true);
+  assert.strictEqual(aiReady({ has_api_key: false }), false);
+  assert.strictEqual(aiReady({ ai_ready: true, has_api_key: false }), true);
+  assert.strictEqual(aiReady({ ai_ready: false, has_api_key: true }), false);
+  const backend = (config) => vm.runInContext(`configEffectiveBackend(${JSON.stringify(config)})`, context);
+  assert.strictEqual(backend({ has_api_key: true }), "openai");
+  assert.strictEqual(backend({ AI_BACKEND: "codex", effective_backend: "codex" }), "codex");
+  assert.strictEqual(backend({ AI_BACKEND: "codex", effective_backend: "openai", codex_available: false }), "openai");
+  assert.match(vm.runInContext('aiCostNote({ effective_backend: "codex" })', context), /Codex CLI 调用 gpt-6-luna，消耗 ChatGPT 订阅额度/);
+  assert.match(vm.runInContext('aiCostNote({ has_api_key: true })', context), /API 额度/);
+  const status = (config) => JSON.parse(vm.runInContext(`JSON.stringify(describeAiStatus(${JSON.stringify(config)}))`, context));
+  assert.deepStrictEqual(status({ has_api_key: true }), { text: "API Key 状态：✓ 已配置", state: "ok" });
+  assert.strictEqual(status({ AI_BACKEND: "codex", CODEX_MODEL: "gpt-6-luna", codex_available: true, ai_ready: true }).text, "AI 状态：✓ 使用 Codex CLI（gpt-6-luna）");
+  const fallback = status({ AI_BACKEND: "codex", codex_available: false, effective_backend: "openai", ai_ready: true, has_api_key: true });
+  assert.match(fallback.text, /未找到 codex 命令.*npm i -g @openai\/codex.*codex login.*回退到 OpenAI/);
+  assert.strictEqual(fallback.state, "missing");
+  assert.match(status({ AI_BACKEND: "openai", has_api_key: false }).text, /✗ 未配置 API Key/);
+
   // Every POST declares a JSON body (the server rejects others with 415).
   const posts = source.match(/method:\s*"POST"[^}]*/g) || [];
   assert.ok(posts.length > 0);
