@@ -1,3 +1,7 @@
+// 「我的偏好」标签页（insights.html#prefs）。作用域限定在 IIFE 内，由 insights.js 调用 InsightsReport.init()。
+(function () {
+"use strict";
+
 const reportElements = {
   status: document.getElementById("reportStatus"),
   generatedAt: document.getElementById("reportGeneratedAt"),
@@ -23,12 +27,8 @@ const reportElements = {
   preferredBigrams: document.getElementById("reportPreferredBigrams"),
   avoidedBigrams: document.getElementById("reportAvoidedBigrams"),
   sourceJournalCoverage: document.getElementById("reportSourceJournalCoverage"),
-  journalTopFavSummary: document.getElementById("reportJournalTopFavSummary"),
-  journalTopHiddenSummary: document.getElementById("reportJournalTopHiddenSummary"),
   journalPreferredSummary: document.getElementById("reportJournalPreferredSummary"),
   journalAvoidedSummary: document.getElementById("reportJournalAvoidedSummary"),
-  journalTopFavTerms: document.getElementById("reportJournalTopFavTerms"),
-  journalTopHiddenTerms: document.getElementById("reportJournalTopHiddenTerms"),
   journalPreferredTerms: document.getElementById("reportJournalPreferredTerms"),
   journalAvoidedTerms: document.getElementById("reportJournalAvoidedTerms"),
   sourceTopFavSummary: document.getElementById("reportSourceTopFavSummary"),
@@ -261,8 +261,19 @@ function buildFilterLink(type, value, view = "all") {
   const params = new URLSearchParams();
   params.set(type, value);
   params.set("view", view);
-  params.set("from", "report");
+  params.set("from", "insights");
   return `index.html?${params.toString()}`;
+}
+
+// 期刊名链接到「期刊表现」中该期刊的详情（同页切换标签）。
+function createJournalStatsLink(journal) {
+  if (!journal) return "-";
+  const link = document.createElement("a");
+  link.className = "term-link";
+  link.href = `#journals/detail?journal=${encodeURIComponent(journal)}`;
+  link.textContent = journal;
+  link.title = "在「期刊表现」中查看该期刊的发刊频率与收藏/不感兴趣占比";
+  return link;
 }
 
 function createFilterLink(type, value, view = "all") {
@@ -338,16 +349,12 @@ function renderReport(report) {
     if (reportElements.sourceJournalCoverage) {
       reportElements.sourceJournalCoverage.textContent = "";
     }
-    renderSummary(reportElements.journalTopFavSummary, [], "");
-    renderSummary(reportElements.journalTopHiddenSummary, [], "");
     renderSummary(reportElements.journalPreferredSummary, [], "");
     renderSummary(reportElements.journalAvoidedSummary, [], "");
     renderSummary(reportElements.sourceTopFavSummary, [], "");
     renderSummary(reportElements.sourceTopHiddenSummary, [], "");
     renderSummary(reportElements.sourcePreferredSummary, [], "");
     renderSummary(reportElements.sourceAvoidedSummary, [], "");
-    renderTable(reportElements.journalTopFavTerms, [], []);
-    renderTable(reportElements.journalTopHiddenTerms, [], []);
     renderTable(reportElements.journalPreferredTerms, [], []);
     renderTable(reportElements.journalAvoidedTerms, [], []);
     renderTable(reportElements.sourceTopFavTerms, [], []);
@@ -385,7 +392,7 @@ function renderReport(report) {
   const terms = report.title_terms || {};
   const bigrams = report.title_bigrams || {};
 
-  renderSummary(reportElements.topFavSummary, terms.top_favorites, "收藏/归档高频词集中在 ");
+  renderSummary(reportElements.topFavSummary, terms.top_favorites, "收藏高频词集中在 ");
   renderSummary(reportElements.topHiddenSummary, terms.top_hidden, "不感兴趣高频词集中在 ");
   renderSummary(reportElements.preferredSummary, terms.preferred, "更可能收藏的词集中在 ");
   renderSummary(reportElements.avoidedSummary, terms.avoided, "更可能避开的词集中在 ");
@@ -462,33 +469,21 @@ function renderReport(report) {
     reportElements.sourceJournalCoverage.textContent = `期刊缺失 ${journalUnknown} 条，来源缺失 ${sourceUnknown} 条。`;
   }
 
-  renderSummary(reportElements.journalTopFavSummary, journalData.top_favorites, "收藏/归档高频期刊集中在 ");
-  renderSummary(reportElements.journalTopHiddenSummary, journalData.top_hidden, "不感兴趣高频期刊集中在 ");
   renderSummary(reportElements.journalPreferredSummary, journalData.preferred, "更可能收藏的期刊集中在 ");
   renderSummary(reportElements.journalAvoidedSummary, journalData.avoided, "更可能避开的期刊集中在 ");
-  renderSummary(reportElements.sourceTopFavSummary, sourceData.top_favorites, "收藏/归档高频来源集中在 ");
+  renderSummary(reportElements.sourceTopFavSummary, sourceData.top_favorites, "收藏高频来源集中在 ");
   renderSummary(reportElements.sourceTopHiddenSummary, sourceData.top_hidden, "不感兴趣高频来源集中在 ");
   renderSummary(reportElements.sourcePreferredSummary, sourceData.preferred, "更可能收藏的来源集中在 ");
   renderSummary(reportElements.sourceAvoidedSummary, sourceData.avoided, "更可能避开的来源集中在 ");
 
   const labelOf = (item) => item.term || item.label || "";
-  renderTable(reportElements.journalTopFavTerms, journalData.top_favorites, [
-    { label: "期刊", value: (item) => labelOf(item) || "-" },
-    { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "favorites") }
-  ]);
-  renderTable(reportElements.journalTopHiddenTerms, journalData.top_hidden, [
-    { label: "期刊", value: (item) => labelOf(item) || "-" },
-    { label: "次数", value: (item) => item.count ?? "-" },
-    { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "all") }
-  ]);
   renderTable(reportElements.journalPreferredTerms, journalData.preferred, [
-    { label: "期刊", value: (item) => labelOf(item) || "-" },
+    { label: "期刊", render: (item) => createJournalStatsLink(labelOf(item)) },
     liftColumn(),
     { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "favorites") }
   ]);
   renderTable(reportElements.journalAvoidedTerms, journalData.avoided, [
-    { label: "期刊", value: (item) => labelOf(item) || "-" },
+    { label: "期刊", render: (item) => createJournalStatsLink(labelOf(item)) },
     liftColumn(),
     { label: "筛选", render: (item) => createFilterLink("journal", labelOf(item), "all") }
   ]);
@@ -705,7 +700,7 @@ function createConfidenceBar(confidence) {
 function createTermLink(term) {
     const link = document.createElement('a');
     link.className = 'term-link';
-    const params = new URLSearchParams({ q: term, view: "all", from: "report" });
+    const params = new URLSearchParams({ q: term, view: "all", from: "insights" });
     link.href = `index.html?${params.toString()}`;
     link.textContent = term;
     link.title = `点击查看包含"${term}"的论文`;
@@ -791,7 +786,7 @@ function renderTrendChart(trends) {
         const favBar = document.createElement('div');
         favBar.className = 'trend-bar-segment trend-bar-segment--fav';
         favBar.style.height = `${item.fav_rate * 100}%`;
-        favBar.title = `收藏/归档: ${item.favorites}`;
+        favBar.title = `收藏: ${item.favorites}`;
 
         // 隐藏部分
         const hidBar = document.createElement('div');
@@ -826,7 +821,15 @@ function attachHandlers() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+let initialized = false;
+
+// 首次进入标签页时调用：只读取已保存的报告（GET），不会自动重新计算（POST）。
+function init() {
+  if (initialized) return;
+  initialized = true;
   attachHandlers();
   loadReport();
-});
+}
+
+window.InsightsReport = { init };
+})();

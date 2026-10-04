@@ -1671,9 +1671,12 @@ function applyUrlFilters() {
   // which the one-at-a-time swipe deck cannot do.
   if (applied) setInboxViewMode("list");
 
-  if ((fromParam === "report" || fromParam === "stats") && elements.backLink) {
-    elements.backLink.href = fromParam === "report" ? "report.html" : "stats.html";
-    elements.backLink.textContent = fromParam === "report" ? "← 返回报告" : "← 返回统计";
+  // from=insights（旧链接 report / stats 同样接受）显示返回洞察页的链接；
+  // 洞察页会记住上次打开的标签，旧值则直接回到对应标签。
+  const BACK_LINK_TARGETS = { insights: "insights.html", report: "insights.html#prefs", stats: "insights.html#journals" };
+  if (Object.prototype.hasOwnProperty.call(BACK_LINK_TARGETS, fromParam) && elements.backLink) {
+    elements.backLink.href = BACK_LINK_TARGETS[fromParam];
+    elements.backLink.textContent = "← 返回洞察";
     elements.backLink.hidden = false;
   }
 

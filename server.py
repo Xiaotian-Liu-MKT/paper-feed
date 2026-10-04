@@ -11,7 +11,6 @@ import threading
 import queue
 import uuid
 import errno
-import argparse
 from functools import partial
 from urllib.parse import parse_qs, urlparse
 from paper_feed.service import PaperFeedService, PaperNotFound, PaperReferenceError
@@ -1495,21 +1494,39 @@ def _is_address_in_use(error):
             or getattr(error, "winerror", None) in {10048, 10013})
 
 
-def run_server(port=None):
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def browser_url(host, port):
+    """URL a local browser should open for a server bound to *host*."""
+    if host in {"", "0.0.0.0", "::"} or host in LOOPBACK_HOSTS:
+        host = "127.0.0.1"
+    return f"http://{host}:{port}/"
+
+
+def run_server(port=None, host="127.0.0.1", on_ready=None):
+    """Serve until Ctrl+C.  *on_ready(url)* runs once the port is bound."""
     port = resolve_port(port) if port is None else int(port)
+    host = host or "127.0.0.1"
     try:
-        httpd = PaperFeedHTTPServer(('127.0.0.1', port), CustomHandler)
+        httpd = PaperFeedHTTPServer((host, port), CustomHandler)
     except OSError as error:
         if _is_address_in_use(error):
-            print(f"Error: port {port} is already in use on 127.0.0.1.")
-            print(f"  - If Paper Feed is already running, open http://127.0.0.1:{port}/ instead.")
+            print(f"Error: port {port} is already in use on {host}.")
+            print(f"  - If Paper Feed is already running, open http://127.0.0.1:{port}/ instead "
+                  "(or run `python -m paper_feed start`, which detects it).")
             print("  - Otherwise stop the other program, or choose another port with "
-                  "`python server.py --port 8001` or the PAPER_FEED_PORT environment variable.")
+                  "`python -m paper_feed serve --port 8001` or the PAPER_FEED_PORT environment variable.")
             return 1
         raise
     with httpd:
-        print(f"Server started at http://127.0.0.1:{port}")
+        if host not in LOOPBACK_HOSTS:
+            print(f"WARNING: listening on {host}. The API has no authentication and can modify local "
+                  "files; do not expose it to an untrusted network.")
+        print(f"Server started at {browser_url(host, port)}")
         print("Press Ctrl+C to stop.")
+        if on_ready is not None:
+            on_ready(browser_url(host, port))
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -1518,17 +1535,13 @@ def run_server(port=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Serve the Paper Feed web UI and local API on 127.0.0.1 (no authentication; "
-                    "do not expose it to a network).")
-    parser.add_argument("--port", type=int, default=None,
-                        help=f"TCP port to listen on (default: PAPER_FEED_PORT env var, else {DEFAULT_PORT}).")
-    args = parser.parse_args(argv)
-    if args.port is not None and not 0 < args.port < 65536:
-        parser.error("--port must be between 1 and 65535")
-    return run_server(resolve_port(args.port))
+    """Compatibility entry point: `python server.py` == `python -m paper_feed serve`."""
+    from paper_feed.cli import main as cli_main
+    return cli_main(["serve", *(sys.argv[1:] if argv is None else argv)])
 
 
 if __name__ == "__main__":
-    configure_stdio()
+    # Share this module object with the CLI instead of importing the file twice
+    # (a second copy would start a second job worker).
+    sys.modules.setdefault("server", sys.modules[__name__])
     sys.exit(main())

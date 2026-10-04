@@ -3,8 +3,7 @@
 (function () {
   const NAV_ITEMS = [
     { href: "index.html", label: "📰 Feed" },
-    { href: "report.html", label: "📈 偏好报告" },
-    { href: "stats.html", label: "📊 期刊统计" },
+    { href: "insights.html", label: "🔎 洞察", aliases: ["report.html", "stats.html"] },
     { href: "journals.html", label: "📚 期刊管理" }
   ];
 
@@ -47,7 +46,7 @@
       link.className = "btn btn--secondary site-nav__link";
       link.href = item.href;
       link.textContent = item.label;
-      if (item.href === page) {
+      if (item.href === page || (item.aliases || []).includes(page)) {
         link.setAttribute("aria-current", "page");
       }
       container.appendChild(link);

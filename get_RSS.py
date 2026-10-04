@@ -1161,6 +1161,12 @@ def compute_journal_hash(journals):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def stale_analysis_items(items):
+    """Durable items whose title analysis is missing or from an older classifier."""
+    return [item for item in items if not isinstance(item.get("translation"), dict)
+            or item["translation"].get("classification_version") != CLASSIFICATION_VERSION]
+
+
 def analyze_database_items(database, items, config=None, report=None):
     """Run GPT only for missing/stale durable translations and store by paper_id.
 
@@ -1171,8 +1177,7 @@ def analyze_database_items(database, items, config=None, report=None):
         report.setdefault("errors", [])
     config = config or get_config()
     api_key = config.get("OPENAI_API_KEY")
-    stale = [item for item in items if not isinstance(item.get("translation"), dict)
-             or item["translation"].get("classification_version") != CLASSIFICATION_VERSION]
+    stale = stale_analysis_items(items)
     if not stale:
         return 0
     if not api_key:
@@ -1305,6 +1310,26 @@ def run_reanalysis_flow():
     return {"status": "ok", "message": message, "updated": saved,
             "failed": report["failed"], "errors": report["errors"]}
 
+def pending_summary_items(database, target_ids):
+    """Resolve *target_ids* (paper_id / RSS id / legacy id) to items still lacking an AI summary."""
+    item_map = {}
+    for item in database_items(database):
+        for key in (item["paper_id"], item.get("id"), *item.get("legacy_ids", [])):
+            if key:
+                item_map[str(key)] = item
+    pending = []
+    visited = set()
+    for target in dict.fromkeys(str(target) for target in target_ids):
+        item = item_map.get(target)
+        if not item or item["paper_id"] in visited:
+            continue
+        visited.add(item["paper_id"])
+        if (item.get("abstract") or {}).get("source") in {"gpt_summarized", "gpt_generated"}:
+            continue
+        pending.append(item)
+    return pending
+
+
 def summarize_specific_papers(target_ids):
     """Summarize requested durable records, then regenerate compatibility exports."""
     print(f"Request to summarize {len(target_ids)} papers...")
@@ -1316,21 +1341,9 @@ def summarize_specific_papers(target_ids):
     model = config_model(config)
     report = {"failed": 0, "errors": []}
     database = _database_path()
-    item_map = {}
-    for item in database_items(database):
-        for key in (item["paper_id"], item.get("id"), *item.get("legacy_ids", [])):
-            if key:
-                item_map[str(key)] = item
     updates = {}
-    visited = set()
-    for target in dict.fromkeys(str(target) for target in target_ids):
-        item = item_map.get(target)
-        if not item or item["paper_id"] in visited:
-            continue
-        visited.add(item["paper_id"])
+    for item in pending_summary_items(database, target_ids):
         existing = item.get("abstract") or {}
-        if existing.get("source") in {"gpt_summarized", "gpt_generated"}:
-            continue
         raw = existing.get("raw_abstract") or (existing.get("abstract") if existing.get("source") in {"crossref", "semantic_scholar"} else None)
         call_errors = []
         if raw:
@@ -1363,26 +1376,15 @@ def summarize_specific_papers(target_ids):
 
 
 def main(argv=None):
-    """CLI entry point.  Exit codes: 0 published, 1 all sources failed, 2 config error."""
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Fetch RSS journals (journals.dat), keep entries matching keywords.dat, "
-                    "store them in SQLite and regenerate filtered_feed.xml / web/feed.json.",
-        epilog="Exit codes: 0 = published (possibly with some failed sources), "
-               "1 = every RSS source failed (nothing published), "
-               "2 = journals.dat or keywords.dat is empty/missing.")
-    parser.parse_args(argv)
-    outcome = run_rss_flow() or {}
-    if outcome.get("published"):
-        failed = outcome.get("failed_sources") or []
-        if failed:
-            print(f"Finished with {len(failed)} failed source(s); available data was published.")
-        return 0
-    if outcome.get("config_error"):
-        return 2
-    return 1
+    """Compatibility entry point: `python get_RSS.py` == `python -m paper_feed refresh`.
+
+    Exit codes: 0 published, 1 all sources failed, 2 config error.
+    """
+    from paper_feed.cli import main as cli_main
+    return cli_main(["refresh", *(sys.argv[1:] if argv is None else argv)])
 
 
 if __name__ == '__main__':
-    configure_stdio()
+    # Share this module object with the CLI instead of importing the file twice.
+    sys.modules.setdefault("get_RSS", sys.modules[__name__])
     sys.exit(main())

@@ -189,7 +189,7 @@ async function run() {
   // any filter switches the inbox to list mode, and params are cleared once.
   let replaced = null;
   context.window = {
-    location: { search: "?search=nudge&view=all&from=report", pathname: "/index.html", hash: "" },
+    location: { search: "?search=nudge&view=all&from=insights", pathname: "/index.html", hash: "" },
     history: { replaceState: (_s, _t, url) => { replaced = url; } }
   };
   vm.runInContext(`
@@ -199,14 +199,35 @@ async function run() {
   vm.runInContext(`
     elements.filterMethod = null; elements.filterTopic = null; elements.filterPreset = null;
     elements.searchInput = { value: "" };
+    elements.backLink = { href: "", textContent: "", hidden: true };
     state.urlFiltersApplied = false; state.filterMode = "all"; state.inboxViewMode = "swipe";
   `, context);
   assert.strictEqual(vm.runInContext("applyUrlFilters()", context), true);
+  // from=insights shows a back link to the merged 洞察 page.
+  assert.strictEqual(vm.runInContext("elements.backLink.hidden", context), false);
+  assert.strictEqual(vm.runInContext("elements.backLink.href", context), "insights.html");
+  assert.strictEqual(vm.runInContext("elements.backLink.textContent", context), "← 返回洞察");
   assert.strictEqual(vm.runInContext("elements.searchInput.value", context), "nudge");
   assert.strictEqual(vm.runInContext("state.filterMode", context), "everything");
   assert.strictEqual(vm.runInContext("state.inboxViewMode", context), "list");
   assert.strictEqual(replaced, "/index.html");
   assert.strictEqual(vm.runInContext("applyUrlFilters()", context), false); // applied only once
+  // Legacy from=report / from=stats links still get a back link to the matching 洞察 tab.
+  for (const [legacy, target] of [["report", "insights.html#prefs"], ["stats", "insights.html#journals"]]) {
+    context.window.location.search = `?q=x&from=${legacy}`;
+    vm.runInContext(`
+      elements.backLink = { href: "", textContent: "", hidden: true };
+      state.urlFiltersApplied = false;
+    `, context);
+    vm.runInContext("applyUrlFilters()", context);
+    assert.strictEqual(vm.runInContext("elements.backLink.href", context), target);
+    assert.strictEqual(vm.runInContext("elements.backLink.textContent", context), "← 返回洞察");
+  }
+  // Unknown from values do not show a back link.
+  context.window.location.search = "?q=x&from=elsewhere";
+  vm.runInContext(`elements.backLink = { href: "", textContent: "", hidden: true }; state.urlFiltersApplied = false;`, context);
+  vm.runInContext("applyUrlFilters()", context);
+  assert.strictEqual(vm.runInContext("elements.backLink.hidden", context), true);
 
   // List actions keep pagination, are undoable, and the undo history is capped
   // instead of being wiped by a timer.

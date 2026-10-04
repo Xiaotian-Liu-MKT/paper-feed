@@ -113,13 +113,21 @@ def validate_exports(xml_path: Path, json_path: Path, baseline_xml: Path | None 
     return len(xml_ids)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--xml", required=True, type=Path)
-    parser.add_argument("--json", required=True, type=Path)
-    parser.add_argument("--baseline-xml", type=Path)
-    parser.add_argument("--projection-limit", type=int, default=1000)
-    args = parser.parse_args(argv)
+def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add the guard's options (shared with `python -m paper_feed publish-guard`)."""
+    parser.add_argument("--xml", required=True, type=Path,
+                        help="Generated RSS export to check / 待检查的 RSS 导出 (filtered_feed.xml).")
+    parser.add_argument("--json", required=True, type=Path,
+                        help="Generated JSON export to check / 待检查的 JSON 导出 (web/feed.json).")
+    parser.add_argument("--baseline-xml", type=Path,
+                        help="Previously published XML; enables the rolling-projection safety check "
+                             "/ 上次发布的 XML，用于检查滚动窗口是否异常缩水。")
+    parser.add_argument("--projection-limit", type=int, default=1000,
+                        help="Maximum items in the rolling projection (default: 1000) / 滚动窗口上限。")
+    return parser
+
+
+def run(args: argparse.Namespace) -> int:
     try:
         count = validate_exports(args.xml, args.json, args.baseline_xml, args.projection_limit)
     except PublishGuardError as error:
@@ -127,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Publication guard passed: {count} items.")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = configure_parser(argparse.ArgumentParser(prog="python -m paper_feed.publish_guard",
+                                                      description=__doc__))
+    return run(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

@@ -38,10 +38,10 @@ jobs:
         OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
         OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
       run: |
-        # SQLite is an ephemeral CI cache. get_RSS.py bootstraps it from the
+        # SQLite is an ephemeral CI cache. `refresh` (get_RSS.py) bootstraps it from the
         # committed XML/JSON compatibility exports when it is absent.
         rm -f data/paper_feed.sqlite3 data/paper_feed.sqlite3-wal data/paper_feed.sqlite3-shm
-        python get_RSS.py
+        python -m paper_feed refresh
 
     - name: Commit and Push changes
       run: |

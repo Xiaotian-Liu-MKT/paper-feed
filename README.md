@@ -101,12 +101,14 @@ https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mksc
 
 ### 4. 端口
 
-默认端口是 `8000`。端口被占用时，可以设置环境变量 `PAPER_FEED_PORT`，或给 `server.py` 传 `--port`：
+默认端口是 `8000`。端口被占用时，可以设置环境变量 `PAPER_FEED_PORT`，或给命令行传 `--port`：
 
 ```powershell
-$env:PAPER_FEED_PORT = "8010"; run_web.bat start
-.\.venv\Scripts\python.exe server.py --port 8010
+$env:PAPER_FEED_PORT = "8010"; .\.venv\Scripts\python.exe -m paper_feed start
+.\.venv\Scripts\python.exe -m paper_feed start --port 8010
 ```
+
+`run_web.bat` 固定使用 8000；`run_web.sh` 读取 `PAPER_FEED_PORT`。
 
 ## 使用方法
 
@@ -127,7 +129,7 @@ chmod +x run_web.sh   # 首次使用
 ./run_web.sh start
 ```
 
-也可以直接运行 `.\.venv\Scripts\python.exe server.py`。服务只监听 `127.0.0.1`，包含本地写入接口和后台任务，**不要进行公网端口转发**。
+启动器只是 `python -m paper_feed run`（默认/refresh）和 `python -m paper_feed start` 的外壳，见下方“命令行”。服务只监听 `127.0.0.1`，包含本地写入接口和后台任务，**不要进行公网端口转发**。
 
 **注意：** 裸运行 `run_web.bat` 和 `run_web.bat refresh` 都可能联网、调用 AI 并修改生成物；只想查看现有结果时使用 `start`。
 
@@ -147,24 +149,42 @@ chmod +x run_web.sh   # 首次使用
 - **列表模式**：`J`/`K` 移动高亮卡片，`F` 收藏、`A`（或 `L`）归档、`X` 不感兴趣、`O` 打开原文。
 - `Z` 在任何视图都可撤销最近的操作（最多 20 步，切换视图时清空）；按 **`?`** 弹出完整快捷键说明。
 
-顶部导航栏可在主页、期刊、偏好报告、统计页之间切换。更新 RSS、重新分析和 AI 总结以后台任务运行，刷新页面后仍能看到正在运行的任务。
+### 🔎 洞察页（insights.html）
 
-### 命令行刷新 RSS
+原「偏好报告」和「期刊统计」已合并为一个「洞察」页面，分三个标签：
 
-```powershell
-.\.venv\Scripts\python.exe get_RSS.py
-```
+- **我的偏好**：基于标题的偏好词、方法/主题偏好倍数、时间趋势、来源/期刊偏好。报告不会自动更新，标记新文章后点「重新计算」。
+- **期刊表现**：全部期刊一览 + 单刊详情（发刊频率、收藏/不感兴趣占比、主题分布）。
+- **期刊匹配**：按匹配度/结构匹配排序的期刊画像，以及粘贴研究摘要反向匹配期刊。
 
-该命令会从已配置 RSS 源获取论文、按关键词过滤、导入 SQLite，并更新兼容导出。它可能联网、调用 AI，并修改 `data/paper_feed.sqlite3`、`filtered_feed.xml`、`web/feed.json`、`web/translations.json` 等本地生成物。
+每个标签都有独立地址，可直接收藏或分享：`insights.html#prefs`、`#journals`、`#journals/detail?journal=期刊名`、`#fit`、`#fit/match`；页面会记住上次打开的标签。各处「筛选」会跳回 Feed 并显示「← 返回洞察」；旧的 `report.html` / `stats.html` 链接会自动跳转到对应标签。
 
-### 备份与旧数据导入
+顶部导航栏可在 Feed、洞察、期刊管理之间切换。更新 RSS、重新分析和 AI 总结以后台任务运行，刷新页面后仍能看到正在运行的任务。
 
-```powershell
-.\.venv\Scripts\python.exe -m paper_feed backup         # 备份 SQLite 数据库
-.\.venv\Scripts\python.exe -m paper_feed import-legacy  # 从旧版 JSON 状态文件导入
-```
+### 命令行
 
-数据库是唯一的数据真相源，升级或大改前建议先执行 `backup`。
+所有命令行功能统一为 `python -m paper_feed <命令>`（Windows 下用 `.\.venv\Scripts\python.exe -m paper_feed ...`，macOS/Linux 用 `.venv/bin/python -m paper_feed ...`）。不带命令运行会显示帮助；每个命令都支持 `--help`。
+
+| 命令 | 作用 | 联网 / AI 费用 |
+| --- | --- | --- |
+| `start [--port N] [--host H] [--no-browser]` | 用现有本地数据启动服务并打开浏览器；若该端口上已有 Paper Feed，直接打开它；端口被其他程序占用时报错退出 | 否 |
+| `run [--port N] [--host H] [--no-browser]` | 先 `refresh`，再像 `start` 一样启动/打开；刷新失败时仍打开已有数据；配置了 OpenAI 密钥时会提示费用 | 是 |
+| `serve [--port N] [--host 127.0.0.1] [--open]` | 只启动本地 Web/API 服务（`--open` 启动后打开浏览器） | 否（后台任务按需） |
+| `refresh` | 抓取 RSS、按关键词过滤、写入 SQLite、AI 标题分析（若配置密钥）、重新生成 `filtered_feed.xml` / `web/feed.json` 等导出。退出码：`0` 已发布；`1` 所有 RSS 源都失败；`2` `journals.dat` 或关键词为空 | 是 |
+| `reanalyze [--dry-run] [--yes]` | 对未分类或分类版本过旧的论文做 AI 标题分析；先显示数量并确认，`--dry-run` 只统计 | AI |
+| `summarize-favorites [--dry-run] [--yes]` | 为尚无 AI 总结的收藏生成总结；先显示数量并确认，`--dry-run` 只统计 | AI |
+| `keywords show` | 显示当前生效的关键词规则及来源（`RSS_KEYWORDS` 环境变量会覆盖 `keywords.dat`） | 否 |
+| `keywords preview [--text T \| --file F] [--json]` | 用库中已有论文预览规则命中数与示例（默认使用当前规则） | 否 |
+| `doctor [--port N] [--ascii]` | 环境自检：Python 版本、依赖（含 httpx 代理兼容）、每项配置的来源（不显示密钥）、`journals.dat`/`keywords.dat`、数据库完整性与各状态论文数、端口、`web/` 文件；有阻塞问题时退出码为 1 | 否 |
+| `backup [--out DIR]` | 用 sqlite3 备份 API 生成一致的数据库副本（服务运行时也安全） | 否 |
+| `import-legacy [--root R] [--database D] [--dry-run]` | 将旧版 `filtered_feed.xml`、`web/*.json` 单向、幂等地导入 SQLite | 否 |
+| `publish-guard --xml X --json J [--baseline-xml B]` | 发布前校验导出（GitHub Actions 使用） | 否 |
+
+`refresh` / `run` / `reanalyze` / `summarize-favorites` 可能联网、调用 AI，并修改 `data/paper_feed.sqlite3`、`filtered_feed.xml`、`web/feed.json`、`web/translations.json` 等本地生成物。`reanalyze` 与 `summarize-favorites` 在非交互环境中必须加 `--yes` 才会执行。
+
+兼容入口仍然可用：`python get_RSS.py` 等同于 `python -m paper_feed refresh`（退出码相同），`python server.py [--port N]` 等同于 `python -m paper_feed serve`，`python -m paper_feed.publish_guard` 等同于 `publish-guard`。旧的“不带命令的 `python -m paper_feed` = 导入旧数据”已取消，请改用 `import-legacy`。
+
+数据库是唯一的数据真相源，升级或大改前建议先执行 `backup`。遇到问题先运行 `doctor`。
 
 ### 在其他 RSS 阅读器中订阅
 
@@ -199,9 +219,9 @@ SQLite 是唯一的持久化真相源，默认路径是 `data/paper_feed.sqlite3
 
 ```
 paper-feed/
-├── get_RSS.py              # RSS 抓取、导入与兼容导出
-├── server.py               # 127.0.0.1 本地 Web/API 与后台任务
-├── paper_feed/             # SQLite、论文身份、导入、备份与服务层
+├── get_RSS.py              # RSS 抓取、导入与兼容导出（`python get_RSS.py` = refresh）
+├── server.py               # 127.0.0.1 本地 Web/API 与后台任务（`python server.py` = serve）
+├── paper_feed/             # SQLite、论文身份、导入、备份与服务层；cli.py 为统一命令行
 ├── data/paper_feed.sqlite3 # SQLite 真相源（本地生成，默认忽略）
 ├── journals.dat            # RSS 源列表
 ├── keywords.dat            # 关键词规则（keywords.dat.example 为示例）
@@ -228,12 +248,13 @@ paper-feed/
 
 ## 常见问题排查
 
+- **先运行自检**：`.\.venv\Scripts\python.exe -m paper_feed doctor` 会逐项检查依赖、配置来源、关键词/期刊文件、数据库和端口，并标出阻塞问题。
 - **`ModuleNotFoundError` / 缺少依赖**：确认使用的是 `.venv` 中的 Python，并重新执行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`。启动器提示找不到 `.venv\Scripts\python.exe` 时，说明还没有创建虚拟环境。
-- **端口被占用**：启动器发现 8000 端口被其他程序占用时会报错退出。关闭占用程序；若需换端口，请直接运行 `.\.venv\Scripts\python.exe server.py --port 8010`（或设置 `PAPER_FEED_PORT`，`run_web.sh` 也支持该变量；`run_web.bat` 固定使用 8000）。若占用者本身就是 Paper Feed，启动器会直接打开它。
+- **端口被占用**：启动器发现 8000 端口被其他程序占用时会报错退出。关闭占用程序；若需换端口，请运行 `.\.venv\Scripts\python.exe -m paper_feed start --port 8010`（或设置 `PAPER_FEED_PORT`，`run_web.sh` 也支持该变量；`run_web.bat` 固定使用 8000）。若占用者本身就是 Paper Feed，启动器会直接打开它。
 - **AI 功能被跳过 / 没有翻译**：通常是未配置 API Key，或仍是 `your-api-key-here` 这样的占位值。在 ⚙️ 设置中检查“已配置密钥”状态；也要检查环境变量里是否有一个错误的 `OPENAI_API_KEY`（环境变量优先于 `config.json`）。
 - **任务状态为 `partial_failed`**：任务整体完成，但部分条目失败（例如个别 RSS 源超时、少数 AI 请求出错）。任务结果中会列出失败数量和简短错误信息；通常稍后重试即可，不需要重置数据。
 - **期刊抓取失败**：部分期刊需要机构网络或 VPN；也可能是 RSS 链接已失效，可在期刊页替换。
-- **`get_RSS.py` 退出码**：`0` 已发布；`1` 所有 RSS 源都抓取失败；`2` `journals.dat` 或关键词为空。`run_web.bat` 遇到 1/2 会提示并打开已有数据；GitHub Actions 中会让运行显示为失败。
+- **`refresh`（`get_RSS.py`）退出码**：`0` 已发布；`1` 所有 RSS 源都抓取失败；`2` `journals.dat` 或关键词为空。`run` / `run_web.bat` 遇到 1/2 会提示并打开已有数据；GitHub Actions 中会让运行显示为失败。
 - **分类领域不是营销**：可在 `web/categories.json` 中加一个可选的 `"domain"` 字段（如 `"Organizational Behavior"`），AI 分类提示词会使用它；分类失败时回退为已配置的类别或 `Unclassified`。
 - **关键词改了但旧论文还在**：这是预期行为，关键词只过滤新抓取的论文。不想看的旧论文可在待筛选中隐藏。
 

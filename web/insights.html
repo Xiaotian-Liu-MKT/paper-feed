@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Feed · 洞察</title>
+    <link rel="stylesheet" href="styles.css?v=2.2" />
+    <link rel="stylesheet" href="pages.css?v=1.1" />
+  </head>
+  <body class="insights-page">
+    <header class="hero">
+      <div class="hero__bg"></div>
+      <nav id="site-nav" class="hero__actions" aria-label="站点导航"></nav>
+      <div class="hero__content">
+        <p class="eyebrow">Paper Feed</p>
+        <h1>洞察</h1>
+        <p class="subhead">我的阅读偏好、各期刊的发刊与收藏表现，以及研究与期刊的匹配度。</p>
+      </div>
+    </header>
+
+    <main class="shell">
+      <div class="tab-bar insights-tabs" role="tablist" aria-label="洞察视图">
+        <a class="tab-btn" href="#prefs" data-insights-tab="prefs" role="tab" id="tab-prefs" aria-controls="panel-prefs" aria-selected="false">我的偏好</a>
+        <a class="tab-btn" href="#journals" data-insights-tab="journals" role="tab" id="tab-journals" aria-controls="panel-journals" aria-selected="false">期刊表现</a>
+        <a class="tab-btn" href="#fit" data-insights-tab="fit" role="tab" id="tab-fit" aria-controls="panel-fit" aria-selected="false">期刊匹配</a>
+      </div>
+
+      <!-- 期刊表现 / 期刊匹配 共享的时间范围（作用于两个标签页的全部统计） -->
+      <section class="panel insights-range" id="statsRangePanel" hidden>
+        <div class="controls">
+          <label class="control">
+            <span>起始日期</span>
+            <input id="statsFromDate" type="date" />
+          </label>
+          <label class="control">
+            <span>截止日期</span>
+            <input id="statsToDate" type="date" />
+          </label>
+        </div>
+        <div class="status">
+          <span id="statsStatus">加载中...</span>
+          <span id="statsGeneratedAt"></span>
+        </div>
+      </section>
+
+      <!-- ===================== 我的偏好 ===================== -->
+      <div class="insights-panel" id="panel-prefs" data-insights-panel="prefs" role="tabpanel" aria-labelledby="tab-prefs" hidden>
+        <section class="panel">
+          <div class="panel-title-row">
+            <h3 class="panel-title">偏好报告</h3>
+            <div class="panel-tools">
+              <button id="btnGenerateReport" class="btn btn--primary" type="button" title="根据当前收藏/不感兴趣记录重新计算并保存报告">重新计算</button>
+              <button id="btnReloadReport" class="btn btn--secondary" type="button" title="重新读取上次计算保存的报告，不重新计算">重新载入</button>
+            </div>
+          </div>
+          <p class="panel-hint">根据收藏与不感兴趣记录，从标题中推断偏好特征，不使用摘要内容。报告不会自动更新，标记新文章后请点击「重新计算」。</p>
+          <div class="status">
+            <span id="reportStatus">加载中...</span>
+            <span id="reportGeneratedAt"></span>
+          </div>
+          <div id="reportStale" class="alert alert--medium report-stale" hidden></div>
+          <div id="reportWarnings" class="report-warnings"></div>
+          <details class="report-details metric-explainer">
+            <summary>指标说明</summary>
+            <dl>
+              <dt>收藏</dt>
+              <dd>你标记为「收藏」或「归档」的文章（同时被标为不感兴趣的除外）。本站所有页面中「收藏」均包含归档。</dd>
+              <dt>不感兴趣</dt>
+              <dd>你标记为「不感兴趣」的文章，用于识别你倾向回避的特征。</dd>
+              <dt>偏好倍数</dt>
+              <dd>某个词/期刊/来源/方法/主题在收藏中出现的比例 ÷ 在不感兴趣中出现的比例（加 1 平滑）。例如 1.8 = 在收藏中出现的概率是不感兴趣中的 1.8 倍；&gt;1 表示偏好，&lt;1 表示回避，接近 1 说明没有明显倾向。</dd>
+              <dt>置信度</dt>
+              <dd>衡量偏好倍数有多可靠（0–100%）。由两部分相乘：收藏占比的 Wilson 95% 置信区间越窄越高，出现次数越多（相对样本总量的对数比例）越高。低于 40% 的结果仅供参考。（与「期刊匹配」中只看样本量的「样本置信度」不同。）</dd>
+              <dt>收藏/不感兴趣</dt>
+              <dd>该特征分别出现在多少篇收藏和不感兴趣文章中。出现总次数少于 3 次（方法/主题少于 5 次）的特征不参与计算。</dd>
+              <dt>相关视图</dt>
+              <dd>按期刊的篇数、收藏/不感兴趣占比见 <a href="#journals">期刊表现</a>；按主题/方法结构与各期刊的对比见 <a href="#fit">期刊匹配</a>。</dd>
+            </dl>
+          </details>
+        </section>
+
+        <section class="panel panel--highlight">
+          <h3 class="panel-title">💡 智能洞察</h3>
+          <p class="panel-hint">基于你的收藏和不感兴趣行为，自动生成的研究偏好总结</p>
+          <div id="insightsSummary" class="insights-container"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">样本概览</h3>
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">收藏样本</div>
+              <div class="stat-value" id="reportFavCount">-</div>
+              <div class="stat-note">参与偏好计算</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">不感兴趣样本</div>
+              <div class="stat-value" id="reportHiddenCount">-</div>
+              <div class="stat-note">用于排除特征</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">收藏缺失</div>
+              <div class="stat-value" id="reportMissingFav">-</div>
+              <div class="stat-note">当前 feed 未命中</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">不感兴趣缺失</div>
+              <div class="stat-value" id="reportMissingHidden">-</div>
+              <div class="stat-note">可能已下线</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">偏好画像</h3>
+          <div class="report-grid">
+            <div class="report-card">
+              <h4>主题画像</h4>
+              <p class="report-summary">从标题词推断你更关注的研究主题与不偏好的话题。</p>
+              <ul id="reportTopicInsights" class="report-insights"></ul>
+            </div>
+            <div class="report-card">
+              <h4>方法画像</h4>
+              <p class="report-summary">从标题线索估计你更偏好的研究方法风格。</p>
+              <ul id="reportMethodInsights" class="report-insights"></ul>
+            </div>
+            <div class="report-card">
+              <h4>语气画像</h4>
+              <p class="report-summary">从措辞判断你更偏好的表达与研究语气。</p>
+              <ul id="reportToneInsights" class="report-insights"></ul>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">研究方法与主题偏好</h3>
+          <p class="panel-hint">全部期刊合计的偏好倍数。想看各期刊的主题/方法结构与你的收藏有多接近，请到 <a href="#fit">期刊匹配</a>。</p>
+          <div class="report-grid">
+            <div class="report-card">
+              <h4>研究方法分布</h4>
+              <div class="ratio-bar" aria-hidden="true">
+                <div id="methodFavBar" class="ratio-fill ratio-fill--like"></div>
+                <div id="methodHidBar" class="ratio-fill ratio-fill--dislike"></div>
+              </div>
+              <div id="methodStats" class="method-stats"></div>
+              <details class="report-details">
+                <summary>查看详细列表</summary>
+                <div id="methodTable" class="report-table"></div>
+              </details>
+            </div>
+            <div class="report-card">
+              <h4>研究主题分布</h4>
+              <div class="ratio-bar" aria-hidden="true">
+                <div id="topicFavBar" class="ratio-fill ratio-fill--like"></div>
+                <div id="topicHidBar" class="ratio-fill ratio-fill--dislike"></div>
+              </div>
+              <div id="topicStats" class="topic-stats"></div>
+              <details class="report-details">
+                <summary>查看详细列表</summary>
+                <div id="topicTable" class="report-table"></div>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">📈 偏好时间趋势（近12个月）</h3>
+          <p class="panel-hint">你的收藏与不感兴趣操作随时间的变化</p>
+          <div id="trendChart" class="trend-chart"></div>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">详细词表（可展开）</h3>
+          <details class="report-details">
+            <summary>查看高频词与偏好列表</summary>
+            <div class="report-grid report-details-grid">
+              <div class="report-card">
+                <h4>收藏高频词</h4>
+                <p id="reportTopFavSummary" class="report-summary"></p>
+                <div id="reportTopFavTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>不感兴趣高频词</h4>
+                <p id="reportTopHiddenSummary" class="report-summary"></p>
+                <div id="reportTopHiddenTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能收藏</h4>
+                <p id="reportPreferredSummary" class="report-summary"></p>
+                <div id="reportPreferredTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能避开</h4>
+                <p id="reportAvoidedSummary" class="report-summary"></p>
+                <div id="reportAvoidedTerms" class="report-table"></div>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">偏好短语（双词组合）</h3>
+          <details class="report-details">
+            <summary>查看双词组合列表</summary>
+            <div class="report-grid report-details-grid">
+              <div class="report-card">
+                <h4>更可能收藏</h4>
+                <p id="reportPreferredBigramsSummary" class="report-summary"></p>
+                <div id="reportPreferredBigrams" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能避开</h4>
+                <p id="reportAvoidedBigramsSummary" class="report-summary"></p>
+                <div id="reportAvoidedBigrams" class="report-table"></div>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">来源/期刊偏好倍数</h3>
+          <p class="panel-hint">
+            <span id="reportSourceJournalCoverage"></span>
+            各期刊的收藏/不感兴趣篇数与占比统一在 <a href="#journals">期刊表现</a> 中查看；点击下方期刊名可直接跳到该期刊详情。
+          </p>
+          <details class="report-details">
+            <summary>查看来源与期刊偏好</summary>
+            <div class="report-grid report-details-grid">
+              <div class="report-card">
+                <h4>更可能收藏的期刊</h4>
+                <p id="reportJournalPreferredSummary" class="report-summary"></p>
+                <div id="reportJournalPreferredTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能避开的期刊</h4>
+                <p id="reportJournalAvoidedSummary" class="report-summary"></p>
+                <div id="reportJournalAvoidedTerms" class="report-table"></div>
+              </div>
+            </div>
+            <div class="report-grid report-details-grid insights-gap">
+              <div class="report-card">
+                <h4>收藏高频来源</h4>
+                <p id="reportSourceTopFavSummary" class="report-summary"></p>
+                <div id="reportSourceTopFavTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>不感兴趣高频来源</h4>
+                <p id="reportSourceTopHiddenSummary" class="report-summary"></p>
+                <div id="reportSourceTopHiddenTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能收藏的来源</h4>
+                <p id="reportSourcePreferredSummary" class="report-summary"></p>
+                <div id="reportSourcePreferredTerms" class="report-table"></div>
+              </div>
+              <div class="report-card">
+                <h4>更可能避开的来源</h4>
+                <p id="reportSourceAvoidedSummary" class="report-summary"></p>
+                <div id="reportSourceAvoidedTerms" class="report-table"></div>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">未匹配链接样本</h3>
+          <div class="report-grid">
+            <div class="report-card">
+              <h4>收藏但不在当前 feed 中</h4>
+              <ul id="reportMissingFavLinks" class="report-links"></ul>
+            </div>
+            <div class="report-card">
+              <h4>不感兴趣但不在当前 feed 中</h4>
+              <ul id="reportMissingHiddenLinks" class="report-links"></ul>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ===================== 期刊表现 ===================== -->
+      <div class="insights-panel" id="panel-journals" data-insights-panel="journals" role="tabpanel" aria-labelledby="tab-journals" hidden>
+        <div class="tab-bar insights-subtabs" aria-label="期刊表现视图">
+          <a class="tab-btn" href="#journals" data-insights-subtab="journals/overview">全部期刊一览</a>
+          <a class="tab-btn" href="#journals/detail" data-insights-subtab="journals/detail">单刊详情</a>
+        </div>
+
+        <details class="report-details metric-explainer insights-explainer">
+          <summary>指标说明</summary>
+          <dl>
+            <dt>收藏 / 不感兴趣 / 未反馈</dt>
+            <dd>该期刊在所选时间范围内的文章中，被你收藏（含归档）、标为不感兴趣、以及尚未处理的篇数与占比。</dd>
+            <dt>占比</dt>
+            <dd>条形图依次为收藏（绿）/ 不感兴趣（红）/ 未反馈（灰）占该刊总篇数的比例。</dd>
+            <dt>平均每周 / 每月</dt>
+            <dd>有效日期范围内的篇数 ÷ 首末篇之间的周数（月数按 30.44 天计）。</dd>
+            <dt>相关视图</dt>
+            <dd>期刊的「偏好倍数」（收藏 vs 不感兴趣的相对概率）见 <a href="#prefs">我的偏好 → 来源/期刊偏好倍数</a>；综合匹配度与结构匹配见 <a href="#fit">期刊匹配</a>。</dd>
+          </dl>
+        </details>
+
+        <div class="insights-subpanel" data-insights-subpanel="journals/overview">
+          <section class="panel">
+            <div class="panel-title-row">
+              <h3 class="panel-title">全部期刊一览</h3>
+              <div class="panel-tools">
+                <label class="panel-select">
+                  <span>排序</span>
+                  <select id="overviewSort">
+                    <option value="total_desc">总篇数（高→低）</option>
+                    <option value="like_desc">收藏占比（高→低）</option>
+                    <option value="dislike_desc">不感兴趣占比（高→低）</option>
+                    <option value="last_desc">最近发布（最新→最旧）</option>
+                    <option value="name_asc">期刊名称（A→Z）</option>
+                  </select>
+                </label>
+                <span class="panel-note" id="overviewCount"></span>
+              </div>
+            </div>
+            <p class="panel-hint">点击期刊名称查看该期刊的详细统计。</p>
+            <div class="overview-table-wrap">
+              <table class="overview-table">
+                <thead>
+                  <tr>
+                    <th>期刊</th>
+                    <th class="overview-spacer"></th>
+                    <th>总篇数</th>
+                    <th>收藏</th>
+                    <th>不感兴趣</th>
+                    <th>未反馈</th>
+                    <th>占比</th>
+                    <th>最近发布</th>
+                  </tr>
+                </thead>
+                <tbody id="overviewBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <div class="insights-subpanel" data-insights-subpanel="journals/detail">
+          <section class="panel">
+            <div class="controls">
+              <label class="control">
+                <span>期刊</span>
+                <select id="statsJournal">
+                  <option value="">请选择期刊</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="stats-grid">
+              <div class="stat-card">
+                <div class="stat-label">总篇数</div>
+                <div class="stat-value" id="statTotal">-</div>
+                <div class="stat-note" id="statSpan">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">平均每周</div>
+                <div class="stat-value" id="statPerWeek">-</div>
+                <div class="stat-note" id="statWeekNote">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">平均每月</div>
+                <div class="stat-value" id="statPerMonth">-</div>
+                <div class="stat-note" id="statMonthNote">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">最近发布</div>
+                <div class="stat-value" id="statLastDate">-</div>
+                <div class="stat-note" id="statLastNote">-</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">我的收藏/不感兴趣占比</h3>
+            <div class="ratio-bar" aria-hidden="true">
+              <div id="ratioLikeBar" class="ratio-fill ratio-fill--like"></div>
+              <div id="ratioDislikeBar" class="ratio-fill ratio-fill--dislike"></div>
+              <div id="ratioNeutralBar" class="ratio-fill ratio-fill--neutral"></div>
+            </div>
+            <div class="ratio-grid">
+              <div class="ratio-item">
+                <span class="ratio-dot ratio-dot--like"></span>
+                <div>
+                  <div class="ratio-label">收藏</div>
+                  <div class="ratio-value" id="ratioLikeText">-</div>
+                </div>
+              </div>
+              <div class="ratio-item">
+                <span class="ratio-dot ratio-dot--dislike"></span>
+                <div>
+                  <div class="ratio-label">不感兴趣</div>
+                  <div class="ratio-value" id="ratioDislikeText">-</div>
+                </div>
+              </div>
+              <div class="ratio-item">
+                <span class="ratio-dot ratio-dot--neutral"></span>
+                <div>
+                  <div class="ratio-label">未反馈</div>
+                  <div class="ratio-value" id="ratioNeutralText">-</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">近 12 个月发刊频率</h3>
+            <div id="monthChart" class="bar-chart"></div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">主题分布（本刊全部文章）</h3>
+            <div id="topicDistribution" class="topic-distribution"></div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">主题趋势</h3>
+            <div id="topicTrend" class="trend-chart"></div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">主题关联</h3>
+            <div id="topicNetwork" class="topic-network"></div>
+          </section>
+
+          <section class="panel">
+            <h3 class="panel-title">本刊收藏的主题雷达</h3>
+            <div id="topicRadar" class="radar-chart"></div>
+          </section>
+        </div>
+      </div>
+
+      <!-- ===================== 期刊匹配 ===================== -->
+      <div class="insights-panel" id="panel-fit" data-insights-panel="fit" role="tabpanel" aria-labelledby="tab-fit" hidden>
+        <div class="tab-bar insights-subtabs" aria-label="期刊匹配视图">
+          <a class="tab-btn" href="#fit" data-insights-subtab="fit/profile">期刊匹配画像</a>
+          <a class="tab-btn" href="#fit/match" data-insights-subtab="fit/match">研究摘要匹配</a>
+        </div>
+
+        <details class="report-details metric-explainer insights-explainer">
+          <summary>指标说明</summary>
+          <dl>
+            <dt>匹配度</dt>
+            <dd><code>(收藏占比 − 不感兴趣占比) × 100</code>，范围 −100 ~ +100。≥ +20 显示为高匹配，≤ −20 为低匹配。各期刊的篇数与占比明细见 <a href="#journals">期刊表现</a>。</dd>
+            <dt>样本置信度</dt>
+            <dd><code>log(n + 1) / log(51)</code>，n 为该期刊的样本篇数，上限 100%。约 4 篇以上为「中等置信」（≥ 40%），约 15 篇以上为「高置信」（≥ 70%），50 篇达到 100%。样本少时匹配度波动大，仅供参考。（与「我的偏好」中基于 Wilson 区间的「置信度」不同。）</dd>
+            <dt>结构匹配</dt>
+            <dd><code>0.7 × Topic 分布余弦相似度 + 0.3 × Method 分布余弦相似度</code>，显示为 0–100。对比基准默认是「我的收藏」，也可换成另一本期刊。</dd>
+            <dt>摘要匹配得分</dt>
+            <dd>「研究摘要匹配」中按 <code>结构匹配 × 样本置信度</code> 排序：先从你粘贴的文字中识别 Topic/Method 关键词，再与各期刊的分布比对。</dd>
+            <dt>相关视图</dt>
+            <dd>全部期刊合计的主题/方法「偏好倍数」见 <a href="#prefs">我的偏好</a>。</dd>
+          </dl>
+        </details>
+
+        <div class="insights-subpanel" data-insights-subpanel="fit/profile">
+          <section class="panel" id="fitBehaviorPanel">
+            <div class="panel-title-row">
+              <h3 class="panel-title">期刊匹配一览</h3>
+              <div class="panel-tools">
+                <label class="panel-select">
+                  <span>排序</span>
+                  <select id="fitSort">
+                    <option value="fit_desc">匹配度（高→低）</option>
+                    <option value="structure_desc">结构匹配（高→低）</option>
+                    <option value="confidence_desc">样本置信度（高→低）</option>
+                    <option value="total_desc">样本量（多→少）</option>
+                    <option value="name_asc">期刊名称（A→Z）</option>
+                  </select>
+                </label>
+                <span class="panel-note" id="fitOverviewCount"></span>
+              </div>
+            </div>
+            <p class="panel-hint">基于收藏/不感兴趣/未反馈计算匹配度与样本置信度，可对照下方基准画像理解结构差异。</p>
+            <div class="fit-journal-list" id="fitJournalList"></div>
+          </section>
+
+          <section class="panel" id="fitStructurePanel">
+            <div class="panel-title-row">
+              <h3 class="panel-title">对比基准画像</h3>
+            </div>
+            <div class="controls">
+              <label class="control">
+                <span>对比基准</span>
+                <select id="fitCompareMode">
+                  <option value="favorites">对比我的收藏</option>
+                  <option value="journal">对比另一本期刊</option>
+                </select>
+              </label>
+              <label class="control" id="fitCompareJournalWrap">
+                <span>对比期刊</span>
+                <select id="fitCompareJournal">
+                  <option value="">请选择期刊</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="fit-compare-grid">
+              <div class="fit-block">
+                <h4 class="fit-block__title">Topic 分布</h4>
+                <div class="fit-bar-group">
+                  <div class="fit-bar-row" data-series="baseline">
+                    <div class="fit-bar-label" id="fitTopicBaselineLabel">对比基准</div>
+                    <div class="fit-bar-track" id="fitTopicBaseline"></div>
+                  </div>
+                </div>
+                <div class="fit-top-list" id="fitTopicTopList"></div>
+              </div>
+
+              <div class="fit-block">
+                <h4 class="fit-block__title">Method 分布</h4>
+                <div class="fit-bar-group">
+                  <div class="fit-bar-row" data-series="baseline">
+                    <div class="fit-bar-label" id="fitMethodBaselineLabel">对比基准</div>
+                    <div class="fit-bar-track" id="fitMethodBaseline"></div>
+                  </div>
+                </div>
+                <div class="fit-top-list" id="fitMethodTopList"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="insights-subpanel" data-insights-subpanel="fit/match">
+          <section class="panel" id="fitMatcherPanel">
+            <div class="panel-title-row">
+              <h3 class="panel-title">研究摘要反向匹配期刊</h3>
+              <span class="panel-note" id="fitMatchStatus"></span>
+            </div>
+            <textarea
+              id="fitAbstractInput"
+              class="fit-input"
+              placeholder="粘贴研究项目摘要、研究问题或关键摘要段落，系统会基于 Topic/Method 找到最匹配的期刊。"
+            ></textarea>
+            <div class="panel-actions">
+              <button class="btn btn--primary" id="fitMatchBtn" type="button">匹配期刊</button>
+            </div>
+            <div class="fit-match-results" id="fitMatchResults"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script src="nav.js?v=1.1"></script>
+    <script src="report.js?v=2.0"></script>
+    <script src="stats.js?v=2.1"></script>
+    <script src="insights.js?v=1.0"></script>
+  </body>
+</html>

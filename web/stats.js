@@ -1,3 +1,8 @@
+// 「期刊表现」与「期刊匹配」标签页（insights.html#journals / #fit）。
+// 作用域限定在 IIFE 内，由 insights.js 调用 InsightsStats.init() / showJournal()。
+(function () {
+"use strict";
+
 const statsState = {
   items: [],
   interactions: { favorites: [], archived: [], hidden: [] },
@@ -32,8 +37,6 @@ const statsElements = {
   overviewBody: document.getElementById("overviewBody"),
   overviewCount: document.getElementById("overviewCount"),
   overviewSort: document.getElementById("overviewSort"),
-  tabButtons: document.querySelectorAll("[data-tab]"),
-  tabPanels: document.querySelectorAll("[data-tab-panel]"),
   fitJournalList: document.getElementById("fitJournalList"),
   fitSort: document.getElementById("fitSort"),
   fitOverviewCount: document.getElementById("fitOverviewCount"),
@@ -412,7 +415,11 @@ function renderOverview(items, fromDate, toDate) {
 
     const name = document.createElement("td");
     name.className = "overview-name";
-    name.textContent = row.journal;
+    const nameLink = document.createElement("a");
+    nameLink.href = buildJournalDetailHash(row.journal);
+    nameLink.textContent = row.journal;
+    nameLink.title = "查看该期刊详情";
+    name.appendChild(nameLink);
 
     const spacer = document.createElement("td");
     spacer.className = "overview-spacer";
@@ -499,17 +506,27 @@ async function loadInteractions() {
 async function loadFeed() {
   setStatus("加载中...");
   try {
-    const response = await fetch("feed.json?t=" + Date.now(), {
-      cache: "no-store",
-      headers: {
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
-      }
-    });
-    if (!response.ok) {
-      throw new Error("feed.json missing");
+    // 优先读取本地 SQLite（含本机 AI 分类）；feed.json 是 CI 导出，可能缺少分类结果。
+    let payload = null;
+    try {
+      const apiResponse = await fetch("/api/papers?view=all", { cache: "no-store" });
+      if (apiResponse.ok) payload = await apiResponse.json();
+    } catch (apiError) {
+      console.warn("Paper API unavailable; using feed.json fallback", apiError);
     }
-    const payload = await response.json();
+    if (!payload) {
+      const response = await fetch("feed.json?t=" + Date.now(), {
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache"
+        }
+      });
+      if (!response.ok) {
+        throw new Error("feed.json missing");
+      }
+      payload = await response.json();
+    }
     statsState.items = (payload.items || []).map((item) => ({
       journal: cleanJournalName(item.journal) || "未知期刊",
       paperId: item.paper_id || "",
@@ -528,7 +545,7 @@ async function loadFeed() {
       : "";
     setStatus("请选择期刊");
   } catch (error) {
-    setStatus("无法加载 feed.json，请先运行 get_RSS.py 并用本地服务器打开页面。");
+    setStatus("无法加载论文数据，请用 python -m paper_feed start 启动本地服务后打开页面。");
   }
 }
 
@@ -723,12 +740,17 @@ function formatTopLabels(entries, limit) {
 }
 
 const FIT_SCORE_HELP = "匹配度 = (收藏占比 − 不感兴趣占比) × 100，范围 −100 ~ +100；>0 表示你更常收藏该期刊的文章";
-const CONFIDENCE_HELP = "按样本量计算 log(n+1)/log(51)，约 4 篇为中等、15 篇为高、50 篇达到 100%";
+const CONFIDENCE_HELP = "样本置信度按样本量计算 log(n+1)/log(51)，约 4 篇为中等、15 篇为高、50 篇达到 100%";
 const STRUCTURE_HELP = "结构匹配 = 0.7 × Topic 分布余弦相似度 + 0.3 × Method 分布余弦相似度（×100）";
 
 function buildJournalFilterLink(journal) {
-  const params = new URLSearchParams({ journal, view: "all", from: "stats" });
+  const params = new URLSearchParams({ journal, view: "all", from: "insights" });
   return `index.html?${params.toString()}`;
+}
+
+// 同页链接：切换到「期刊表现 → 单刊详情」并选中该期刊（由 insights.js 处理 hash）。
+function buildJournalDetailHash(journal) {
+  return `#journals/detail?journal=${encodeURIComponent(journal)}`;
 }
 
 function describeConfidence(confidence) {
@@ -807,7 +829,7 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
     const confidenceBadge = document.createElement("span");
     confidenceBadge.className = `fit-chip fit-chip--${confidenceInfo.tone}`;
     confidenceBadge.textContent = confidenceInfo.label;
-    confidenceBadge.title = `置信度 ${Math.round(row.confidence * 100)}%：${CONFIDENCE_HELP}`;
+    confidenceBadge.title = `样本置信度 ${Math.round(row.confidence * 100)}%：${CONFIDENCE_HELP}`;
 
     const structureBadge = document.createElement("span");
     structureBadge.className = "fit-chip";
@@ -818,26 +840,6 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
 
     badges.appendChild(confidenceBadge);
     badges.appendChild(structureBadge);
-
-    const ratio = document.createElement("div");
-    ratio.className = "fit-journal-ratio";
-    const ratioBar = document.createElement("div");
-    ratioBar.className = "ratio-bar ratio-bar--compact";
-
-    const likeFill = document.createElement("div");
-    likeFill.className = "ratio-fill ratio-fill--like";
-    likeFill.style.width = `${Math.round(row.stats.likePct * 100)}%`;
-    const dislikeFill = document.createElement("div");
-    dislikeFill.className = "ratio-fill ratio-fill--dislike";
-    dislikeFill.style.width = `${Math.round(row.stats.dislikePct * 100)}%`;
-    const neutralFill = document.createElement("div");
-    neutralFill.className = "ratio-fill ratio-fill--neutral";
-    neutralFill.style.width = `${Math.round(row.stats.neutralPct * 100)}%`;
-
-    ratioBar.appendChild(likeFill);
-    ratioBar.appendChild(dislikeFill);
-    ratioBar.appendChild(neutralFill);
-    ratio.appendChild(ratioBar);
 
     const bars = document.createElement("div");
     bars.className = "fit-journal-bars";
@@ -879,11 +881,17 @@ function renderFitJournalList(metrics, baselineVectors, baselineLabel) {
     link.className = "fit-match-filter";
     link.href = buildJournalFilterLink(row.journal);
     link.textContent = "筛选";
+    link.title = "在 Feed 中筛选该期刊的文章";
+    const detailLink = document.createElement("a");
+    detailLink.className = "fit-match-filter";
+    detailLink.href = buildJournalDetailHash(row.journal);
+    detailLink.textContent = "期刊表现";
+    detailLink.title = "查看发刊频率与收藏/不感兴趣占比";
     actions.appendChild(link);
+    actions.appendChild(detailLink);
 
     card.appendChild(header);
     card.appendChild(badges);
-    card.appendChild(ratio);
     card.appendChild(bars);
     card.appendChild(tags);
     card.appendChild(actions);
@@ -1035,8 +1043,8 @@ function renderMatchResults(results, queryMatches) {
 
     const detail = document.createElement("div");
     detail.className = "fit-match-detail";
-    detail.textContent = `结构匹配 ${(result.structureScore * 100).toFixed(0)} · 置信度 ${Math.round(result.confidence * 100)}% · 匹配度 ${result.fitScore.toFixed(0)}`;
-    detail.title = "综合得分 = 结构匹配 × 置信度；详见页面顶部「指标说明」";
+    detail.textContent = `结构匹配 ${(result.structureScore * 100).toFixed(0)} · 样本置信度 ${Math.round(result.confidence * 100)}% · 匹配度 ${result.fitScore.toFixed(0)}`;
+    detail.title = "综合得分 = 结构匹配 × 样本置信度；详见本页「指标说明」";
 
     const explain = document.createElement("div");
     explain.className = "fit-match-explain";
@@ -1313,7 +1321,7 @@ function updateStats() {
 
   if (!journal) {
     const inRange = statsState.items.filter((item) => isWithinRange(item, fromDate, toDate)).length;
-    setStatus(inRange ? `当前范围共 ${inRange} 篇 · 请选择期刊` : "请选择期刊");
+    setStatus(inRange ? `当前时间范围共 ${inRange} 篇 · 请选择期刊` : "请选择期刊");
     statsElements.statTotal.textContent = "-";
     statsElements.statSpan.textContent = "-";
     statsElements.statPerWeek.textContent = "-";
@@ -1400,7 +1408,9 @@ function updateStats() {
   renderTopicNetwork(filtered);
   renderTopicRadar(filtered);
 
-  setStatus(`共 ${stats.total} 篇`);
+  // 状态栏位于期刊表现/期刊匹配共享的时间范围面板中，显示范围内全部文章数而非单刊篇数
+  const inRange = statsState.items.filter((item) => isWithinRange(item, fromDate, toDate)).length;
+  setStatus(`当前时间范围共 ${inRange} 篇`);
 }
 
 function attachHandlers() {
@@ -1413,10 +1423,10 @@ function attachHandlers() {
 
   if (statsElements.overviewBody) {
     statsElements.overviewBody.addEventListener("click", (event) => {
+      if (event.target.closest("a")) return; // 链接自身负责跳转
       const row = event.target.closest("tr");
       if (!row || !row.dataset.journal) return;
-      statsElements.journalSelect.value = row.dataset.journal;
-      updateStats();
+      window.location.hash = buildJournalDetailHash(row.journal);
     });
   }
 
@@ -1450,30 +1460,40 @@ function attachHandlers() {
     });
   }
 
-  if (statsElements.tabButtons && statsElements.tabPanels) {
-    statsElements.tabButtons.forEach((button) => {
-      button.addEventListener("click", () => {
-        const target = button.getAttribute("data-tab");
-        statsElements.tabButtons.forEach((btn) => {
-          const isActive = btn === button;
-          btn.classList.toggle("is-active", isActive);
-          btn.setAttribute("aria-selected", isActive ? "true" : "false");
-        });
-        statsElements.tabPanels.forEach((panel) => {
-          const isActive = panel.getAttribute("data-tab-panel") === target;
-          panel.classList.toggle("is-active", isActive);
-        });
-      });
-    });
+}
+
+let initPromise = null;
+
+// 首次进入「期刊表现」或「期刊匹配」时调用；两个标签共享同一份数据，只加载一次。
+function init() {
+  if (!initPromise) {
+    initPromise = (async () => {
+      attachHandlers();
+      await Promise.all([loadInteractions(), loadCategories()]);
+      await loadFeed();
+      updateStats();
+    })();
   }
+  return initPromise;
 }
 
-async function init() {
-  attachHandlers();
-  await loadInteractions();
-  await loadCategories();
-  await loadFeed();
+// 选中某本期刊并刷新详情；期刊不存在时保持当前选择。
+async function showJournal(journal) {
+  await init();
+  if (!journal || !statsElements.journalSelect) return false;
+  const options = Array.from(statsElements.journalSelect.options);
+  const match =
+    options.find((opt) => opt.value === journal) ||
+    options.find((opt) => opt.value.toLowerCase() === journal.toLowerCase()) ||
+    options.find((opt) => opt.value && opt.value.toLowerCase() === cleanJournalName(journal).toLowerCase());
+  if (!match) {
+    setStatus(`未找到期刊「${journal}」，请从下拉框选择。`);
+    return false;
+  }
+  statsElements.journalSelect.value = match.value;
   updateStats();
+  return true;
 }
 
-document.addEventListener("DOMContentLoaded", init);
+window.InsightsStats = { init, showJournal };
+})();

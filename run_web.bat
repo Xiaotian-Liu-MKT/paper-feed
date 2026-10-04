@@ -21,54 +21,22 @@ if /I not "%~1"=="" (
 
 if not exist "%PYTHON%" goto :missing_venv
 
-echo Starting Paper Feed Server...
-echo Open http://127.0.0.1:8000 in your browser.
-echo Press Ctrl+C to stop.
+rem The unified CLI does the work (python -m paper_feed --help):
+rem   run   = refresh RSS, then serve and open the browser
+rem   start = serve existing local data and open the browser (no network)
+rem Both reuse an already running Paper Feed on the port (just open it) and
+rem refuse to start when another program holds the port.
+set "COMMAND=run"
+if /I "%MODE%"=="start" set "COMMAND=start"
 
-set "EXISTING_PAPER_FEED=0"
-
-rem Do not start a second server.  A listener is accepted only when its read-only
-rem interaction API returns Paper Feed's three-array state schema.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$conn = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue; if (-not $conn) { exit 0 }; try { $response = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/api/interactions' -UseBasicParsing -TimeoutSec 2; $data = $response.Content | ConvertFrom-Json -ErrorAction Stop; $required = 'favorites','archived','hidden'; $missing = @($required | Where-Object { -not ($data.PSObject.Properties.Name -contains $_) }); $invalid = @($required | Where-Object { $data.$_ -isnot [System.Array] }); if ($null -ne $data -and $missing.Count -eq 0 -and $invalid.Count -eq 0) { exit 10 } } catch {}; Write-Host 'Port 8000 is already in use by PID(s):' (($conn | Select-Object -ExpandProperty OwningProcess -Unique) -join ', '); exit 20"
-if errorlevel 20 (
-  echo Close the process using port 8000, then run this script again.
-  pause
-  exit /b 1
-)
-if errorlevel 10 set "EXISTING_PAPER_FEED=1"
-
+echo Paper Feed: http://127.0.0.1:8000  (Ctrl+C stops the server)
 if /I "%MODE%"=="refresh" (
-  echo.
   echo Refresh is the default and may access RSS networks, call OpenAI, and modify generated files.
-  echo Running RSS refresh before opening Paper Feed...
-  "%PYTHON%" "%~dp0get_RSS.py"
-  if errorlevel 1 (
-    echo.
-    echo Warning: Refresh did not publish new data ^(see the messages above^).
-    echo Exit code 1 = every RSS source failed; 2 = journals.dat or keywords.dat is empty.
-    echo Opening Paper Feed with the existing local data instead.
-    echo.
-  )
 )
-
-for /f %%i in ('powershell -NoProfile -Command "[DateTimeOffset]::Now.ToUnixTimeMilliseconds()"') do set "CACHE_BUSTER=%%i"
-
-if "%EXISTING_PAPER_FEED%"=="1" (
-  if /I "%MODE%"=="refresh" (
-    echo Opening refreshed Paper Feed...
-  ) else (
-    echo Opening Paper Feed without refreshing RSS...
-  )
-  start "" "http://127.0.0.1:8000/?t=%CACHE_BUSTER%"
-  exit /b 0
-)
-
-rem Delay opening the browser until the local server has had time to bind.
-start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:8000/?t=%CACHE_BUSTER%'"
-"%PYTHON%" "%~dp0server.py" --port 8000
-set "SERVER_EXIT=%ERRORLEVEL%"
-pause
-exit /b %SERVER_EXIT%
+"%PYTHON%" -m paper_feed %COMMAND% --port 8000
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" pause
+exit /b %EXIT_CODE%
 
 :missing_venv
 echo Error: missing virtual environment interpreter:
@@ -86,4 +54,5 @@ echo   %~nx0 refresh   ^(explicit alias for refresh-first behavior^)
 echo   %~nx0 start     ^(start/open existing local data without refreshing RSS^)
 echo.
 echo Refresh may use the network, call OpenAI, and modify generated files.
+echo More commands: "%PYTHON%" -m paper_feed --help
 exit /b 1

@@ -27,6 +27,7 @@
 | `paper_feed/service.py` | `PaperFeedService`：按 `paper_id` 列表/查询、分流、保存摘要与分类修正 |
 | `paper_feed/exporter.py` | 从数据库投影 `filtered_feed.xml` 与 `web/feed.json` |
 | `paper_feed/publish_guard.py` | 自动化发布前的导出完整性检查 |
+| `paper_feed/cli.py` | 统一命令行 `python -m paper_feed <命令>`（见 §4.0） |
 
 主要表：`papers`、`paper_identifiers`、`paper_observations`（每次 RSS 观察）、`paper_review_state`（`inbox`/`favorite`/`archived`/`hidden`）、`paper_review_events`、`paper_analyses`（`analysis_kind` = `translation` / `abstract`）、`paper_user_overrides`（如 `user_correction`）、`fetch_runs`、`source_fetches`、`migration_unresolved`。
 
@@ -68,7 +69,7 @@
 *   **收件箱逻辑**: 分流后的文章从“待筛选”移出，进入相应视图。
 *   **Method/Topic Filter**: 多选下拉，支持“全部方法/全部主题”；选择“全部”会自动取消其他选项。
 *   **空状态文案**: 待筛选为空时提示“暂时没有新的文献了...”。
-*   **导航栏**: `web/nav.js` 为主页、期刊、偏好报告、统计页提供统一导航。
+*   **导航栏**: `web/nav.js` 为 Feed、洞察、期刊管理提供统一导航。
 
 ### 3.2 视觉增强
 *   **Badge System**: 渲染 Method/Topic/Source 徽章。
@@ -86,14 +87,30 @@
 *   🔑 **关键词编辑器**: 编辑 `keywords.dat`，保存前可预览对已入库论文的命中数和示例。
 *   **后台任务**: 抓取/分析/总结以 job 运行；页面重载后通过 `GET /api/jobs` 找回进行中的任务；`partial_failed` 表示部分条目失败。
 
-### 3.4 偏好报告
-*   **入口**: 导航栏“偏好报告”，页面 `web/report.html`。
+### 3.4 洞察页（偏好报告 + 期刊统计）
+*   **入口**: 导航栏“🔎 洞察”，页面 `web/insights.html`（`insights.js` 负责标签切换与 hash 路由：`#prefs`、`#journals`、`#journals/detail?journal=`、`#fit`、`#fit/match`）。`report.js` / `stats.js` 作为模块分别暴露 `window.InsightsReport` / `window.InsightsStats`，各标签首次激活时才加载数据。`report.html` / `stats.html` 仅为跳转页。
 *   **报告内容**: 基于收藏/隐藏标题的偏好词、偏好短语、样本数量与缺失链接提示；来源/期刊偏好提供 lift 与缺失覆盖提示。
-*   **筛选跳转**: 来源/期刊“筛选”按钮跳转至 `index.html?journal=...` 或 `index.html?source=...`。
-*   **触发逻辑**: “生成报告 / 刷新”按钮调用后端生成并读取报告。
+*   **筛选跳转**: “筛选”按钮跳转至 `index.html?journal=...&view=...&from=insights`（或 `source=` / `q=`），主页显示“← 返回洞察”。
+*   **触发逻辑**: “重新计算”(POST) 生成报告，“重新载入”(GET) 读取；页面打开时只 GET，不会自动生成。
 
 ### 3.5 期刊管理
 *   `web/journals.html`：管理订阅列表；可从期刊目录（`RSS list.md` 解析，按学科分组）勾选添加。保存时去除 `utm_*` 跟踪参数。
+
+## 4.0 命令行入口 (`paper_feed/cli.py`)
+
+唯一的命令行入口是 `python -m paper_feed <命令>`（argparse 子命令，中英文帮助；不带命令只打印帮助）。`get_RSS`/`server` 在命令处理函数内**延迟导入**，避免循环依赖，也让 `--help` / `doctor` 在缺依赖时仍可运行。
+
+| 命令 | 实现 |
+| --- | --- |
+| `refresh` | `get_RSS.run_rss_flow` + `cli.refresh_exit_code`（0 已发布 / 1 全部源失败 / 2 配置为空） |
+| `serve [--port] [--host] [--open]` | `server.run_server(port, host, on_ready)` |
+| `start` / `run` | `cli._start`：`probe_port` 探测 `/api/interactions`；已有 Paper Feed 则只打开浏览器，其他程序占用则退出 1；`run` 先 refresh（失败仍打开）并在配置密钥时提示费用 |
+| `reanalyze` / `summarize-favorites` | 计数（`get_RSS.stale_analysis_items` / `get_RSS.pending_summary_items`）→ 确认（`--yes`）→ `run_reanalysis_flow` / `summarize_specific_papers`；`--dry-run` 只计数 |
+| `keywords show` / `keywords preview` | 规则来源与 `get_RSS.load_config` 相同；预览调用 `server.keyword_preview`（SQLite） |
+| `doctor` | `cli.run_doctor`：Python、依赖、httpx `proxy=`、配置来源（不打印密钥）、期刊/关键词、数据库 `integrity_check` 与各状态计数、端口、`web/` 资源；有 FAIL 时退出 1 |
+| `backup` / `import-legacy` / `publish-guard` | `paper_feed.backup` / `paper_feed.importer` / `paper_feed.publish_guard.run` |
+
+兼容外壳：`python get_RSS.py` → `refresh`，`python server.py` → `serve`，`python -m paper_feed.publish_guard` 保留；`run_web.bat` / `run_web.sh` 分别调用 `-m paper_feed run|start --port ...`。新增命令行功能请加在 `cli.py` 并补 `tests/test_cli.py`。
 
 ## 4. API 接口 (`server.py`)
 
@@ -138,8 +155,8 @@
 *   **摘要编辑**: `server.py` -> `/api/update_abstract` -> `PaperFeedService.save_abstract(paper_id, ...)`（`paper_analyses`, `analysis_kind='abstract'`, `source='user_provided'`）。
 *   **分流**: `PaperFeedService.review(paper_id, action)` 写 `paper_review_state` 与 `paper_review_events`。
 *   **兼容导出**: `paper_feed.exporter`（`filtered_feed.xml`、`web/feed.json`）。
-*   **备份 / 旧数据导入**: `python -m paper_feed backup` / `python -m paper_feed import-legacy`。
-*   **偏好报告**: `server.py` -> `generate_title_report` 写入 `web/preference_report.json`；前端 `web/report.js` 渲染。
+*   **命令行**: `paper_feed/cli.py`（`python -m paper_feed --help`）；备份 / 旧数据导入为 `backup` / `import-legacy` 子命令，环境自检为 `doctor`。
+*   **偏好报告**: `server.py` -> `generate_title_report` 写入 `web/preference_report.json`；前端 `web/report.js` 在 `web/insights.html#prefs` 渲染。
 *   **来源/期刊筛选跳转**: `web/app.js` -> `applyUrlFilters` 处理 `journal/source/q` 查询参数。
 *   **前端渲染**: `web/app.js` -> `renderList`。
 *   **调试页面**: `dev/`（不随 `web/` 发布）。

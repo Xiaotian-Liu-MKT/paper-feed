@@ -21,6 +21,7 @@ usage() {
   echo
   echo "Refresh may use the network, call OpenAI, and modify generated files."
   echo "Set PAPER_FEED_PORT to use a port other than 8000."
+  echo "More commands: .venv/bin/python -m paper_feed --help"
   exit 1
 }
 
@@ -40,56 +41,16 @@ if [ ! -x "$PYTHON" ]; then
   exit 1
 fi
 
-URL="http://127.0.0.1:$PORT"
+# The unified CLI does the work (`.venv/bin/python -m paper_feed --help`):
+#   run   = refresh RSS, then serve and open the browser
+#   start = serve existing local data and open the browser (no network)
+# Both reuse an already running Paper Feed on the port (just open it) and refuse
+# to start when another program holds the port.
+COMMAND=run
+if [ "$MODE" = "start" ]; then COMMAND=start; fi
 
-open_browser() {
-  target="$URL/?t=$(date +%s)"
-  if command -v open >/dev/null 2>&1 && [ "$(uname)" = "Darwin" ]; then
-    open "$target" >/dev/null 2>&1
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$target" >/dev/null 2>&1
-  else
-    echo "Open $target in your browser."
-  fi
-}
-
-# Detect an already running Paper Feed via its read-only interactions API.
-existing=0
-if command -v curl >/dev/null 2>&1; then
-  body=$(curl -fsS --max-time 2 "$URL/api/interactions" 2>/dev/null || true)
-  if [ -n "$body" ]; then
-    if printf '%s' "$body" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if all(isinstance(d.get(k), list) for k in ("favorites","archived","hidden")) else 1)' 2>/dev/null; then
-      existing=1
-    else
-      echo "Port $PORT is already in use by another program."
-      echo "Stop it, or choose another port: PAPER_FEED_PORT=8001 $0 $MODE"
-      exit 1
-    fi
-  fi
-fi
-
-echo "Starting Paper Feed Server..."
-echo "Open $URL in your browser."
-
+echo "Paper Feed: http://127.0.0.1:$PORT  (Ctrl+C stops the server)"
 if [ "$MODE" = "refresh" ]; then
-  echo
   echo "Refresh is the default and may access RSS networks, call OpenAI, and modify generated files."
-  echo "Running RSS refresh before opening Paper Feed..."
-  if ! "$PYTHON" "$ROOT/get_RSS.py"; then
-    echo
-    echo "Warning: Refresh did not publish new data (see the messages above)."
-    echo "Exit code 1 = every RSS source failed; 2 = journals.dat or keywords.dat is empty."
-    echo "Opening Paper Feed with the existing local data instead."
-    echo
-  fi
 fi
-
-if [ "$existing" = "1" ]; then
-  echo "Paper Feed is already running; opening it..."
-  open_browser
-  exit 0
-fi
-
-echo "Press Ctrl+C to stop."
-(sleep 2 && open_browser) &
-exec "$PYTHON" "$ROOT/server.py" --port "$PORT"
+exec "$PYTHON" -m paper_feed "$COMMAND" --port "$PORT"
