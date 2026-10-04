@@ -17,6 +17,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, unquote
 from paper_feed.ingestion import ingest_fetch_results, ensure_database, save_translations as save_db_translations, save_abstracts as save_db_abstracts
 from paper_feed.exporter import database_items, export_items
+from paper_feed.locks import LockBusyError, job_lock  # noqa: F401 (LockBusyError re-exported)
 
 # --- 配置区域 ---
 # All project files resolve relative to this file, never the current directory,
@@ -65,6 +66,14 @@ CODEX_TIMEOUT_SECONDS = 180
 CODEX_ANALYSIS_CHUNK_SIZE = 25
 CODEX_ANALYSIS_WORKERS = 2
 OPENAI_ANALYSIS_CHUNK_SIZE = 10
+# On-demand summaries: Codex batches several papers per `codex exec` (one
+# ~20k-token overhead per call); the OpenAI API keeps one paper per call.
+CODEX_SUMMARY_BATCH_SIZE = 8
+OPENAI_SUMMARY_BATCH_SIZE = 1
+CODEX_SUMMARY_WORKERS = 2
+# Extra Codex timeout per paper in a summary batch (on top of CODEX_TIMEOUT_SECONDS).
+CODEX_SUMMARY_SECONDS_PER_ITEM = 20
+TITLE_ONLY_PREFIX = "【基于标题推测，未读原文】"
 # Free abstract sources (no tokens): short timeouts, never raise to callers.
 ABSTRACT_HTTP_TIMEOUT = (5, 10)
 ABSTRACT_MIN_LENGTH = 100
@@ -604,18 +613,55 @@ def openalex_mailto(config=None):
     return value.strip() if is_usable_config_value(value) and isinstance(value, str) else None
 
 
+# Crossref's public pool allows one request at a time and about one per second
+# (x-concurrency-limit / x-rate-limit headers), so Crossref calls are serialized.
+_CROSSREF_LOCK = threading.Lock()
+_CROSSREF_MIN_INTERVAL = 1.0
+_crossref_last_call = [0.0]
+ABSTRACT_429_RETRIES = 2
+
+
+def _retry_after_seconds(response, attempt):
+    try:
+        value = float((getattr(response, "headers", None) or {}).get("Retry-After"))
+    except (TypeError, ValueError):
+        value = 2.0 * (attempt + 1)
+    return max(0.5, min(value, 10.0))
+
+
+def _abstract_http_get(url, source, params=None):
+    if source != "Crossref":
+        return requests.get(url, params=params, timeout=ABSTRACT_HTTP_TIMEOUT,
+                            headers={"User-Agent": ABSTRACT_USER_AGENT, "Accept": "application/json"})
+    with _CROSSREF_LOCK:
+        wait = _CROSSREF_MIN_INTERVAL - (time.monotonic() - _crossref_last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return requests.get(url, params=params, timeout=ABSTRACT_HTTP_TIMEOUT,
+                                headers={"User-Agent": ABSTRACT_USER_AGENT, "Accept": "application/json"})
+        finally:
+            _crossref_last_call[0] = time.monotonic()
+
+
 def _abstract_api_get(url, source, params=None, breaker=None):
-    """GET JSON from a free metadata API; returns dict or None and never raises."""
+    """GET JSON from a free metadata API; returns dict or None and never raises.
+
+    A 429 is retried (honouring Retry-After, capped) before it counts as a failure.
+    """
     if breaker is not None and breaker.is_open:
         return None
-    try:
-        response = requests.get(url, params=params, timeout=ABSTRACT_HTTP_TIMEOUT,
-                                headers={"User-Agent": ABSTRACT_USER_AGENT, "Accept": "application/json"})
-    except Exception as e:
-        print(f"{source} request failed: {type(e).__name__}: {e}")
-        if breaker is not None:
-            breaker.record_failure()
-        return None
+    for attempt in range(ABSTRACT_429_RETRIES + 1):
+        try:
+            response = _abstract_http_get(url, source, params)
+        except Exception as e:
+            print(f"{source} request failed: {type(e).__name__}: {e}")
+            if breaker is not None:
+                breaker.record_failure()
+            return None
+        if getattr(response, "status_code", None) != 429 or attempt == ABSTRACT_429_RETRIES:
+            break
+        time.sleep(_retry_after_seconds(response, attempt))
     status = getattr(response, "status_code", None)
     if status == 429 or (isinstance(status, int) and status >= 500):
         if breaker is not None:
@@ -634,6 +680,11 @@ def _abstract_api_get(url, source, params=None, breaker=None):
 
 def _usable_doi(doi):
     return bool(doi) and not str(doi).startswith('pii:')
+
+
+def is_elsevier_doi(doi):
+    """Elsevier (10.1016) does not deposit abstracts with Crossref, so that lookup is skipped."""
+    return str(doi or "").lower().startswith("10.1016/")
 
 
 def get_abstract_from_crossref(doi, breaker=None):
@@ -790,6 +841,146 @@ Provide a structured summary covering: 研究主题、可能的研究方法、�
             errors.append(f"{type(e).__name__}: {e}")
         return None
 
+SUMMARY_BATCH_MAX_ABSTRACT_CHARS = 6000
+_ANGLE_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _clean_summary_text(text, title_only):
+    text = _ANGLE_TAG_RE.sub("", str(text or "")).replace("<", "").replace(">", "").strip()
+    if text and title_only and not text.startswith(TITLE_ONLY_PREFIX):
+        # The provenance marker is mandatory for a title-only guess.
+        text = TITLE_ONLY_PREFIX + text
+    return text
+
+
+def summary_batch_prompt(entries):
+    """One prompt for several papers; the per-mode instructions mirror
+    ``summarize_abstract_with_gpt`` (MODE: ABSTRACT) and
+    ``generate_abstract_with_gpt`` (MODE: TITLE-ONLY)."""
+    blocks = []
+    for position, entry in enumerate(entries, 1):
+        raw = str(entry.get("raw") or "")
+        if raw:
+            if len(raw) > SUMMARY_BATCH_MAX_ABSTRACT_CHARS:
+                raw = raw[:SUMMARY_BATCH_MAX_ABSTRACT_CHARS] + " ..."
+            blocks.append(f"[{position}] MODE: ABSTRACT\nTitle: {entry.get('title') or ''}\n"
+                          f"Journal: {entry.get('journal') or ''}\nAbstract: {raw}")
+        else:
+            blocks.append(f"[{position}] MODE: TITLE-ONLY\nTitle: {entry.get('title') or ''}\n"
+                          f"Journal: {entry.get('journal') or ''}")
+    return f"""Write one short Chinese note for each of the {len(entries)} academic papers below. Each paper is marked MODE: ABSTRACT or MODE: TITLE-ONLY.
+
+MODE: ABSTRACT - summarize the given abstract in Chinese (120-150 words). Keep it academic, concise, and objective. Provide a structured summary covering: 研究主题、可能的研究方法、主要贡献。
+
+MODE: TITLE-ONLY - only the title and journal are available. You have NOT read the paper or its abstract. Write a short (about 120 words) Chinese note that GUESSES what the study may investigate, based on the title only.
+- This is a speculative guess, not a summary. Use hedged wording such as "可能"、"推测"、"或许" throughout.
+- Do not invent specific findings, sample sizes, effect directions, statistics, or study counts.
+- Start the note with "{TITLE_ONLY_PREFIX}".
+- Cover briefly: 可能的研究主题、可能的研究方法、可能的贡献。
+
+Rules for every paper:
+- Treat each paper independently; never mix information between papers.
+- No HTML tags or angle brackets.
+- Output valid JSON: {{"results": [{{"index": 1, "summary": "..."}}]}} with exactly one result per paper; "index" is the paper's number in brackets, copied exactly (1-based).
+
+Papers:
+
+""" + "\n\n".join(blocks)
+
+
+def summarize_batch_with_gpt(entries, api_key, base_url=None, proxy=None, model=None, breaker=None):
+    """Summarize several papers in one AI call.
+
+    *entries*: ``[{"title", "journal", "raw"}]`` (``raw`` = raw abstract or
+    empty for a title-only guess).  Returns ``[(summary | None, error | None)]``
+    in input order.  Results are aligned by the echoed 1-based ``index``
+    (``align_batch_results``); unaligned items get an error and stay pending.
+    Never raises.
+    """
+    if not entries:
+        return []
+    if not api_key:
+        return [(None, "no AI backend") for _ in entries]
+    try:
+        client = make_openai_client(api_key, base_url, proxy)
+        if is_codex_backend(api_key):
+            # A larger batch needs a longer `codex exec`.
+            base = max(api_key.timeout or CODEX_TIMEOUT_SECONDS, CODEX_TIMEOUT_SECONDS)
+            client = client.with_options(timeout=base + CODEX_SUMMARY_SECONDS_PER_ITEM * len(entries))
+        response = chat_completion_with_retry(
+            client,
+            breaker=breaker,
+            model=model or DEFAULT_OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a careful academic research assistant and a JSON-only API. "
+                                              "You write concise academic-style notes in Chinese; when information is "
+                                              "missing you say so and only speculate with explicit hedging."},
+                {"role": "user", "content": summary_batch_prompt(entries)},
+            ],
+            max_tokens=450 * len(entries),
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(strip_code_fences(response.choices[0].message.content or ""))
+    except Exception as e:
+        print(f"GPT batch summary error: {e}")
+        reason = f"{type(e).__name__}: {e}"
+        return [(None, reason) for _ in entries]
+    result_list = data.get("results", []) if isinstance(data, dict) else []
+    if not isinstance(result_list, list):
+        result_list = []
+    outcomes = [(None, "not returned by the model; left pending") for _ in entries]
+    for position, result in align_batch_results(list(range(len(entries))), result_list):
+        summary = result.get("summary") if isinstance(result, dict) else None
+        summary = _clean_summary_text(summary, not entries[position].get("raw")) if isinstance(summary, str) else ""
+        outcomes[position] = (summary, None) if summary else (None, "empty summary in batch response")
+    missing = sum(1 for summary, _ in outcomes if not summary)
+    if missing:
+        print(f"Warning: batch summary returned {len(result_list)} items for {len(entries)} papers; "
+              f"{missing} left pending.")
+    return outcomes
+
+
+def _summarize_one(entry, api_key, base_url, proxy, model, breaker):
+    errors = []
+    if entry.get("raw"):
+        summary = summarize_abstract_with_gpt(entry["raw"], entry.get("title"), api_key, base_url, proxy,
+                                              model=model, errors=errors, breaker=breaker)
+    else:
+        summary = generate_abstract_with_gpt(entry.get("title"), entry.get("journal"), api_key, base_url, proxy,
+                                             model=model, errors=errors, breaker=breaker)
+    return (summary, None) if summary else (None, errors[0] if errors else "empty response")
+
+
+def generate_summaries(entries, api_key, base_url=None, proxy=None, model=None, breaker=None):
+    """``[(summary | None, error | None)]`` for *entries* (see ``summarize_batch_with_gpt``).
+
+    Codex: ``CODEX_SUMMARY_BATCH_SIZE`` papers per call; OpenAI:
+    ``OPENAI_SUMMARY_BATCH_SIZE`` (1 = the per-paper prompts, sequentially).
+    A shared *breaker* stops the remaining calls after repeated timeouts.
+    """
+    codex = is_codex_backend(api_key)
+    size = max(1, CODEX_SUMMARY_BATCH_SIZE if codex else OPENAI_SUMMARY_BATCH_SIZE)
+    if size == 1:
+        return [_summarize_one(entry, api_key, base_url, proxy, model, breaker) for entry in entries]
+    chunks = [list(range(start, min(start + size, len(entries)))) for start in range(0, len(entries), size)]
+    outcomes = [(None, "not processed") for _ in entries]
+
+    def run(positions):
+        if len(positions) == 1:
+            return positions, [_summarize_one(entries[positions[0]], api_key, base_url, proxy, model, breaker)]
+        return positions, summarize_batch_with_gpt([entries[p] for p in positions], api_key, base_url, proxy,
+                                                   model=model, breaker=breaker)
+
+    workers = min(CODEX_SUMMARY_WORKERS if codex else AI_ANALYSIS_WORKERS, len(chunks)) or 1
+    print(f"Summarizing {len(entries)} papers in {len(chunks)} batch(es) of up to {size}...")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for positions, results in executor.map(run, chunks):
+            for position, outcome in zip(positions, results):
+                outcomes[position] = outcome
+    return outcomes
+
+
 def abstract_breakers():
     """One breaker per free source, shared by every lookup of a job."""
     return {source: CircuitBreaker(ABSTRACT_SOURCE_BREAKER_THRESHOLD, source) for source in FETCHED_ABSTRACT_SOURCES}
@@ -804,6 +995,39 @@ def entry_doi(entry):
             return doi
     doi = extract_doi(entry.get('link') or '', entry.get('id') or '')
     return doi if _usable_doi(doi) else None
+
+
+PII_BATCH_SIZE = 20
+
+
+def resolve_dois_from_piis(piis, breaker=None):
+    """{PII (upper-case): DOI} for Elsevier PIIs via Crossref's alternative-id filter.
+
+    ScienceDirect links carry only a PII.  Repeated filters are OR-ed, so one
+    request resolves up to PII_BATCH_SIZE PIIs.  A PII matched by more than
+    one work is ambiguous and dropped.  Never raises.
+    """
+    from paper_feed.identity import normalize_doi
+    wanted = list(dict.fromkeys(str(pii).upper() for pii in piis if pii))
+    resolved, seen = {}, {}
+    for start in range(0, len(wanted), PII_BATCH_SIZE):
+        chunk = wanted[start:start + PII_BATCH_SIZE]
+        data = _abstract_api_get("https://api.crossref.org/works", "Crossref", breaker=breaker, params={
+            "filter": ",".join(f"alternative-id:{pii}" for pii in chunk),
+            "rows": len(chunk) * 2, "select": "DOI,alternative-id"})
+        for item in ((data or {}).get("message") or {}).get("items") or []:
+            doi = normalize_doi(item.get("DOI"))
+            for alt in item.get("alternative-id") or []:
+                key = str(alt).upper()
+                if doi and key in chunk:
+                    seen[key] = seen.get(key, 0) + 1
+                    resolved[key] = doi
+    return {pii: doi for pii, doi in resolved.items() if seen.get(pii) == 1}
+
+
+def resolve_doi_from_pii(pii, breaker=None):
+    """DOI for one Elsevier PII (see resolve_dois_from_piis).  Never raises."""
+    return resolve_dois_from_piis([pii], breaker=breaker).get(str(pii or "").upper())
 
 
 def fetch_abstract_with_fallback(entry, api_key=None, base_url=None, proxy=None, *,
@@ -822,8 +1046,9 @@ def fetch_abstract_with_fallback(entry, api_key=None, base_url=None, proxy=None,
         breakers = breakers or {}
         lookups = []
         if doi:
-            lookups = [
-                ('crossref', lambda: get_abstract_from_crossref(doi, breaker=breakers.get('crossref'))),
+            lookups = [] if is_elsevier_doi(doi) else [
+                ('crossref', lambda: get_abstract_from_crossref(doi, breaker=breakers.get('crossref')))]
+            lookups += [
                 ('openalex', lambda: get_abstract_from_openalex(doi, mailto=mailto, breaker=breakers.get('openalex'))),
                 ('semantic_scholar', lambda: get_abstract_from_semantic_scholar(title, doi=doi, breaker=breakers.get('semantic_scholar'))),
             ]
@@ -1729,6 +1954,22 @@ def analyze_database_items(database, items, config=None, report=None):
 def _database_path():
     return ensure_database(BASE_DIR, os.environ.get("PAPER_FEED_DB") or None)
 
+
+def locked_flow(kind):
+    """Run a mutating flow under the cross-process ``job_lock`` (raises LockBusyError).
+
+    The lock is re-entrant within a thread, so a locked flow may call another.
+    """
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with job_lock(kind):
+                return func(*args, **kwargs)
+        return wrapper
+    return decorate
+
+
+@locked_flow("refresh")
 def run_rss_flow():
     # 请确保这里的调用参数与你目前的 secrets 配置一致
     rss_urls = load_config(JOURNALS_FILE, 'RSS_JOURNALS')
@@ -1824,6 +2065,7 @@ def run_rss_flow():
         "errors": report["errors"],
     }
 
+@locked_flow("reanalyze")
 def run_reanalysis_flow():
     """Reanalyse the durable store and regenerate compatibility exports from it."""
     print("Starting AI Re-analysis...")
@@ -1869,28 +2111,47 @@ def _fetch_raw_abstracts(database, items, config=None):
 
     Never calls the AI model and never raises; nothing is saved here.
     """
-    from paper_feed.ingestion import paper_dois
+    from paper_feed.ingestion import paper_dois, paper_piis, save_resolved_dois
     stats = {"fetched": 0, "failed": 0, "skipped": 0}
+    ids = [item["paper_id"] for item in items]
     try:
-        dois = paper_dois(database, [item["paper_id"] for item in items])
+        dois = paper_dois(database, ids)
+        piis = paper_piis(database, ids)
     except Exception as e:
-        print(f"Could not read stored DOIs: {e}")
-        dois = {}
+        print(f"Could not read stored identifiers: {e}")
+        dois, piis = {}, {}
+    breakers = abstract_breakers()
     jobs = []
+    pii_only = []
     for item in items:
         if existing_raw_abstract(item):
             stats["skipped"] += 1
             continue
         doi = dois.get(item["paper_id"]) or entry_doi(item)
-        if not doi:
+        if doi:
+            jobs.append((item, doi))
+        elif piis.get(item["paper_id"]):
+            pii_only.append(item)
+        else:
             stats["skipped"] += 1
-            continue
-        jobs.append((item, doi))
+    if pii_only:
+        print(f"Resolving {len(pii_only)} ScienceDirect PIIs to DOIs via Crossref...")
+        by_pii = resolve_dois_from_piis([piis[item["paper_id"]] for item in pii_only], breaker=breakers.get('crossref'))
+        resolved = [by_pii.get(piis[item["paper_id"]].upper()) for item in pii_only]
+        found = {item["paper_id"]: doi for item, doi in zip(pii_only, resolved) if doi}
+        try:
+            save_resolved_dois(database, found)
+        except Exception as e:
+            print(f"Could not save resolved DOIs: {e}")
+        for item, doi in zip(pii_only, resolved):
+            if doi:
+                jobs.append((item, doi))
+            else:
+                stats["failed"] += 1
     payloads = {}
     if not jobs:
         return payloads, stats
     mailto = openalex_mailto(config)
-    breakers = abstract_breakers()
     print(f"Looking up {len(jobs)} abstracts (Crossref -> OpenAlex -> Semantic Scholar)...")
 
     def lookup(job):
@@ -1924,6 +2185,7 @@ def _resolve_items(database, references):
     return resolved
 
 
+@locked_flow("fetch_abstracts")
 def fetch_missing_abstracts(paper_ids=None, view='favorite'):
     """Fetch raw abstracts for free (Crossref -> OpenAlex -> Semantic Scholar); no AI, no tokens.
 
@@ -1950,6 +2212,7 @@ def fetch_missing_abstracts(paper_ids=None, view='favorite'):
             "skipped": stats["skipped"], "errors": []}
 
 
+@locked_flow("summarize")
 def summarize_specific_papers(target_ids):
     """Summarize requested durable records, then regenerate compatibility exports.
 
@@ -1980,31 +2243,29 @@ def summarize_specific_papers(target_ids):
     breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "Codex CLI" if ai["backend"] == "codex" else "OpenAI endpoint")
     report = {"failed": 0, "errors": []}
     updates = {}
+    entries = []
     for item in pending:
         existing = item.get("abstract") or {}
         fetched = fetched_payloads.get(item["paper_id"])
         raw = existing_raw_abstract(item) or (fetched or {}).get("raw_abstract")
         raw_source = existing.get("source") if existing_raw_abstract(item) else (fetched or {}).get("source")
-        call_errors = []
-        if raw:
-            summary = summarize_abstract_with_gpt(raw, item["title"], api_key, ai["base_url"], ai["proxy"],
-                                                  model=model, errors=call_errors, breaker=breaker)
-            source = "gpt_summarized"
-        else:
-            summary = generate_abstract_with_gpt(item["title"], item["journal"], api_key, ai["base_url"], ai["proxy"],
-                                                 model=model, errors=call_errors, breaker=breaker)
-            source = "gpt_generated"
+        entries.append({"title": item.get("title") or "", "journal": item.get("journal") or "",
+                        "raw": raw, "raw_source": raw_source})
+    # Batched for Codex (one `codex exec` per CODEX_SUMMARY_BATCH_SIZE papers).
+    outcomes = generate_summaries(entries, api_key, ai["base_url"], ai["proxy"], model=model, breaker=breaker)
+    for item, entry, (summary, reason) in zip(pending, entries, outcomes):
+        raw = entry["raw"]
         if summary:
-            payload = {"abstract": summary, "source": source, "fetched_at": datetime.datetime.now().isoformat()}
+            payload = {"abstract": summary, "source": "gpt_summarized" if raw else "gpt_generated",
+                       "fetched_at": datetime.datetime.now().isoformat()}
             if raw:
                 payload["raw_abstract"] = raw
-                if raw_source:
-                    payload["raw_source"] = raw_source
+                if entry["raw_source"]:
+                    payload["raw_source"] = entry["raw_source"]
             updates[item["paper_id"]] = payload
         else:
             report["failed"] += 1
-            reason = call_errors[0] if call_errors else "empty response"
-            add_error(report, f"{(item.get('title') or '')[:60]}: {reason}")
+            add_error(report, f"{(item.get('title') or '')[:60]}: {reason or 'empty response'}")
     # save_abstracts never replaces a user_provided abstract edited meanwhile.
     updated_count = save_db_abstracts(database, updates)
     # Summarizing selected papers must regenerate the complete durable history,

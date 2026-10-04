@@ -138,7 +138,9 @@
 *   `POST /api/reanalyze`: 后台 job：标题 AI 重新分析。
 *   `POST /api/summarize_favorites`: 后台 job：对收藏按需生成 AI 总结（先按 DOI 免费抓取缺失的原始摘要）。
 *   `GET /api/summarize_favorites/pending`: `{pending, total_favorites}`，前端确认框显示真实待处理数。
-*   `GET /api/jobs` / `GET /api/jobs/<job_id>`: 最近任务列表 / 单个任务状态（可能为 `partial_failed`，结果含 `failed` 与 `errors`）。
+*   `POST /api/fetch_abstracts`: 后台 job（kind `fetch_abstracts`，同 kind 去重）：`get_RSS.fetch_missing_abstracts(view=...)` 按 DOI 免费抓取原始摘要，不调用 AI。请求体可选 `{"view": "favorite"|"all"|"inbox"|"archived"}`（默认 `favorite`，其他值 400）；返回 202 `{job, duplicate, view}`；job 结果 `{status, message, fetched, failed, skipped, errors}`。
+*   `GET /api/fetch_abstracts/pending?view=favorite`: `{view, total, pending, with_doi}`（视图内论文数 / 缺原始摘要数 / 其中有 DOI、可抓取的数量）。
+*   `GET /api/jobs` / `GET /api/jobs/<job_id>`: 最近任务列表 / 单个任务状态（可能为 `partial_failed`，结果含 `failed` 与 `errors`）。任务锁被占用时 job 为 `failed`，`message` 为“另一个任务正在运行（kind, pid）/ Another Paper Feed task is running …”，`result = {status: "error", error: "lock_busy", holder, ...}`。
 *   `POST /api/update_abstract`: 按 `paper_id` 保存用户补充摘要。
 *   `POST /api/update_classification`: 按 `paper_id` 保存用户分类修正。
 *   `GET/POST /api/categories`: 读写分类体系。
@@ -153,7 +155,11 @@
 2.  **按需总结阶段**: 用户点击“生成 AI 总结”时：
     *   **已有摘要**: 若数据库已有原始摘要（含用户手动补充），AI 基于摘要总结 (`gpt_summarized`)。
     *   **无摘要**: AI 基于标题生成研究方向预测 (`gpt_generated`)。
-    *   **外部抓取**: 按需总结前，对缺少原始摘要且有 DOI 的论文依次查询 Crossref → OpenAlex → Semantic Scholar（免费，`abstract_source` = `crossref`/`openalex`/`semantic_scholar`；可选 `OPENALEX_MAILTO`）。无 API Key 时仍会抓取原始摘要，仅跳过 AI。RSS 刷新流程**不**抓取摘要。用户补充的摘要不会被任务覆盖。
+    *   **外部抓取**: 按需总结前，对缺少原始摘要且有 DOI 的论文依次查询 Crossref → OpenAlex → Semantic Scholar（免费，`abstract_source` = `crossref`/`openalex`/`semantic_scholar`；可选 `OPENALEX_MAILTO`）。无 API Key 时仍会抓取原始摘要，仅跳过 AI。RSS 刷新流程**不**抓取摘要。用户补充的摘要不会被任务覆盖。只有 ScienceDirect PII 的论文先经 Crossref `alternative-id` 批量解析 DOI（每次 20 个）并存为 `doi` 标识；Elsevier（`10.1016/`）DOI 跳过 Crossref 摘要查询（Elsevier 不向 Crossref 提供摘要）。Crossref 公共池限 1 并发 / 1 次每秒，请求已串行节流，429 按 `Retry-After` 重试。
+    *   **批处理**: `summarize_specific_papers` → `generate_summaries`：Codex 后端每次调用合并 `CODEX_SUMMARY_BATCH_SIZE`（8）篇（`summarize_batch_with_gpt`，每篇标注 `MODE: ABSTRACT`/`MODE: TITLE-ONLY`，沿用单篇提示词要求；JSON `{"results":[{"index","summary"}]}` 经 `align_batch_results` 按 1-based index 对齐；超时 = `CODEX_TIMEOUT_SECONDS` + 20 s×篇数；共享熔断器）。OpenAI 后端 `OPENAI_SUMMARY_BATCH_SIZE = 1`，仍逐篇调用 `summarize_abstract_with_gpt` / `generate_abstract_with_gpt`。未对齐的论文保持待总结并计入 `failed`/`errors`。
+
+### 5.1 跨进程任务锁 (`paper_feed/locks.py`)
+`run_rss_flow` / `run_reanalysis_flow` / `summarize_specific_papers` / `fetch_missing_abstracts` 均经 `get_RSS.locked_flow` 持有 `job_lock(kind)`：锁文件 `data/.paper_feed.lock`（`PAPER_FEED_DB` 所在目录），`O_CREAT|O_EXCL` 创建，内容 `{pid, kind, started_at, host}`。同一线程可重入（流程互相调用不死锁），同进程其他线程与其他进程得到 `LockBusyError`；同主机 pid 已退出或超过 6 小时的锁会被回收。CLI 打印双语提示并退出 1（`run` 仍会打开已有数据）；服务端 job 以 `failed` 结束。
 
 ## 6. 后期更新指导
 

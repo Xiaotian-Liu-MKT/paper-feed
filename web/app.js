@@ -14,7 +14,15 @@ const state = {
   visibleLimit: 40,
   listCursor: 0,
   pendingJournal: "",
+  pendingFilterSelections: null, // { methods, topics } restored before categories load
   urlFiltersApplied: false,
+  // A jump from 洞察 (?journal=…&from=insights) applies its filters for this
+  // page load only; persisted filters / mode / positions are left untouched.
+  transientUiState: false,
+  restoredPositions: null, // { views, swipePaperId } read once at startup
+  positionRestored: false,
+  positionPending: false, // a view switch happened; its saved position is not restored yet
+  fetchAbstractsAvailable: null, // null = unknown, false = server lacks the endpoint
   preset: "",
   focusTopics: [],
   categories: {
@@ -56,10 +64,13 @@ const elements = {
 };
 
 const PAGE_SIZE = 40;
-// The undo history is kept until the view changes; it is bounded so a long
-// triage session does not retain unbounded paper objects.
-const MAX_UNDO_STACK_SIZE = 20;
+// The undo history survives view / mode switches (records target paper_id);
+// it is bounded so a long triage session does not retain unbounded objects.
+const MAX_UNDO_STACK_SIZE = 50;
 const UI_STATE_KEY = "paper-feed:ui-state";
+const ABSTRACT_DRAFTS_KEY = "paper-feed:abstract-drafts";
+const VIEW_LABELS = { all: "待筛选", favorites: "收藏", archived: "归档", hidden: "已隐藏", everything: "全部" };
+const VIEW_OF_REVIEW_STATE = { inbox: "all", favorite: "favorites", archived: "archived", hidden: "hidden" };
 const VIEW_MODES = ["all", "favorites", "archived", "hidden", "everything"];
 
 const formatter = new Intl.DateTimeFormat("zh-CN", {
@@ -84,7 +95,8 @@ function updateCountLabel() {
   if (elements.countLabel) elements.countLabel.textContent = `共 ${state.filtered.length} 篇`;
 }
 
-function showToast(message, type = "info", timeoutMs = 6000) {
+// `action` = { label, onClick } adds a button that runs onClick and closes the toast.
+function showToast(message, type = "info", timeoutMs = 6000, action = null) {
   const container = document.getElementById("toastContainer");
   if (!container) return;
   const toast = document.createElement("div");
@@ -92,13 +104,22 @@ function showToast(message, type = "info", timeoutMs = 6000) {
   toast.setAttribute("role", type === "error" ? "alert" : "status");
   const text = document.createElement("span");
   text.textContent = message;
+  toast.appendChild(text);
+  if (action && action.label && typeof action.onClick === "function") {
+    const actionButton = document.createElement("button");
+    actionButton.type = "button";
+    actionButton.className = "toast__action";
+    actionButton.textContent = action.label;
+    actionButton.onclick = () => { toast.remove(); action.onClick(); };
+    toast.appendChild(actionButton);
+  }
   const close = document.createElement("button");
   close.type = "button";
   close.className = "toast__close";
   close.textContent = "✕";
   close.setAttribute("aria-label", "关闭提示");
   close.onclick = () => toast.remove();
-  toast.append(text, close);
+  toast.appendChild(close);
   container.appendChild(toast);
   if (timeoutMs) setTimeout(() => toast.remove(), timeoutMs);
 }
@@ -302,6 +323,7 @@ function reinsertItem(item, index) {
 }
 
 function pushUndo(record) {
+  if (!record.view) record.view = state.filterMode;
   state.undoStack.push(record);
   if (state.undoStack.length > MAX_UNDO_STACK_SIZE) state.undoStack.shift();
   renderUndoStack();
@@ -385,7 +407,9 @@ function renderUndoStack() {
   const bar = document.createElement("div");
   bar.className = "undo-bar";
   const message = document.createElement("span");
-  message.textContent = state.undoStack.length > 1 ? `${undoMessage(record.action)} · ${state.undoStack.length} 项可撤销` : undoMessage(record.action);
+  const origin = record.view && record.view !== state.filterMode && VIEW_LABELS[record.view] ? `（在“${VIEW_LABELS[record.view]}”视图）` : "";
+  const text = `${undoMessage(record.action)}${origin}`;
+  message.textContent = state.undoStack.length > 1 ? `${text} · ${state.undoStack.length} 项可撤销` : text;
   const button = document.createElement("button");
   button.type = "button";
   button.className = "undo-btn";
@@ -463,6 +487,9 @@ function undoLastInteraction() {
   const record = state.undoStack.pop();
   if (!record) return clearUndoBar();
   setSwipeBusy(true, "正在保存撤销…");
+  // Records may predate a feed reload; prefer the live object for this paper_id.
+  const liveItem = state.items.find((candidate) => paperKey(candidate) === record.id);
+  if (liveItem) record.item = liveItem;
   const stateBeforeUndo = reviewStateOf(record.id);
   applyInteractionAction(record.id, record.undoAction);
   reinsertItem(record.item, record.index);
@@ -472,6 +499,7 @@ function undoLastInteraction() {
   renderUndoStack();
   saveInteraction(record.item, record.undoAction).then(() => {
     setStatus("已撤销。");
+    notifyUndoElsewhere(record);
   }).catch((error) => {
     applyInteractionAction(record.id, actionToReach(stateBeforeUndo, record.undoAction));
     const sets = interactionSets();
@@ -484,6 +512,31 @@ function undoLastInteraction() {
     setStatus(`撤销未保存，已恢复原状态：${error.message}`);
     showToast(`撤销失败，已恢复原状态：${error.message}`, "error");
   }).finally(() => { setSwipeBusy(false); });
+}
+
+// After undoing a decision made in another view, the paper may not be visible
+// here; say where it went and offer to jump there.
+function undoTargetView(record) {
+  if (!record || belongsToView(record.id)) return null;
+  return VIEW_OF_REVIEW_STATE[reviewStateOf(record.id)] || null;
+}
+
+function notifyUndoElsewhere(record) {
+  const target = undoTargetView(record);
+  if (!target) return null;
+  const title = truncateText((record.item && record.item.title) || "未命名论文", 60);
+  const message = `已撤销：${title}（现在位于“${VIEW_LABELS[target]}”视图）`;
+  setStatus(message);
+  showToast(message, "info", 8000, {
+    label: `前往${VIEW_LABELS[target]}`,
+    onClick: () => {
+      if (state.swipeBusy) return;
+      setFilterMode(target);
+      applyFilters();
+      restoreViewPosition();
+    }
+  });
+  return target;
 }
 
 function toggleArchive(item) {
@@ -972,6 +1025,7 @@ function renderSwipeDeck() {
   elements.list.textContent = "";
   elements.list.classList.add("grid--swipe");
   const item = currentSwipeItem();
+  if (item) rememberSwipePosition(item);
   if (!item) {
     const empty = document.createElement("div");
     empty.className = "swipe-empty";
@@ -1115,6 +1169,64 @@ function attachSwipeGesture(card, titleLink) {
       suppressClick = false;
     }
   }, true);
+}
+
+// --- Abstract edit drafts ---
+// The inline editor is rebuilt on every renderList(); drafts keyed by
+// paper_id (mirrored to localStorage) reopen it with the typed text.
+// A draft exists exactly while its editor is open.  `base` is the prefill,
+// so an untouched editor does not count as unsaved work.
+const abstractDrafts = loadAbstractDrafts();
+
+function loadAbstractDrafts() {
+  const drafts = new Map();
+  try {
+    const parsed = JSON.parse(safeStorageGet(ABSTRACT_DRAFTS_KEY) || "null");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      Object.entries(parsed).forEach(([key, draft]) => {
+        if (key && draft && typeof draft.text === "string") {
+          drafts.set(key, { text: draft.text, base: typeof draft.base === "string" ? draft.base : "" });
+        }
+      });
+    }
+  } catch (_) { /* corrupt drafts are dropped */ }
+  return drafts;
+}
+
+function persistAbstractDrafts() {
+  safeStorageSet(ABSTRACT_DRAFTS_KEY, JSON.stringify(Object.fromEntries(abstractDrafts)));
+}
+
+function setAbstractDraft(key, text, base) {
+  if (!key) return;
+  const previous = abstractDrafts.get(key);
+  abstractDrafts.set(key, { text: String(text || ""), base: base !== undefined ? String(base || "") : (previous ? previous.base : "") });
+  persistAbstractDrafts();
+}
+
+function clearAbstractDraft(key) {
+  if (!abstractDrafts.delete(key)) return;
+  persistAbstractDrafts();
+}
+
+function hasUnsavedAbstractDrafts() {
+  return Array.from(abstractDrafts.values()).some((draft) => draft.text.trim() && draft.text !== draft.base);
+}
+
+function setupDraftUnloadWarning() {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+  window.addEventListener("beforeunload", (event) => {
+    if (!hasUnsavedAbstractDrafts()) return;
+    event.preventDefault();
+    event.returnValue = "有尚未保存的摘要草稿。";
+  });
+}
+
+function abstractPrefill(item) {
+  if (item.raw_abstract) return item.raw_abstract;
+  // A title-only guess is not source material: let the user paste the real one.
+  if (item.abstract_source === "gpt_generated") return "";
+  return item.abstract || "";
 }
 
 function renderList() {
@@ -1324,35 +1436,35 @@ function renderList() {
       editError.hidden = !message;
     };
 
+    const draftKey = paperKey(item);
+    const draft = draftKey ? abstractDrafts.get(draftKey) : null;
+    if (draft) {
+        // Reopen an editor that a re-render (filter, job reload, …) closed.
+        editArea.style.display = "block";
+        textarea.value = draft.text;
+    }
+    textarea.addEventListener("input", () => setAbstractDraft(draftKey, textarea.value));
+
     btnEdit.onclick = function(e) {
         e.preventDefault();
         // Toggle visibility
         if (editArea.style.display === "none") {
             editArea.style.display = "block";
             showEditError("");
-
-            // Intelligent pre-fill
-            let prefillValue = "";
-            if (item.raw_abstract) {
-                prefillValue = item.raw_abstract;
-            } else if (item.abstract_source === "gpt_generated") {
-                // If it was generated from title only, don't prefill the "fake" summary.
-                // Let user paste the real one.
-                prefillValue = "";
-            } else {
-                // Fallback to whatever is current
-                prefillValue = item.abstract || "";
-            }
-
+            // Prefer the raw source material over AI output.
+            const prefillValue = abstractPrefill(item);
             textarea.value = prefillValue;
+            setAbstractDraft(draftKey, prefillValue, prefillValue);
             textarea.focus();
         } else {
             editArea.style.display = "none";
+            clearAbstractDraft(draftKey);
         }
     };
 
     btnCancel.onclick = function() {
         editArea.style.display = "none";
+        clearAbstractDraft(draftKey);
     };
 
     btnSave.onclick = async function() {
@@ -1380,6 +1492,7 @@ function renderList() {
                 item.abstract = newText;
                 item.raw_abstract = newText; // Also update raw so next edit shows this
                 item.abstract_source = newText ? "user_provided" : "";
+                clearAbstractDraft(draftKey);
                 setStatus(newText ? "摘要已保存。" : "摘要已清除。");
                 rerenderPreservingScroll();
             } else {
@@ -1731,23 +1844,148 @@ function renderFilterChips() {
   });
 }
 
-function saveUiState() {
-  safeStorageSet(UI_STATE_KEY, JSON.stringify({
+// Persisted UI state (localStorage, best effort):
+//   filters / view / mode / sort / 显示摘要  -> saveUiState (on every applyFilters)
+//   views[viewStateKey] = { scroll, limit } -> rememberViewPosition (throttled scroll)
+//   swipePaperId (current card, by paper_id) -> rememberSwipePosition
+// While state.transientUiState is set (URL jump from 洞察) nothing is written.
+
+function readStoredUiState() {
+  try {
+    const parsed = JSON.parse(safeStorageGet(UI_STATE_KEY) || "null");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeUiState(patch) {
+  if (state.transientUiState) return false;
+  safeStorageSet(UI_STATE_KEY, JSON.stringify({ ...readStoredUiState(), ...patch }));
+  return true;
+}
+
+function viewStateKey(mode = state.filterMode, inboxMode = state.inboxViewMode) {
+  return mode === "all" ? `all:${inboxMode}` : mode;
+}
+
+function collectUiState() {
+  // Until categories load, the checkboxes do not exist yet: keep the restored selection.
+  const pending = state.pendingFilterSelections;
+  return {
     search: elements.searchInput ? elements.searchInput.value : "",
     journal: elements.journalSelect ? elements.journalSelect.value : "",
     tab: state.filterMode,
-    mode: state.inboxViewMode
-  }));
+    mode: state.inboxViewMode,
+    methods: pending ? pending.methods : getSelectedFilterValues(elements.filterMethod),
+    topics: pending ? pending.topics : getSelectedFilterValues(elements.filterTopic),
+    methodMode: elements.filterMethodMode ? elements.filterMethodMode.value : "any",
+    topicMode: elements.filterTopicMode ? elements.filterTopicMode.value : "any",
+    preset: elements.filterPreset ? elements.filterPreset.value : "",
+    fromDate: elements.fromDate ? elements.fromDate.value : "",
+    toDate: elements.toDate ? elements.toDate.value : "",
+    sort: elements.sortSelect ? elements.sortSelect.value : "desc",
+    showSummary: elements.summaryToggle ? Boolean(elements.summaryToggle.checked) : true
+  };
+}
+
+function saveUiState() {
+  return writeUiState(collectUiState());
+}
+
+const DATE_INPUT_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function stringList(value) {
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === "string" && entry) : [];
 }
 
 function restoreUiState() {
-  let saved = null;
-  try { saved = JSON.parse(safeStorageGet(UI_STATE_KEY) || "null"); } catch (_) { saved = null; }
-  if (!saved || typeof saved !== "object") return;
+  const saved = readStoredUiState();
   if (VIEW_MODES.includes(saved.tab)) state.filterMode = saved.tab;
   if (saved.mode === "swipe" || saved.mode === "list") state.inboxViewMode = saved.mode;
   if (typeof saved.search === "string" && elements.searchInput) elements.searchInput.value = saved.search;
   if (typeof saved.journal === "string") state.pendingJournal = saved.journal;
+  const methods = stringList(saved.methods);
+  const topics = stringList(saved.topics);
+  state.pendingFilterSelections = methods.length || topics.length ? { methods, topics } : null;
+  if (elements.filterMethodMode && (saved.methodMode === "any" || saved.methodMode === "all")) elements.filterMethodMode.value = saved.methodMode;
+  if (elements.filterTopicMode && (saved.topicMode === "any" || saved.topicMode === "all")) elements.filterTopicMode.value = saved.topicMode;
+  if (elements.filterPreset && typeof saved.preset === "string") elements.filterPreset.value = saved.preset;
+  if (elements.fromDate && (saved.fromDate === "" || DATE_INPUT_PATTERN.test(saved.fromDate || ""))) elements.fromDate.value = saved.fromDate;
+  if (elements.toDate && (saved.toDate === "" || DATE_INPUT_PATTERN.test(saved.toDate || ""))) elements.toDate.value = saved.toDate;
+  if (elements.sortSelect && (saved.sort === "asc" || saved.sort === "desc")) elements.sortSelect.value = saved.sort;
+  if (elements.summaryToggle && typeof saved.showSummary === "boolean") elements.summaryToggle.checked = saved.showSummary;
+  const views = saved.views && typeof saved.views === "object" && !Array.isArray(saved.views) ? saved.views : {};
+  state.restoredPositions = { views, swipePaperId: typeof saved.swipePaperId === "string" ? saved.swipePaperId : "" };
+}
+
+// Records the scroll offset and "加载更多" depth of the current list view.
+function rememberViewPosition() {
+  if (!state.positionRestored || state.positionPending || state.transientUiState || typeof window === "undefined") return false;
+  if (shouldUseSwipeDeck()) return false;
+  const stored = readStoredUiState();
+  const views = stored.views && typeof stored.views === "object" && !Array.isArray(stored.views) ? stored.views : {};
+  views[viewStateKey()] = { scroll: Math.max(0, Math.round(window.scrollY || 0)), limit: state.visibleLimit };
+  return writeUiState({ views });
+}
+
+function rememberSwipePosition(item) {
+  if (!state.positionRestored || state.positionPending || state.transientUiState) return false;
+  const id = paperKey(item) || "";
+  if (readStoredUiState().swipePaperId === id) return false;
+  return writeUiState({ swipePaperId: id });
+}
+
+// Restores pagination + scroll (list) or the current card (swipe) for the
+// current view.  At startup it uses the values read before the first render.
+function restoreViewPosition() {
+  const startup = !state.positionRestored;
+  const source = startup ? (state.restoredPositions || {}) : readStoredUiState();
+  state.positionRestored = true;
+  state.positionPending = false;
+  if (state.transientUiState) return false;
+  if (shouldUseSwipeDeck()) {
+    const wanted = typeof source.swipePaperId === "string" ? source.swipePaperId : "";
+    const index = wanted ? state.filtered.findIndex((item) => paperKey(item) === wanted) : -1;
+    if (index > 0) {
+      state.swipeIndex = index;
+      renderList();
+    }
+    rememberSwipePosition(currentSwipeItem());
+    return index >= 0;
+  }
+  const views = source.views && typeof source.views === "object" ? source.views : {};
+  const saved = views[viewStateKey()];
+  if (!saved || typeof saved !== "object") return false;
+  const limit = Number(saved.limit);
+  if (Number.isFinite(limit) && limit > state.visibleLimit) {
+    state.visibleLimit = Math.max(PAGE_SIZE, Math.min(limit, Math.ceil(state.filtered.length / PAGE_SIZE) * PAGE_SIZE));
+    renderList();
+  }
+  const scroll = Number(saved.scroll);
+  if (Number.isFinite(scroll) && scroll > 0 && typeof window !== "undefined" && typeof window.scrollTo === "function") {
+    window.scrollTo(0, scroll);
+    // Layout may settle a frame later (fonts, badges); retry once.
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(() => window.scrollTo(0, scroll));
+  }
+  return true;
+}
+
+let scrollSaveTimer = null;
+
+function setupPositionTracking() {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+  try {
+    if (window.history && "scrollRestoration" in window.history) window.history.scrollRestoration = "manual";
+  } catch (_) { /* optional */ }
+  window.addEventListener("scroll", () => {
+    if (scrollSaveTimer) return;
+    scrollSaveTimer = setTimeout(() => {
+      scrollSaveTimer = null;
+      rememberViewPosition();
+    }, 300);
+  }, { passive: true });
+  window.addEventListener("pagehide", () => rememberViewPosition());
 }
 
 // Reflects state.filterMode / state.inboxViewMode on the tab and toggle buttons.
@@ -1768,13 +2006,20 @@ function syncViewControls() {
   const showFavoriteTools = state.filterMode === "favorites";
   const summarize = document.getElementById("btnSummarizeFavorites");
   const exportRis = document.getElementById("btnExportFavorites");
+  const fetchAbstracts = document.getElementById("btnFetchAbstracts");
   if (summarize) summarize.hidden = !showFavoriteTools;
   if (exportRis) exportRis.hidden = !showFavoriteTools;
+  if (fetchAbstracts) fetchAbstracts.hidden = !showFavoriteTools || state.fetchAbstractsAvailable === false;
+  if (showFavoriteTools) probeFetchAbstracts();
 }
 
+// The undo history is deliberately kept across view / mode switches.
 function setFilterMode(mode) {
   if (!VIEW_MODES.includes(mode)) return;
-  if (mode !== state.filterMode) clearUndoBar({ clearStack: true });
+  if (mode !== state.filterMode) {
+    rememberViewPosition();
+    state.positionPending = true; // until restoreViewPosition() for the new view
+  }
   state.filterMode = mode;
   state.swipeIndex = 0;
   syncViewControls();
@@ -1782,7 +2027,10 @@ function setFilterMode(mode) {
 
 function setInboxViewMode(mode) {
   if (mode !== "swipe" && mode !== "list") return;
-  if (mode !== state.inboxViewMode) clearUndoBar({ clearStack: true });
+  if (mode !== state.inboxViewMode) {
+    rememberViewPosition();
+    state.positionPending = true;
+  }
   state.inboxViewMode = mode;
   state.swipeIndex = 0;
   syncViewControls();
@@ -1847,6 +2095,9 @@ function applyUrlFilters() {
   // Arriving with an explicit filter means "show me the matching papers",
   // which the one-at-a-time swipe deck cannot do.
   if (applied) setInboxViewMode("list");
+  // A jump from 洞察 is for this page load only: never persist it over the
+  // user's saved filters / mode / positions.
+  if (applied || fromParam) state.transientUiState = true;
 
   // from=insights（旧链接 report / stats 同样接受）显示返回洞察页的链接；
   // 洞察页会记住上次打开的标签，旧值则直接回到对应标签。
@@ -2066,8 +2317,11 @@ function appendField(container, label, value, highlightTerms) {
 }
 
 function renderFilterOptions() {
+  // Selections restored from localStorage are applied once the categories exist.
+  const restored = state.pendingFilterSelections;
+  state.pendingFilterSelections = null;
   if (elements.filterMethod) {
-    const selected = new Set(getSelectedFilterValues(elements.filterMethod));
+    const selected = new Set(restored ? restored.methods : getSelectedFilterValues(elements.filterMethod));
     elements.filterMethod.innerHTML = "";
     if (elements.filterMethod.tagName === "SELECT") {
       const optionAll = document.createElement("option");
@@ -2091,7 +2345,7 @@ function renderFilterOptions() {
   }
 
   if (elements.filterTopic) {
-    const selected = new Set(getSelectedFilterValues(elements.filterTopic));
+    const selected = new Set(restored ? restored.topics : getSelectedFilterValues(elements.filterTopic));
     elements.filterTopic.innerHTML = "";
     if (elements.filterTopic.tagName === "SELECT") {
       const optionAll = document.createElement("option");
@@ -2372,6 +2626,7 @@ function attachHandlers() {
     elements.loadMore.addEventListener("click", () => {
       state.visibleLimit += PAGE_SIZE;
       renderList();
+      rememberViewPosition();
     });
   }
   if (elements.advancedFilters) {
@@ -2504,7 +2759,9 @@ async function loadFeed() {
     attachHandlers();
     syncViewControls();
     applyFilters();
-    if (priorVisibleLimit > PAGE_SIZE) {
+    if (!state.positionRestored) {
+      restoreViewPosition();
+    } else if (priorVisibleLimit > PAGE_SIZE) {
       state.visibleLimit = Math.min(priorVisibleLimit, state.filtered.length);
       renderList();
     }
@@ -2633,22 +2890,25 @@ const classificationForm = document.getElementById("classificationForm");
 const btnCancelClassification = document.getElementById("btnCancelClassification");
 
 const btnSummarizeFavorites = document.getElementById("btnSummarizeFavorites");
+const btnFetchAbstracts = document.getElementById("btnFetchAbstracts");
 const btnExportFavorites = document.getElementById("btnExportFavorites");
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 // --- Background jobs ---
 
-const JOB_ENDPOINTS = { fetch: "/api/fetch", reanalyze: "/api/reanalyze", summarize: "/api/summarize_favorites" };
-const JOB_LABELS = { fetch: "更新 RSS", reanalyze: "AI 分析", summarize: "生成 AI 总结" };
-const JOB_BUSY_LABELS = { fetch: "更新中...", reanalyze: "分析中...", summarize: "生成中..." };
+const JOB_ENDPOINTS = { fetch: "/api/fetch", reanalyze: "/api/reanalyze", summarize: "/api/summarize_favorites", fetch_abstracts: "/api/fetch_abstracts" };
+const JOB_LABELS = { fetch: "更新 RSS", reanalyze: "AI 分析", summarize: "生成 AI 总结", fetch_abstracts: "补全摘要" };
+const JOB_BUSY_LABELS = { fetch: "更新中...", reanalyze: "分析中...", summarize: "生成中...", fetch_abstracts: "补全中..." };
+// POST bodies; jobs not listed send {}.
+const JOB_BODIES = { fetch_abstracts: { view: "favorite" } };
 const JOB_POLL_TIMEOUT_MS = 30 * 60 * 1000;
 const JOB_MAX_STATUS_ERRORS = 5;
 const activeJobs = new Set();
 let jobStatusHideId = null;
 
 function jobButton(kind) {
-  return { fetch: btnRefresh, reanalyze: btnReanalyze, summarize: btnSummarizeFavorites }[kind] || null;
+  return { fetch: btnRefresh, reanalyze: btnReanalyze, summarize: btnSummarizeFavorites, fetch_abstracts: btnFetchAbstracts }[kind] || null;
 }
 
 function setJobButtonBusy(kind, busy) {
@@ -2669,6 +2929,23 @@ function jobFailureDetails(job) {
   return { failed, details };
 }
 
+// Server messages may live in `message` or `error` (e.g. the cross-process
+// lock: "另一个任务正在运行（…）/ Another Paper Feed task is running").
+function jobMessage(job) {
+  if (!job) return "";
+  const text = job.message || job.error || (job.result && (job.result.message || job.result.error)) || "";
+  return typeof text === "string" ? text : String(text);
+}
+
+// "补到 X 篇摘要，Y 篇未找到" for fetch_abstracts; null for other kinds.
+function fetchAbstractsSummary(job) {
+  if (!job || job.kind !== "fetch_abstracts") return null;
+  const result = job.result || {};
+  const count = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  const skipped = count(result.skipped);
+  return `补到 ${count(result.fetched)} 篇摘要，${count(result.failed)} 篇未找到${skipped ? `，${skipped} 篇已跳过` : ""}。`;
+}
+
 function renderJobStatus(job) {
   const box = elements.jobStatus;
   if (!box) return;
@@ -2678,19 +2955,23 @@ function renderJobStatus(job) {
   box.hidden = false;
   const label = JOB_LABELS[job.kind] || "后台任务";
   const running = job.status === "queued" || job.status === "running";
-  box.className = `job-status job-status--${running ? "running" : job.status}`;
+  // fetch_abstracts reports "DOI but no abstract found" as `failed`, so its
+  // partial_failed is a normal finish: no error styling and no retry prompt.
+  const normalFinish = job.status === "succeeded" || (job.status === "partial_failed" && Boolean(fetchAbstractsSummary(job)));
+  box.className = `job-status job-status--${running ? "running" : (normalFinish ? "succeeded" : job.status)}`;
 
   const line = document.createElement("div");
   line.className = "job-status__line";
   const text = document.createElement("span");
   if (job.status === "queued") text.textContent = `${label}：已排队，仍可继续浏览论文。`;
   else if (job.status === "running") text.textContent = `${label}：进行中${Number.isFinite(job.progress) ? `（${job.progress}%）` : "…"}${job.message && job.message !== "任务正在执行" ? ` · ${job.message}` : ""}`;
+  else if ((job.status === "succeeded" || job.status === "partial_failed") && fetchAbstractsSummary(job)) text.textContent = `${label}：完成。${fetchAbstractsSummary(job)}`;
   else if (job.status === "succeeded") text.textContent = `${label}：完成。${job.result && job.result.message ? job.result.message : ""}`;
   else if (job.status === "partial_failed") text.textContent = `${label}：完成，但 ${jobFailureDetails(job).failed} 项失败。已保留成功的结果。`;
-  else text.textContent = `${label}：失败。${job.message || ""} 原有数据保持不变。`;
+  else text.textContent = `${label}：失败。${jobMessage(job)} 原有数据保持不变。`;
   line.appendChild(text);
 
-  if ((job.status === "partial_failed" || job.status === "failed" || job.status === "timeout") && JOB_ENDPOINTS[job.kind]) {
+  if (!normalFinish && (job.status === "partial_failed" || job.status === "failed" || job.status === "timeout") && JOB_ENDPOINTS[job.kind]) {
     const retry = document.createElement("button");
     retry.type = "button";
     retry.className = "btn btn--secondary btn--small";
@@ -2719,7 +3000,7 @@ function renderJobStatus(job) {
   }
 
   const { details } = jobFailureDetails(job);
-  if (!running && job.status !== "succeeded" && details.length) {
+  if (!running && !normalFinish && details.length) {
     const more = document.createElement("details");
     more.className = "job-status__details";
     const summary = document.createElement("summary");
@@ -2733,7 +3014,7 @@ function renderJobStatus(job) {
     more.append(summary, list);
     box.appendChild(more);
   }
-  if (job.status === "succeeded") {
+  if (normalFinish) {
     jobStatusHideId = setTimeout(() => renderJobStatus(null), 10000);
   }
 }
@@ -2773,10 +3054,14 @@ async function pollJob(job) {
       await loadFeed();
     }
     renderJobStatus(job);
-    if (job.status === "partial_failed") {
+    const abstractsSummary = fetchAbstractsSummary(job);
+    if (abstractsSummary && (job.status === "succeeded" || job.status === "partial_failed")) {
+      setStatus(`${JOB_LABELS[kind]}完成：${abstractsSummary}`);
+      showToast(`${JOB_LABELS[kind]}完成：${abstractsSummary}`, "success");
+    } else if (job.status === "partial_failed") {
       showToast(`${JOB_LABELS[kind]}完成，但 ${jobFailureDetails(job).failed} 项失败。详情见任务状态。`, "warn");
     } else if (job.status === "failed" || job.status === "cancelled") {
-      showToast(`${JOB_LABELS[kind]}失败：${job.message || "原有数据未变更。"}`, "error");
+      showToast(`${JOB_LABELS[kind]}失败：${jobMessage(job) || "原有数据未变更。"}`, "error");
     } else {
       setStatus(`${JOB_LABELS[kind]}完成。`);
     }
@@ -2804,11 +3089,12 @@ async function startJob(kind) {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: "{}"
+      body: JSON.stringify(JOB_BODIES[kind] || {})
     });
     payload = await response.json().catch(() => ({}));
+    if (response.status === 404 && kind === "fetch_abstracts") markFetchAbstractsUnavailable();
     if (response.status !== 202 || !payload.job) {
-      throw new Error(payload.message || `无法启动后台任务（HTTP ${response.status}）`);
+      throw new Error(payload.message || payload.error || `无法启动后台任务（HTTP ${response.status}）`);
     }
   } catch (error) {
     setJobButtonBusy(kind, false);
@@ -2940,11 +3226,89 @@ if (btnSummarizeFavorites) {
       // Older servers have no pending endpoint: fall back to the favourite count.
       question = `确定要对 ${state.interactions.favorites.length} 篇收藏的文章生成 AI 总结吗？\n${costNote}。`;
     }
+    if (state.fetchAbstractsAvailable !== false && btnFetchAbstracts) {
+      question += "\n提示：先运行“📚 补全摘要（免费）”取得原始摘要，AI 总结会更准确。";
+    }
     if (!confirm(question)) {
       return;
     }
 
     await startJob("summarize");
+  });
+}
+
+// --- 补全摘要（免费）: DOI lookup via Crossref / OpenAlex / Semantic Scholar ---
+
+function markFetchAbstractsUnavailable() {
+  state.fetchAbstractsAvailable = false;
+  if (btnFetchAbstracts) btnFetchAbstracts.hidden = true;
+}
+
+// Returns {pending, with_doi, total}, or null when unavailable / unreadable.
+// A 404 means the server predates the feature: the button is hidden.
+async function fetchPendingAbstracts() {
+  try {
+    const res = await fetch("/api/fetch_abstracts/pending?view=favorite&t=" + Date.now(), { cache: "no-store" });
+    if (res.status === 404) {
+      markFetchAbstractsUnavailable();
+      return null;
+    }
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const count = (value) => (Number.isFinite(Number(value)) ? Number(value) : NaN);
+    const result = { pending: count(payload && payload.pending), with_doi: count(payload && payload.with_doi), total: count(payload && payload.total) };
+    if (!Number.isFinite(result.with_doi)) return null;
+    state.fetchAbstractsAvailable = true;
+    return result;
+  } catch (_) {
+    return null;
+  }
+}
+
+let fetchAbstractsProbe = null;
+
+// Checked once, the first time the favorites toolbar is shown.
+function probeFetchAbstracts() {
+  if (state.fetchAbstractsAvailable !== null || fetchAbstractsProbe || !state.paperApiAvailable) return;
+  fetchAbstractsProbe = fetchPendingAbstracts().finally(() => { fetchAbstractsProbe = null; });
+}
+
+async function runFetchAbstracts() {
+  if (activeJobs.has("fetch_abstracts")) {
+    setStatus("补全摘要已在进行中。");
+    return null;
+  }
+  if (!ensureArray(state.interactions.favorites).length) {
+    showToast("还没有收藏任何文章。", "info");
+    return null;
+  }
+  const pending = await fetchPendingAbstracts();
+  if (state.fetchAbstractsAvailable === false) {
+    showToast("当前服务不支持补全摘要，请更新 Paper Feed。", "info");
+    return null;
+  }
+  if (!pending) {
+    showToast("无法读取待补全的收藏数量，请稍后重试。", "error");
+    return null;
+  }
+  if (pending.with_doi <= 0) {
+    const message = "没有可按 DOI 查找的收藏";
+    setStatus(`${message}。`);
+    showToast(`${message}。`, "info");
+    return null;
+  }
+  const count = Number.isFinite(pending.pending) ? Math.min(pending.pending, pending.with_doi) : pending.with_doi;
+  const totalNote = Number.isFinite(pending.total) ? `（共 ${pending.total} 篇收藏）` : "";
+  if (!confirm(`将按 DOI 从 Crossref / OpenAlex / Semantic Scholar 免费查找 ${count} 篇收藏的原始摘要（不消耗 AI 额度）${totalNote}。确定吗？`)) {
+    return null;
+  }
+  return startJob("fetch_abstracts");
+}
+
+if (btnFetchAbstracts) {
+  btnFetchAbstracts.addEventListener("click", () => {
+    btnFetchAbstracts.blur();
+    runFetchAbstracts();
   });
 }
 
@@ -3470,6 +3834,7 @@ function setupFilters() {
       }
       setFilterMode(btn.dataset.filter);
       applyFilters();
+      restoreViewPosition();
     });
   });
 }
@@ -3525,6 +3890,7 @@ function setupInboxViewToggle() {
       if (!mode || mode === state.inboxViewMode) return;
       setInboxViewMode(mode);
       applyFilters();
+      restoreViewPosition();
     });
   });
 }
@@ -3536,6 +3902,8 @@ async function init() {
   setupInboxViewToggle();
   setupMoreMenu();
   setupMultiFilterDropdowns();
+  setupPositionTracking();
+  setupDraftUnloadWarning();
   document.addEventListener("keydown", handleTriageShortcut);
   await loadInteractions();
   await loadCategories();

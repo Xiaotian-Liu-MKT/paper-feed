@@ -2426,6 +2426,21 @@ h1 {
 .toast--warn { background: #92400e; }
 .toast--success { background: #166534; }
 
+.toast__action {
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  padding: 2px 8px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toast__action:hover,
+.toast__action:focus-visible { background: rgba(255, 255, 255, 0.15); }
+
 .toast__close {
   border: none;
   background: none;

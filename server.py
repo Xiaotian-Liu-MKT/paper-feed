@@ -14,6 +14,7 @@ import errno
 from functools import partial
 from urllib.parse import parse_qs, urlparse
 from paper_feed.service import PaperFeedService, PaperNotFound, PaperReferenceError
+from paper_feed.locks import LockBusyError
 
 # 导入 RSS 抓取逻辑
 # 确保 get_RSS.py 在同一目录下
@@ -168,6 +169,13 @@ class JobRunner:
                 with self._lock:
                     job.update(status=status, stage="completed", progress=100, message=message,
                                finished_at=datetime.datetime.now().isoformat(), result=result)
+            except LockBusyError as error:
+                # Another process (CLI or a second server) holds the job lock.
+                with self._lock:
+                    job.update(status="failed", stage="failed", progress=100, message=str(error),
+                               finished_at=datetime.datetime.now().isoformat(),
+                               result={"status": "error", "error": "lock_busy", "message": str(error),
+                                       "holder": error.holder, "failed": 0, "errors": [str(error)]})
             except Exception as error:
                 with self._lock:
                     job.update(status="failed", stage="failed", progress=100,
@@ -198,6 +206,44 @@ def run_summarize_job():
     # The summarizer writes its result directly to SQLite.  Do not re-import the
     # legacy cache here: it may contain an older version of the same abstract.
     return summarize_specific_papers(legacy_ids)
+
+
+FETCH_ABSTRACT_VIEWS = ("favorite", "all", "inbox", "archived")
+
+
+def parse_fetch_view(value):
+    """Validated view for the abstract lookup job (default ``favorite``)."""
+    if value in (None, ""):
+        return "favorite"
+    if value not in FETCH_ABSTRACT_VIEWS:
+        raise ValueError(f"view must be one of {', '.join(FETCH_ABSTRACT_VIEWS)}")
+    return value
+
+
+def make_fetch_abstracts_job(view):
+    def run_fetch_abstracts_job():
+        from get_RSS import fetch_missing_abstracts
+        return fetch_missing_abstracts(view=view)
+    return run_fetch_abstracts_job
+
+
+def fetch_abstract_pending_counts(view="favorite"):
+    """{view, total, pending, with_doi}: papers in *view*, those lacking a raw
+    abstract, and how many of those have a DOI (i.e. are actually fetchable)."""
+    from get_RSS import _resolve_items, existing_raw_abstract, entry_doi
+    from paper_feed.ingestion import paper_dois, paper_ids_in_view, paper_piis
+    service = paper_service()
+    service._ensure_database()
+    database = service.database
+    items = _resolve_items(database, paper_ids_in_view(database, view))
+    lacking = [item for item in items if not existing_raw_abstract(item)]
+    lacking_ids = [item["paper_id"] for item in lacking]
+    dois = paper_dois(database, lacking_ids) if lacking else {}
+    # A ScienceDirect PII is fetchable too: it is resolved to a DOI via Crossref first.
+    piis = paper_piis(database, lacking_ids) if lacking else {}
+    with_doi = sum(1 for item in lacking
+                   if dois.get(item["paper_id"]) or entry_doi(item) or piis.get(item["paper_id"]))
+    return {"view": view, "total": len(items), "pending": len(lacking), "with_doi": with_doi}
 
 
 def apply_interaction_change(request_data):
@@ -1344,6 +1390,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(200, pending_summary_counts())
             return
 
+        if path == '/api/fetch_abstracts/pending':
+            try:
+                view = parse_fetch_view(parse_qs(parsed.query).get("view", ["favorite"])[0])
+            except ValueError as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+                return
+            self.send_json(200, fetch_abstract_pending_counts(view))
+            return
+
         if path in ('/api/jobs', '/api/jobs/'):
             self.send_json(200, {"jobs": JOB_RUNNER.list()})
             return
@@ -1509,6 +1564,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         if path == '/api/summarize_favorites':
             job, duplicate = JOB_RUNNER.enqueue("summarize", run_summarize_job)
             self.send_json(202, {"job": job, "duplicate": duplicate})
+            return
+
+        if path == '/api/fetch_abstracts':
+            try:
+                req_data = self.read_json_body()
+                if not isinstance(req_data, dict):
+                    raise ValueError('Body must be a JSON object, e.g. {"view": "favorite"}')
+                view = parse_fetch_view(req_data.get("view"))
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+                return
+            job, duplicate = JOB_RUNNER.enqueue("fetch_abstracts", make_fetch_abstracts_job(view))
+            self.send_json(202, {"job": job, "duplicate": duplicate, "view": view})
             return
 
         if path == '/api/preference_report':

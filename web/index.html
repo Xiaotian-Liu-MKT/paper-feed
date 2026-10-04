@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.4" />
+    <link rel="stylesheet" href="styles.css?v=2.5" />
   </head>
   <body>
     <div id="offlineBanner" class="offline-banner" role="status" hidden>
@@ -48,6 +48,7 @@
         <button class="view-toggle__btn" type="button" data-inbox-view="list" aria-pressed="false">列表</button>
       </div>
       <button id="btnExportFavorites" class="btn btn--secondary btn--small" type="button" hidden>📄 导出 RIS</button>
+      <button id="btnFetchAbstracts" class="btn btn--secondary btn--small" type="button" title="按 DOI 从 Crossref / OpenAlex / Semantic Scholar 免费查找原始摘要，不消耗 AI 额度" hidden>📚 补全摘要（免费）</button>
       <button id="btnSummarizeFavorites" class="btn btn--secondary btn--small" type="button" hidden>✨ 生成 AI 总结</button>
     </div>
 
@@ -421,6 +422,6 @@
     </dialog>
 
     <script src="nav.js" defer></script>
-    <script src="app.js?v=2.5"></script>
+    <script src="app.js?v=2.6"></script>
   </body>
 </html>

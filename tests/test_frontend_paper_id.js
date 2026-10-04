@@ -5,7 +5,7 @@ const vm = require("vm");
 
 const source = fs.readFileSync("web/app.js", "utf8").replace(/document\.addEventListener\("DOMContentLoaded", init\);/, "");
 const storage = new Map();
-const element = () => ({ value: "", checked: false, textContent: "", innerHTML: "", style: {}, addEventListener() {}, appendChild() {}, append() {}, click() {}, remove() {}, setAttribute() {}, classList: { toggle() {}, add() {}, remove() {} } });
+const element = () => ({ value: "", checked: false, textContent: "", innerHTML: "", style: {}, dataset: {}, addEventListener() {}, appendChild() {}, append() {}, click() {}, remove() {}, setAttribute() {}, classList: { toggle() {}, add() {}, remove() {} } });
 const document = {
   getElementById: () => element(), querySelector: () => null, querySelectorAll: () => [],
   addEventListener() {}, createElement: () => element(), createDocumentFragment: () => element(), body: { appendChild() {} }
@@ -258,12 +258,16 @@ async function run() {
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.strictEqual(vm.runInContext("state.visibleLimit", context), 80);
   assert.strictEqual(vm.runInContext("state.filtered.length", context), 5);
-  assert.strictEqual(vm.runInContext("state.undoStack.length", context), 20);
+  assert.strictEqual(vm.runInContext("state.undoStack.length", context), 25);
   vm.runInContext("undoLastInteraction()", context);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.strictEqual(vm.runInContext("state.filtered.length", context), 6);
   assert.strictEqual(vm.runInContext("state.interactions.hidden.length", context), 12);
   assert.strictEqual(vm.runInContext("state.interactions.favorites.length", context), 12);
+  // The history is capped at MAX_UNDO_STACK_SIZE (50), dropping the oldest.
+  vm.runInContext(`state.undoStack = []; for (let i = 0; i < 60; i++) pushUndo({ id: "cap-" + i, action: "like" });`, context);
+  assert.strictEqual(vm.runInContext("state.undoStack.length", context), 50);
+  assert.strictEqual(vm.runInContext("state.undoStack[0].id", context), "cap-10");
   assert.ok(!/UNDO_BAR_TIMEOUT_MS/.test(source));
 
   // A title-only AI guess is labelled distinctly from a real AI summary.
@@ -320,6 +324,186 @@ async function run() {
   const posts = source.match(/method:\s*"POST"[^}]*/g) || [];
   assert.ok(posts.length > 0);
   posts.forEach((call) => assert.match(call, /Content-Type/));
+  // --- Persisted UI state: filters, sort, 显示摘要 and positions round-trip. ---
+  const toasts = [];
+  vm.runInContext(`showToast = (message, type, ms, action) => { __toasts.push({ message, type, action }); }`, Object.assign(context, { __toasts: toasts }));
+  const multi = (values) => ({ tagName: "SELECT", multiple: true, selectedOptions: values.map((value) => ({ value })) });
+  context.uiFixture = {
+    searchInput: { value: "nudge" }, journalSelect: { value: "JM" },
+    filterMethod: multi(["Experiment", "Survey"]), filterTopic: multi(["AI & Tech"]),
+    filterMethodMode: { value: "all" }, filterTopicMode: { value: "any" }, filterPreset: { value: "cross" },
+    fromDate: { value: "2026-01-01" }, toDate: { value: "" }, sortSelect: { value: "asc" }, summaryToggle: { checked: false }
+  };
+  storage.clear();
+  vm.runInContext(`
+    Object.assign(elements, uiFixture);
+    state.transientUiState = false; state.pendingFilterSelections = null;
+    state.filterMode = "favorites"; state.inboxViewMode = "list";
+    saveUiState();
+  `, context);
+  const saved = JSON.parse(storage.get("paper-feed:ui-state"));
+  assert.deepStrictEqual(saved, {
+    search: "nudge", journal: "JM", tab: "favorites", mode: "list", methods: ["Experiment", "Survey"], topics: ["AI & Tech"],
+    methodMode: "all", topicMode: "any", preset: "cross", fromDate: "2026-01-01", toDate: "", sort: "asc", showSummary: false
+  });
+  storage.set("paper-feed:ui-state", JSON.stringify({ ...saved, views: { favorites: { scroll: 640, limit: 120 } }, swipePaperId: "sw-b" }));
+  context.blankFixture = {
+    searchInput: { value: "" }, journalSelect: { value: "" }, filterMethod: null, filterTopic: null,
+    filterMethodMode: { value: "any" }, filterTopicMode: { value: "any" }, filterPreset: { value: "" },
+    fromDate: { value: "" }, toDate: { value: "" }, sortSelect: { value: "desc" }, summaryToggle: { checked: true }
+  };
+  vm.runInContext(`Object.assign(elements, blankFixture); state.filterMode = "all"; state.inboxViewMode = "swipe"; restoreUiState();`, context);
+  const restored = JSON.parse(vm.runInContext(`JSON.stringify({
+    tab: state.filterMode, mode: state.inboxViewMode, search: elements.searchInput.value, journal: state.pendingJournal,
+    pending: state.pendingFilterSelections, methodMode: elements.filterMethodMode.value, preset: elements.filterPreset.value,
+    fromDate: elements.fromDate.value, sort: elements.sortSelect.value, showSummary: elements.summaryToggle.checked,
+    positions: state.restoredPositions })`, context));
+  assert.deepStrictEqual(restored, {
+    tab: "favorites", mode: "list", search: "nudge", journal: "JM",
+    pending: { methods: ["Experiment", "Survey"], topics: ["AI & Tech"] }, methodMode: "all", preset: "cross",
+    fromDate: "2026-01-01", sort: "asc", showSummary: false,
+    positions: { views: { favorites: { scroll: 640, limit: 120 } }, swipePaperId: "sw-b" }
+  });
+  // Before categories load, saving keeps the restored method/topic selection.
+  vm.runInContext("saveUiState()", context);
+  assert.deepStrictEqual(JSON.parse(storage.get("paper-feed:ui-state")).methods, ["Experiment", "Survey"]);
+  // Garbage in storage is ignored rather than throwing.
+  storage.set("paper-feed:ui-state", "{not json");
+  vm.runInContext("restoreUiState()", context);
+  assert.strictEqual(vm.runInContext("state.filterMode", context), "favorites");
+
+  // First render restores pagination depth + scroll for the current list view…
+  const scrolls = [];
+  context.window = { scrollY: 0, scrollTo: (x, y) => { scrolls.push(y); context.window.scrollY = y; }, location: { search: "", pathname: "/", hash: "" } };
+  vm.runInContext(`
+    state.transientUiState = false; state.positionRestored = false; state.positionPending = false;
+    state.filterMode = "favorites"; state.visibleLimit = PAGE_SIZE;
+    state.filtered = Array.from({ length: 200 }, (_, i) => ({ paper_id: "fv-" + i }));
+    state.restoredPositions = { views: { favorites: { scroll: 640, limit: 120 } }, swipePaperId: "sw-b" };
+  `, context);
+  assert.strictEqual(vm.runInContext("restoreViewPosition()", context), true);
+  assert.strictEqual(vm.runInContext("state.visibleLimit", context), 120);
+  assert.deepStrictEqual(scrolls, [640]);
+  // …and later scrolls are recorded per view (key includes the inbox mode).
+  storage.set("paper-feed:ui-state", "{}");
+  context.window.scrollY = 900;
+  vm.runInContext("rememberViewPosition()", context);
+  assert.deepStrictEqual(JSON.parse(storage.get("paper-feed:ui-state")).views, { favorites: { scroll: 900, limit: 120 } });
+  assert.strictEqual(vm.runInContext('viewStateKey("all", "list")', context), "all:list");
+  // Switching views flushes the old position and defers saving for the new one.
+  vm.runInContext(`syncViewControls = () => {}; setFilterMode("archived")`, context);
+  assert.strictEqual(vm.runInContext("state.positionPending", context), true);
+  context.window.scrollY = 5;
+  assert.strictEqual(vm.runInContext("rememberViewPosition()", context), false);
+
+  // The swipe deck reopens on the same paper_id, not the same index.
+  vm.runInContext(`
+    state.positionRestored = false; state.filterMode = "all"; state.inboxViewMode = "swipe"; state.swipeIndex = 0;
+    state.filtered = [{ paper_id: "sw-a" }, { paper_id: "sw-new" }, { paper_id: "sw-b" }];
+    state.restoredPositions = { views: {}, swipePaperId: "sw-b" };
+  `, context);
+  vm.runInContext("restoreViewPosition()", context);
+  assert.strictEqual(vm.runInContext("state.swipeIndex", context), 2);
+  vm.runInContext(`state.positionRestored = false; state.swipeIndex = 0; state.restoredPositions = { views: {}, swipePaperId: "gone" };`, context);
+  assert.strictEqual(vm.runInContext("restoreViewPosition()", context), false);
+  assert.strictEqual(vm.runInContext("state.swipeIndex", context), 0);
+
+  // URL jumps from 洞察 are transient: nothing is written over saved state.
+  storage.set("paper-feed:ui-state", JSON.stringify({ tab: "favorites", mode: "swipe", journal: "Saved" }));
+  context.window.location.search = "?journal=Other&from=insights";
+  context.window.history = { replaceState() {} };
+  vm.runInContext(`
+    elements.journalSelect = { value: "", options: [{ value: "" }, { value: "Other" }] };
+    elements.backLink = { href: "", textContent: "", hidden: true };
+    state.urlFiltersApplied = false; state.transientUiState = false;
+  `, context);
+  assert.strictEqual(vm.runInContext("applyUrlFilters()", context), true);
+  assert.strictEqual(vm.runInContext("state.transientUiState", context), true);
+  assert.strictEqual(vm.runInContext("saveUiState()", context), false);
+  assert.deepStrictEqual(JSON.parse(storage.get("paper-feed:ui-state")), { tab: "favorites", mode: "swipe", journal: "Saved" });
+  vm.runInContext("state.transientUiState = false", context);
+
+  // --- Undo survives view switches and says where the paper went. ---
+  context.fetch = async () => ({ ok: true, json: async () => ({ interactions: null }) });
+  toasts.length = 0;
+  vm.runInContext(`
+    state.filterMode = "all"; state.inboxViewMode = "list"; state.swipeBusy = false; state.pendingWrites = 0;
+    state.interactions = { favorites: [], archived: [], hidden: [] };
+    state.items = [{ paper_id: "uv-1", title: "Cross view paper" }, { paper_id: "uv-2", title: "Other" }];
+    state.filtered = state.items.slice(); state.undoStack = [];
+    performInteraction(state.items[0], "like");
+  `, context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  vm.runInContext(`setFilterMode("archived"); state.filtered = [];`, context);
+  assert.strictEqual(vm.runInContext("state.undoStack.length", context), 1);
+  assert.strictEqual(vm.runInContext("state.undoStack[0].view", context), "all");
+  vm.runInContext("undoLastInteraction()", context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepStrictEqual(JSON.parse(vm.runInContext("JSON.stringify(state.interactions)", context)), { favorites: [], archived: [], hidden: [] });
+  assert.strictEqual(vm.runInContext("state.filtered.length", context), 0); // not reinserted into 归档
+  assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0].message, "已撤销：Cross view paper（现在位于“待筛选”视图）");
+  assert.strictEqual(toasts[0].action.label, "前往待筛选");
+  // Undo in the view where the action happened needs no toast.
+  toasts.length = 0;
+  vm.runInContext(`setFilterMode("all"); state.filtered = state.items.slice(); performInteraction(state.items[1], "archive");`, context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  vm.runInContext("undoLastInteraction()", context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.strictEqual(toasts.length, 0);
+  assert.ok(vm.runInContext('state.filtered.some((item) => item.paper_id === "uv-2")', context));
+
+  // --- Abstract drafts are keyed by paper_id and mirrored to localStorage. ---
+  vm.runInContext(`setAbstractDraft("d-1", "prefill", "prefill")`, context);
+  assert.strictEqual(vm.runInContext("hasUnsavedAbstractDrafts()", context), false); // untouched prefill
+  vm.runInContext(`setAbstractDraft("d-1", "prefill plus my edits")`, context);
+  assert.strictEqual(vm.runInContext("hasUnsavedAbstractDrafts()", context), true);
+  assert.deepStrictEqual(JSON.parse(storage.get("paper-feed:abstract-drafts")), { "d-1": { text: "prefill plus my edits", base: "prefill" } });
+  assert.strictEqual(vm.runInContext('loadAbstractDrafts().get("d-1").text', context), "prefill plus my edits");
+  vm.runInContext(`clearAbstractDraft("d-1")`, context);
+  assert.strictEqual(vm.runInContext("hasUnsavedAbstractDrafts()", context), false);
+  assert.deepStrictEqual(JSON.parse(storage.get("paper-feed:abstract-drafts")), {});
+  assert.strictEqual(vm.runInContext('abstractPrefill({ abstract: "guess", abstract_source: "gpt_generated" })', context), "");
+  assert.strictEqual(vm.runInContext('abstractPrefill({ abstract: "zh", raw_abstract: "raw" })', context), "raw");
+
+  // --- 补全摘要（免费）job: body, summary text, 404 degradation, no-DOI stop. ---
+  assert.strictEqual(vm.runInContext('fetchAbstractsSummary({ kind: "fetch_abstracts", result: { fetched: 7, failed: 3, skipped: 0 } })', context), "补到 7 篇摘要，3 篇未找到。");
+  assert.strictEqual(vm.runInContext('fetchAbstractsSummary({ kind: "summarize", result: {} })', context), null);
+  assert.strictEqual(vm.runInContext('jobMessage({ error: "另一个任务正在运行（fetch）/ Another Paper Feed task is running" })', context), "另一个任务正在运行（fetch）/ Another Paper Feed task is running");
+  calls = [];
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    if (url.startsWith("/api/fetch_abstracts/pending")) return { ok: true, status: 200, json: async () => ({ pending: 4, with_doi: 0, total: 9 }) };
+    return { ok: true, status: 202, json: async () => ({ job: { id: "j1", status: "succeeded", result: { fetched: 1, failed: 0 } } }) };
+  };
+  context.confirm = () => true;
+  toasts.length = 0;
+  vm.runInContext('state.interactions = { favorites: ["f-1"], archived: [], hidden: [] }; state.paperApiAvailable = true; loadFeed = async () => true;', context);
+  assert.strictEqual(await vm.runInContext("runFetchAbstracts()", context), null);
+  assert.ok(calls.every((call) => !call.options || call.options.method !== "POST"));
+  assert.strictEqual(toasts[0].message, "没有可按 DOI 查找的收藏。");
+  calls = [];
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    if (url.startsWith("/api/fetch_abstracts/pending")) return { ok: true, status: 200, json: async () => ({ pending: 4, with_doi: 3, total: 9 }) };
+    return { ok: true, status: 202, json: async () => ({ job: { id: "j1", status: "succeeded", result: { fetched: 2, failed: 1 } } }) };
+  };
+  let confirmText = "";
+  context.confirm = (text) => { confirmText = text; return true; };
+  toasts.length = 0;
+  await vm.runInContext("runFetchAbstracts()", context);
+  assert.match(confirmText, /免费查找 3 篇收藏的原始摘要（不消耗 AI 额度）/);
+  const post = calls.find((call) => call.url === "/api/fetch_abstracts");
+  assert.ok(post);
+  assert.strictEqual(post.options.headers["Content-Type"], "application/json");
+  assert.deepStrictEqual(JSON.parse(post.options.body), { view: "favorite" });
+  assert.ok(toasts.some((toast) => toast.message === "补全摘要完成：补到 2 篇摘要，1 篇未找到。"));
+  context.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  vm.runInContext("state.fetchAbstractsAvailable = null", context);
+  assert.strictEqual(await vm.runInContext("fetchPendingAbstracts()", context), null);
+  assert.strictEqual(vm.runInContext("state.fetchAbstractsAvailable", context), false);
+  assert.match(source, /fetch_abstracts: "\/api\/fetch_abstracts"/); // resumable via GET /api/jobs
+
   console.log("frontend paper_id tests passed");
 }
 

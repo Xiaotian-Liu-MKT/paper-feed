@@ -238,7 +238,12 @@ def _start(args, refresh):
                   "which costs money. 已配置 OpenAI 密钥：新论文的标题分析会产生 API 费用。"
                   " Use `python -m paper_feed start` to skip the refresh.")
         print("Running RSS refresh before opening Paper Feed...")
-        code = refresh_exit_code(rss.run_rss_flow())
+        from .locks import LockBusyError
+        try:
+            code = refresh_exit_code(rss.run_rss_flow())
+        except LockBusyError as error:
+            print(f"Error: {error}")
+            code = EXIT_FAILURE
         if code != 0:
             print()
             print("Warning: Refresh did not publish new data (see the messages above). 刷新未发布新数据。")
@@ -1012,8 +1017,13 @@ def main(argv=None):
     if not getattr(args, "handler", None):
         parser.print_help()
         return EXIT_OK
+    from .locks import LockBusyError
     try:
         return args.handler(args)
+    except LockBusyError as error:
+        # Another CLI command or the local server is running a mutating job.
+        print(f"Error: {error}")
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         print("\nInterrupted. 已中断。")
         return 130

@@ -212,6 +212,38 @@ def paper_dois(database, paper_ids=None):
     return result
 
 
+def paper_piis(database, paper_ids=None):
+    """{paper_id: Elsevier PII (upper-case)} from stored identifiers."""
+    conn = connect(database)
+    try:
+        rows = conn.execute("SELECT paper_id, identifier_value FROM paper_identifiers WHERE identifier_type='pii' ORDER BY created_at").fetchall()
+    finally:
+        conn.close()
+    wanted = set(paper_ids) if paper_ids is not None else None
+    result = {}
+    for paper_id, value in rows:
+        if value and (wanted is None or paper_id in wanted):
+            result.setdefault(paper_id, str(value).upper())
+    return result
+
+
+def save_resolved_dois(database, dois_by_paper):
+    """Record DOIs resolved from another identifier (e.g. PII); a DOI already owned by another paper is left alone."""
+    conn = connect(database)
+    saved = 0
+    try:
+        with conn:
+            for paper_id, value in dois_by_paper.items():
+                doi = normalize_doi(value)
+                if not doi:
+                    continue
+                cursor = conn.execute("INSERT OR IGNORE INTO paper_identifiers VALUES ('doi', ?, ?, ?)", (doi, paper_id, now()))
+                saved += cursor.rowcount
+        return saved
+    finally:
+        conn.close()
+
+
 def paper_ids_in_view(database, view="favorite"):
     """paper_ids whose review state is *view* (``all``/None: every paper)."""
     conn = connect(database)

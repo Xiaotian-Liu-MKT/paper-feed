@@ -272,6 +272,76 @@ class SummarizeWithFetchTests(unittest.TestCase):
         self.assertEqual((saved["source"], saved["raw_abstract"]), ("user_provided", "My pasted abstract"))
 
 
+class PiiResolutionTests(unittest.TestCase):
+    """ScienceDirect links carry only a PII; it is resolved to a DOI via Crossref before the lookup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.temp.name, "data", "feed.sqlite3")
+        ingest_fetch_results([{"url": "s", "success": True, "entries": [
+            _entry(1, "https://www.sciencedirect.com/science/article/pii/S0278431926002483"),
+            _entry(2, "https://www.sciencedirect.com/science/article/pii/S0261517726000658")]}], self.temp.name, self.db)
+        self.ids = {item["id"]: item["paper_id"] for item in database_items(self.db)}
+        conn = connect(self.db)
+        conn.execute("UPDATE paper_review_state SET state='favorite'")
+        conn.commit(); conn.close()
+        self.patches = [
+            patch.dict(os.environ, {"PAPER_FEED_DB": self.db, "OPENALEX_MAILTO": ""}),
+            patch.object(get_RSS, "OUTPUT_FILE", os.path.join(self.temp.name, "out.xml")),
+            patch.object(get_RSS, "FEED_JSON", os.path.join(self.temp.name, "web", "feed.json")),
+            patch.object(get_RSS, "load_config", return_value=["marketing"]),
+            patch.object(get_RSS, "get_config", return_value={}),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def test_piis_are_resolved_in_batches_via_crossref_alternative_id(self):
+        payload = {"message": {"items": [
+            {"DOI": "10.1016/J.IJHM.2026.104801", "alternative-id": ["S0278431926002483"]},
+            {"DOI": "10.1/a", "alternative-id": ["S1"]}, {"DOI": "10.1/b", "alternative-id": ["S1"]}]}}
+        with patch.object(get_RSS, "_CROSSREF_MIN_INTERVAL", 0), \
+             patch.object(get_RSS.requests, "get", return_value=http_response(200, payload)) as get:
+            result = get_RSS.resolve_dois_from_piis(["s0278431926002483", "S1", "S2"])
+        self.assertEqual(result, {"S0278431926002483": "10.1016/j.ijhm.2026.104801"})  # S1 ambiguous, S2 unknown
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(get.call_args.kwargs["params"]["filter"],
+                         "alternative-id:S0278431926002483,alternative-id:S1,alternative-id:S2")
+        with patch.object(get_RSS, "_CROSSREF_MIN_INTERVAL", 0), \
+             patch.object(get_RSS.requests, "get", side_effect=OSError("offline")):
+            self.assertIsNone(get_RSS.resolve_doi_from_pii("S1"))
+
+    def test_rate_limited_request_is_retried(self):
+        limited = http_response(429)
+        limited.headers = {"Retry-After": "1"}
+        ok = http_response(200, {"message": {"items": [{"DOI": "10.1016/x", "alternative-id": ["S9"]}]}})
+        with patch.object(get_RSS, "_CROSSREF_MIN_INTERVAL", 0), patch.object(get_RSS.time, "sleep") as sleep, \
+             patch.object(get_RSS.requests, "get", side_effect=[limited, ok]):
+            self.assertEqual(get_RSS.resolve_doi_from_pii("S9"), "10.1016/x")
+        sleep.assert_called_with(1.0)
+
+    def test_elsevier_dois_skip_crossref_abstract_lookup(self):
+        with patch.object(get_RSS, "get_abstract_from_crossref") as crossref, \
+             patch.object(get_RSS, "get_abstract_from_openalex", return_value=LONG):
+            result = get_RSS.fetch_abstract_with_fallback({"title": "T", "doi": "10.1016/j.ijhm.2026.104801"})
+        crossref.assert_not_called()
+        self.assertEqual(result[1], "openalex")
+
+    def test_pii_only_papers_are_resolved_saved_and_fetched(self):
+        resolved = {"S0278431926002483": "10.1016/j.ijhm.2026.104801"}
+        with patch.object(get_RSS, "resolve_dois_from_piis", return_value=resolved), \
+             patch.object(get_RSS, "fetch_abstract_with_fallback",
+                          side_effect=lambda entry, **kw: (LONG, "openalex", LONG) if entry.get("doi") else (None, None, None)) as fetch:
+            result = get_RSS.fetch_missing_abstracts()
+        self.assertEqual((result["fetched"], result["failed"], result["skipped"]), (1, 1, 0))
+        self.assertEqual(fetch.call_args.args[0]["doi"], "10.1016/j.ijhm.2026.104801")
+        self.assertEqual(paper_dois(self.db), {self.ids["guid-1"]: "10.1016/j.ijhm.2026.104801"})
+
+
 class SaveAbstractProtectionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

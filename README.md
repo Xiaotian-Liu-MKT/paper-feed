@@ -222,6 +222,10 @@ $env:PAPER_FEED_BOOTSTRAP_FROM_EXPORTS = "1"; .\.venv\Scripts\python.exe -m pape
 
 数据库是唯一的数据真相源，升级或大改前建议先执行 `backup`。遇到问题先运行 `doctor`。
 
+**任务锁**：`refresh` / `reanalyze` / `summarize-favorites` / `fetch-abstracts` 以及网页里对应的后台任务共用一个跨进程锁文件 `data/.paper_feed.lock`（设置 `PAPER_FEED_DB` 时位于数据库所在目录）。另一个任务正在运行时，命令行打印“另一个任务正在运行（kind, pid）/ Another Paper Feed task is running”并以退出码 1 结束，网页任务显示为失败。持有进程已退出或锁超过 6 小时会自动回收。
+
+**AI 总结批处理**：使用 Codex CLI 时，每次 `codex exec` 一次处理最多 8 篇收藏（每次调用约有 2 万 token 的固定开销），超时随批量大小延长；OpenAI API 仍逐篇调用。模型漏掉的论文保持“待总结”，计入失败数，下次再试。
+
 ### 备份与恢复
 
 收藏、归档、隐藏等分流状态和你补充的摘要只保存在本机的 `data/paper_feed.sqlite3` 中，仓库里的导出文件不包含它们，请定期备份：
@@ -320,7 +324,7 @@ paper-feed/
 
 1. OpenAI API 调用会产生费用，Codex CLI 消耗 ChatGPT 订阅额度；刷新间隔建议至少一小时，避免给期刊站点造成压力。
 2. `RSS_JOURNALS`、`RSS_KEYWORDS` 环境变量会覆盖 `journals.dat`、`keywords.dat`（多条用换行或 `;` 分隔）；设置 `RSS_KEYWORDS` 时 `web/feed.json` 不写入 `keywords` 字段。
-3. `/api/fetch`、`/api/reanalyze`、`/api/summarize_favorites` 可能联网、写入或调用 AI；测试和演示时不要无意触发。
+3. `/api/fetch`、`/api/reanalyze`、`/api/summarize_favorites`、`/api/fetch_abstracts` 可能联网、写入或调用 AI；测试和演示时不要无意触发。
 4. 本地 API 无认证，尽管服务仅绑定 loopback，仍不应公开部署。
 
 ## 测试
