@@ -159,3 +159,58 @@ a.tab-btn:focus-visible {
   flex-wrap: wrap;
   gap: 8px;
 }
+
+/* AI 品味（insights.html#taste） */
+.taste-title-row { flex-wrap: wrap; }
+.taste-tools { flex-wrap: wrap; gap: 8px; }
+.taste-alerts { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.taste-alerts:empty { margin: 0; }
+.taste-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 12px 0;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+.taste-meta:empty { margin: 0; }
+.taste-source--ai { background: #ffedd5; color: #9a3412; }
+.taste-source--user { background: #dcfce7; color: #166534; }
+.taste-meta__text { overflow-wrap: anywhere; }
+.taste-summary {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+}
+.taste-summary h4 { margin: 0 0 8px; font-size: 0.95rem; color: #9a3412; }
+.taste-summary p { margin: 0 0 8px; color: #1f2937; line-height: 1.65; overflow-wrap: anywhere; }
+.taste-summary p:last-child { margin-bottom: 0; }
+.taste-card .report-insight { overflow-wrap: anywhere; }
+.taste-card--likes { border-top: 3px solid #22c55e; }
+.taste-card--dislikes { border-top: 3px solid #ef4444; }
+.taste-card--boundaries { border-top: 3px solid #f59e0b; }
+.taste-card--methods { border-top: 3px solid #3b82f6; }
+.taste-empty {
+  padding: 20px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  text-align: center;
+  color: #475569;
+}
+.taste-empty__title { margin: 0 0 6px; font-weight: 600; color: #1f2937; }
+.taste-empty__hint { margin: 0; font-size: 0.9rem; }
+.taste-editor { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
+.taste-field { display: flex; flex-direction: column; gap: 6px; }
+.taste-field__label { font-weight: 600; font-size: 0.9rem; color: #1f2937; }
+.taste-field__label small { font-weight: 400; color: #94a3b8; margin-left: 4px; }
+.taste-field__input { width: 100%; min-height: 0; resize: vertical; }
+.taste-editor__error { margin: 0; color: #b91c1c; font-size: 0.9rem; }
+.taste-editor__error:empty { display: none; }
+.taste-count-note { margin: 12px 0 0; }
+@media (max-width: 640px) {
+  .taste-tools { width: 100%; }
+  .taste-tools .btn { flex: 1 1 auto; }
+}

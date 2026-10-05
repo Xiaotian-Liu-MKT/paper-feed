@@ -18,6 +18,7 @@ from urllib.parse import urlparse, unquote
 from paper_feed.ingestion import ingest_fetch_results, ensure_database, save_translations as save_db_translations, save_abstracts as save_db_abstracts
 from paper_feed.exporter import database_items, export_items
 from paper_feed.locks import LockBusyError, job_lock  # noqa: F401 (LockBusyError re-exported)
+from paper_feed import taste as taste_store
 
 # --- 配置区域 ---
 # All project files resolve relative to this file, never the current directory,
@@ -2086,6 +2087,19 @@ def run_rss_flow():
         print(f"AI analysis failed; publishing without new analyses: {e}")
         ai_report["failed"] += 1
         add_error(ai_report, f"AI analysis error: {type(e).__name__}: {e}")
+    taste_scored = 0
+    try:
+        # Score new inbox papers against an existing taste profile (never fails the fetch).
+        if taste_store.load_profile(database):
+            taste = _score_inbox_with_taste(database)
+            taste_scored = taste.get("scored", 0)
+            ai_report["failed"] += taste.get("failed", 0)
+            for message in taste.get("errors") or []:
+                add_error(ai_report, f"Taste score: {message}")
+    except Exception as e:
+        print(f"Taste scoring failed; publishing without new scores: {e}")
+        ai_report["failed"] += 1
+        add_error(ai_report, f"Taste score error: {type(e).__name__}: {e}")
     for message in ai_report["errors"]:
         add_error(report, message)
     all_entries = database_items(database)
@@ -2099,6 +2113,7 @@ def run_rss_flow():
         "new_items": new_count,
         "published": True,
         "ai_failed": ai_report["failed"],
+        "taste_scored": taste_scored,
         "failed": len(failed_sources) + ai_report["failed"],
         "errors": report["errors"],
     }
@@ -2318,6 +2333,311 @@ def summarize_specific_papers(target_ids):
         message += f" {report['failed']} failed."
     return {"status": "ok", "message": message, "updated": updated_count, "fetched": fetched_count,
             "failed": report["failed"], "errors": report["errors"]}
+
+
+# --- AI taste profile (品味画像) ------------------------------------------------
+
+TASTE_SAMPLE_LIMIT = 150
+TASTE_SAMPLE_ABSTRACT_CHARS = 300
+TASTE_SCORE_ABSTRACT_CHARS = 300
+TASTE_PROFILE_EXTRA_SECONDS = 240
+TASTE_REASON_MAX_CHARS = 120
+
+
+def _taste_labels(item):
+    labels = []
+    if item.get("methods"):
+        labels.append("method=" + ", ".join(item["methods"][:2]))
+    if item.get("topics"):
+        labels.append("topic=" + ", ".join(item["topics"][:3]))
+    return "; ".join(labels)
+
+
+def _taste_abstract(item, limit):
+    raw = " ".join(str(item.get("raw_abstract") or "").split())
+    return raw[:limit].rstrip() + " ..." if len(raw) > limit else raw
+
+
+def _taste_sample_block(tag, item, with_abstract):
+    lines = [f"[{tag}] {item.get('title') or ''}"]
+    if item.get("journal"):
+        lines.append(f"  Journal: {item['journal']}")
+    labels = _taste_labels(item)
+    if labels:
+        lines.append(f"  Labels: {labels}")
+    raw = _taste_abstract(item, TASTE_SAMPLE_ABSTRACT_CHARS) if with_abstract else ""
+    if raw:
+        lines.append(f"  Abstract: {raw}")
+    return "\n".join(lines)
+
+
+def taste_profile_prompt(positives, hidden):
+    """Prompt asking for a semantic (not keyword) reading-taste profile in Chinese."""
+    favorite = [item for item in positives if item.get("state") == "favorite"]
+    archived = [item for item in positives if item.get("state") != "favorite"]
+    blocks = [_taste_sample_block(f"F{n}", item, True) for n, item in enumerate(favorite, 1)]
+    blocks += [_taste_sample_block(f"A{n}", item, True) for n, item in enumerate(archived, 1)]
+    negative = [_taste_sample_block(f"H{n}", item, False) for n, item in enumerate(hidden, 1)]
+    return f"""You are profiling one researcher's reading taste from papers they triaged in an academic RSS reader.
+
+Samples:
+- [F*] FAVORITE ({len(favorite)}): papers the researcher saved as favorites - the strongest positive signal.
+- [A*] ARCHIVED ({len(archived)}): papers they read and kept for reference - a positive but weaker signal.
+- [H*] HIDDEN ({len(hidden)}): papers they dismissed - the negative signal.
+
+Infer WHY they keep some papers and dismiss others. Look past surface keywords to semantic distinctions:
+- research question: what phenomenon, outcome or mechanism the paper tries to explain;
+- theoretical lens: which theory or explanatory angle is used (e.g. psychological process vs. economic incentives);
+- context: domain, population, setting or level of analysis (consumers, firms, platforms, policy ...);
+- method: experiments, archival/empirical data, modelling, qualitative, review, etc.
+Many liked and hidden papers share a topic word. Compare such pairs and state the deciding difference as a boundary judgment, e.g. "同样研究 AI，偏好消费者对 AI 的心理反应，不看企业 AI 采纳的宏观影响". Never cite sample labels such as F4 or H36 in the output (the reader cannot see them); name the kind of paper instead. Every judgment must be supported by the samples; do not invent preferences the samples do not show. If the samples are thin on some aspect, say so in the summary instead of guessing.
+
+Write everything in Simplified Chinese (keep established English theory or method names if clearer). Be specific and concrete; avoid generic phrases such as "关注高质量研究".
+
+Output valid JSON with exactly these keys:
+{{"summary": "一段 150-300 字的中文总体描述：核心兴趣、偏好的问题类型与视角、明显回避的方向",
+  "likes": ["偏好的研究问题/理论视角，每条一句，4-10 条"],
+  "dislikes": ["不感兴趣的方向，每条一句，3-8 条"],
+  "boundaries": ["边界判断：同样是X，要Y不要Z（对比相似主题的收藏与隐藏论文），3-8 条"],
+  "methods": ["偏好的研究方法/情境/样本，每条一句，2-6 条"]}}
+No HTML tags or angle brackets. At most {taste_store.TASTE_MAX_ITEMS} items per list.
+
+Positive samples:
+
+""" + "\n".join(blocks) + "\n\nHidden samples:\n\n" + "\n".join(negative)
+
+
+def _taste_result(status, message, profile=None, failed=0, errors=None):
+    return {"status": status, "message": message, "profile": profile, "failed": failed, "errors": list(errors or [])}
+
+
+@locked_flow("taste_profile")
+def generate_taste_profile(config=None):
+    """Infer a new taste profile from favorite + archived vs hidden papers (one AI call).
+
+    Uses the TASTE_SAMPLE_LIMIT most recently reviewed positives and hidden
+    papers.  Returns ``{"status": "ok"|"error"|"skipped", "message", "profile",
+    "failed", "errors"}``; skipped when AI is not ready or samples are too few.
+    """
+    config = get_config() if config is None else config
+    database = _database_path()
+    counts = taste_store.sample_counts(database)
+    positives = counts["favorite"] + counts["archived"]
+    if not taste_store.has_enough_samples(counts):
+        message = (f"Not enough samples for a taste profile: {positives} favorite/archived and {counts['hidden']} hidden "
+                   f"(need >= {taste_store.TASTE_MIN_POSITIVES} positives and >= {taste_store.TASTE_MIN_SAMPLES} in total). "
+                   f"样本不足：需要至少 {taste_store.TASTE_MIN_POSITIVES} 篇收藏/归档，且总样本至少 {taste_store.TASTE_MIN_SAMPLES} 篇。")
+        print(message)
+        return _taste_result("skipped", message)
+    ai = ai_settings(config, log=True)
+    if not ai["ready"]:
+        print(f"Taste profile skipped: {ai_skip_message(ai)}.")
+        return _taste_result("skipped", f"No AI backend available: {ai['reason']}")
+    samples = taste_store.collect_samples(database, TASTE_SAMPLE_LIMIT)
+    api_key = ai["api_key"]
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "Codex CLI" if ai["backend"] == "codex" else "OpenAI endpoint")
+    print(f"Generating taste profile from {len(samples['positive'])} positive and {len(samples['hidden'])} hidden "
+          f"samples with {ai_backend_label(ai)}...")
+    try:
+        client = make_openai_client(api_key, ai["base_url"], ai["proxy"])
+        if is_codex_backend(api_key):
+            # Up to 300 samples in one prompt: allow a longer `codex exec`.
+            base = max(api_key.timeout or CODEX_TIMEOUT_SECONDS, CODEX_TIMEOUT_SECONDS)
+            client = client.with_options(timeout=base + TASTE_PROFILE_EXTRA_SECONDS)
+        response = chat_completion_with_retry(
+            client,
+            breaker=breaker,
+            model=ai["model"] or DEFAULT_OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a careful academic research assistant and a JSON-only API. "
+                                              "You analyse a researcher's reading choices and describe their taste "
+                                              "in Chinese, grounded only in the evidence given."},
+                {"role": "user", "content": taste_profile_prompt(samples["positive"], samples["hidden"])},
+            ],
+            max_tokens=2500,
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        data = parse_model_json(response.choices[0].message.content or "")
+        if isinstance(data, dict) and isinstance(data.get("profile"), dict):
+            data = data["profile"]
+        profile = taste_store.save_profile(database, data, "ai", model=ai["model"] or "", sample_counts=counts)
+    except Exception as e:
+        print(f"Taste profile error: {e}")
+        reason = f"{type(e).__name__}: {e}"[:300]
+        return _taste_result("error", f"Taste profile generation failed: {reason}", failed=1, errors=[reason])
+    message = (f"Generated taste profile {profile['version']} from {len(samples['positive'])} positive and "
+               f"{len(samples['hidden'])} hidden samples (most recent). 已生成品味画像。")
+    print(message)
+    return _taste_result("ok", message, profile=profile)
+
+
+def stale_taste_items(items, profile):
+    """Inbox items whose taste score is missing or was computed against another profile version.
+
+    Accepts ``taste.inbox_items`` rows (``taste`` payload) and service records
+    (``taste_score`` / ``taste_profile_version``); items with a non-inbox
+    ``state`` are ignored.
+    """
+    version = (profile or {}).get("version")
+    if not version:
+        return []
+    stale = []
+    for item in items:
+        if item.get("state") not in (None, "inbox"):
+            continue
+        payload = item.get("taste") if isinstance(item.get("taste"), dict) else {
+            "score": item.get("taste_score"), "profile_version": item.get("taste_profile_version")}
+        if payload.get("score") is None or payload.get("profile_version") != version:
+            stale.append(item)
+    return stale
+
+
+def pending_taste_items(database=None):
+    """Stale inbox items for the current profile ([] when there is no profile)."""
+    database = database or _database_path()
+    profile = taste_store.load_profile(database)
+    if not profile:
+        return []
+    return stale_taste_items(taste_store.inbox_items(database), profile)
+
+
+def taste_score_prompt(profile, entries):
+    blocks = []
+    for position, entry in enumerate(entries, 1):
+        lines = [f"[{position}] Title: {entry.get('title') or ''}"]
+        if entry.get("journal"):
+            lines.append(f"Journal: {entry['journal']}")
+        labels = _taste_labels(entry)
+        if labels:
+            lines.append(f"Labels: {labels}")
+        raw = _taste_abstract(entry, TASTE_SCORE_ABSTRACT_CHARS)
+        if raw:
+            lines.append(f"Abstract: {raw}")
+        blocks.append("\n".join(lines))
+    return f"""Rate how well each of the {len(entries)} papers below matches one researcher's reading taste.
+
+Taste profile (Chinese):
+{taste_store.profile_text(profile)}
+
+Judge the research question, theoretical lens, context and method, not shared keywords. Apply the boundary judgments: a paper on a liked topic but from a disliked angle scores low.
+Score 0-100: 90-100 core interest; 75-89 strong match; 50-74 partial match; 25-49 weak; 0-24 matches a dislike or is unrelated.
+
+Rules:
+- Treat each paper independently; never mix information between papers.
+- "reason": one short Chinese sentence (at most 40 characters) naming the preference or boundary that decided the score. No HTML tags or angle brackets.
+- Output valid JSON: {{"results": [{{"index": 1, "score": 82, "reason": "..."}}]}} with exactly one result per paper; "index" is the paper's number in brackets, copied exactly (1-based); "score" is an integer.
+
+Papers:
+
+""" + "\n\n".join(blocks)
+
+
+def batch_score_with_taste(entries, profile, api_key, base_url=None, proxy=None, model=None, breaker=None):
+    """Score *entries* against *profile* in one AI call.
+
+    Returns ``[(result | None, error | None)]`` in input order with
+    ``result = {"score": int 0-100, "reason": str}``; aligned by the echoed
+    1-based ``index`` (``align_batch_results``).  Never raises.
+    """
+    if not entries:
+        return []
+    if not api_key:
+        return [(None, "no AI backend") for _ in entries]
+    try:
+        client = make_openai_client(api_key, base_url, proxy)
+        response = chat_completion_with_retry(
+            client,
+            breaker=breaker,
+            model=model or DEFAULT_OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a JSON-only API that matches academic papers to a "
+                                              "researcher's taste profile and explains each score in Chinese."},
+                {"role": "user", "content": taste_score_prompt(profile, entries)},
+            ],
+            max_tokens=80 * len(entries) + 200,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        data = parse_model_json(response.choices[0].message.content or "")
+    except Exception as e:
+        print(f"Taste scoring error: {e}")
+        reason = f"{type(e).__name__}: {e}"
+        return [(None, reason) for _ in entries]
+    result_list = data.get("results", []) if isinstance(data, dict) else []
+    if not isinstance(result_list, list):
+        result_list = []
+    outcomes = [(None, "not returned by the model; left pending") for _ in entries]
+    for position, result in align_batch_results(list(range(len(entries))), result_list):
+        score = taste_store.clamp_score(result.get("score")) if isinstance(result, dict) else None
+        if score is None:
+            outcomes[position] = (None, "invalid score in batch response")
+            continue
+        reason = _ANGLE_TAG_RE.sub("", str(result.get("reason") or "")).replace("<", "").replace(">", "")
+        outcomes[position] = ({"score": score, "reason": " ".join(reason.split())[:TASTE_REASON_MAX_CHARS]}, None)
+    return outcomes
+
+
+@locked_flow("taste_score")
+def score_inbox_with_taste(config=None, rescore=False):
+    """Score stale (or, with *rescore*, all) inbox papers against the current taste profile.
+
+    Returns ``{"status": "ok"|"partial_failed"|"skipped"|"error", "message",
+    "scored", "failed", "skipped", "errors"}``.
+    """
+    return _score_inbox_with_taste(_database_path(), config, rescore)
+
+
+def _score_inbox_with_taste(database, config=None, rescore=False):
+    """Unlocked implementation shared by ``score_inbox_with_taste`` and ``run_rss_flow``."""
+    result = {"status": "ok", "message": "", "scored": 0, "failed": 0, "skipped": 0, "errors": []}
+    profile = taste_store.load_profile(database)
+    if not profile:
+        result.update(status="skipped", message="No taste profile yet; generate one first. 尚无品味画像，请先生成。")
+        return result
+    items = taste_store.inbox_items(database)
+    targets = list(items) if rescore else stale_taste_items(items, profile)
+    result["skipped"] = len(items) - len(targets)
+    if not targets:
+        result["message"] = "Every inbox paper already has a current taste score. 待筛选论文均已打分。"
+        return result
+    config = get_config() if config is None else config
+    ai = ai_settings(config, log=True)
+    if not ai["ready"]:
+        print(f"Taste scoring skipped for {len(targets)} papers: {ai_skip_message(ai)}.")
+        result.update(status="skipped", message=f"No AI backend available: {ai['reason']}",
+                      skipped=result["skipped"] + len(targets))
+        return result
+    codex = ai["backend"] == "codex"
+    # Each `codex exec` costs a large fixed prompt overhead: fewer, larger calls.
+    size = max(1, CODEX_ANALYSIS_CHUNK_SIZE if codex else OPENAI_ANALYSIS_CHUNK_SIZE)
+    chunks = [targets[start:start + size] for start in range(0, len(targets), size)]
+    breaker = CircuitBreaker(OPENAI_BREAKER_THRESHOLD, "Codex CLI" if codex else "OpenAI endpoint")
+
+    def run(chunk):
+        return chunk, batch_score_with_taste(chunk, profile, ai["api_key"], ai["base_url"], ai["proxy"],
+                                             model=ai["model"], breaker=breaker)
+
+    workers = min(CODEX_ANALYSIS_WORKERS if codex else AI_ANALYSIS_WORKERS, len(chunks)) or 1
+    print(f"Scoring {len(targets)} inbox papers against taste profile {profile['version']} in {len(chunks)} "
+          f"batch(es) with {ai_backend_label(ai)}...")
+    scores = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for chunk, outcomes in executor.map(run, chunks):
+            for item, (scored, reason) in zip(chunk, outcomes):
+                if scored:
+                    scores[item["paper_id"]] = scored
+                else:
+                    result["failed"] += 1
+                    add_error(result, f"{(item.get('title') or '')[:60]}: {reason or 'empty response'}")
+    result["scored"] = taste_store.save_scores(database, scores, profile["version"])
+    message = f"Scored {result['scored']} inbox papers. 已为 {result['scored']} 篇待筛选论文打分。"
+    if result["failed"]:
+        message += f" {result['failed']} failed."
+        result["status"] = "partial_failed" if result["scored"] else "error"
+    result["message"] = message
+    print(message)
+    return result
 
 
 def main(argv=None):

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed</title>
-    <link rel="stylesheet" href="styles.css?v=2.5" />
+    <link rel="stylesheet" href="styles.css?v=2.6" />
   </head>
   <body>
     <div id="offlineBanner" class="offline-banner" role="status" hidden>
@@ -132,6 +132,7 @@
             <select id="sortSelect">
               <option value="desc">最新优先</option>
               <option value="asc">最早优先</option>
+              <option value="taste" title="按 AI 品味画像的匹配分从高到低；未打分的排在最后">AI 匹配度</option>
             </select>
           </label>
 
@@ -422,6 +423,6 @@
     </dialog>
 
     <script src="nav.js" defer></script>
-    <script src="app.js?v=2.6"></script>
+    <script src="app.js?v=2.7"></script>
   </body>
 </html>

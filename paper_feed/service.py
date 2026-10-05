@@ -34,6 +34,12 @@ def _primary(labels, fallback):
     return first.get("name") if isinstance(first, dict) else first
 
 
+def _taste_score(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0, min(100, int(round(value))))
+
+
 class PaperFeedService:
     """Never retains a connection: each public call opens and closes one."""
     def __init__(self, root=".", database=None, import_legacy=True):
@@ -109,6 +115,7 @@ class PaperFeedService:
         translation = dict(payload("paper_analyses", "analysis_kind", "translation"))
         abstract = dict(payload("paper_analyses", "analysis_kind", "abstract"))
         correction = dict(payload("paper_user_overrides", "override_kind", "user_correction"))
+        taste = payload("paper_analyses", "analysis_kind", "taste_score")
         methods = _labels(translation.get("methods", translation.get("method", [])))
         topics = _labels(translation.get("topics", translation.get("topic", [])))
         effective_correction = False
@@ -131,6 +138,10 @@ class PaperFeedService:
             "user_corrected": effective_correction,
             "abstract": abstract.get("abstract", ""), "raw_abstract": abstract.get("raw_abstract", ""),
             "abstract_source": abstract.get("source", ""),
+            # Personal AI taste match (never exported to feed.json).
+            "taste_score": _taste_score(taste.get("score")),
+            "taste_reason": str(taste.get("reason") or ""),
+            "taste_profile_version": str(taste.get("profile_version") or ""),
         })
         return item
 

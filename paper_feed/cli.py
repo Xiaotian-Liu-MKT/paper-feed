@@ -382,6 +382,123 @@ def cmd_fetch_abstracts(args):
     return EXIT_OK if result.get("status") == "ok" else EXIT_FAILURE
 
 
+TASTE_SECTIONS = (("likes", "Likes / 偏好"), ("dislikes", "Dislikes / 不感兴趣"),
+                  ("boundaries", "Boundaries / 边界判断"), ("methods", "Methods & contexts / 方法与情境"))
+
+
+def _print_taste_profile(profile):
+    print(f"Profile / 画像: version {profile.get('version')}, source {profile.get('source')}, "
+          f"created {profile.get('created_at')}" + (f", model {profile['model']}" if profile.get("model") else ""))
+    counts = profile.get("sample_counts") or {}
+    if counts:
+        print(f"Built from / 样本: favorite {counts.get('favorite', 0)}, archived {counts.get('archived', 0)}, "
+              f"hidden {counts.get('hidden', 0)}")
+    if profile.get("summary"):
+        print(f"Summary / 总体: {profile['summary']}")
+    for field, title in TASTE_SECTIONS:
+        entries = profile.get(field) or []
+        if entries:
+            print(f"{title}:")
+            for entry in entries:
+                print(f"  - {entry}")
+
+
+def cmd_taste_show(args):
+    if not os.path.exists(_database_path()):
+        return _missing_database_notice()
+    from . import taste
+    database = _database_path()
+    profile = taste.load_profile(database)
+    counts = taste.sample_counts(database)
+    new_samples = taste.samples_since_profile(database, profile) if profile else 0
+    pending = None
+    if profile:
+        rss = _load_rss()
+        pending = len(rss.stale_taste_items(taste.inbox_items(database), profile))
+    if args.json:
+        print(json.dumps({"profile": profile, "counts": counts, "new_samples": new_samples, "pending": pending,
+                          "min_samples": taste.TASTE_MIN_SAMPLES}, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    print(f"Samples / 样本: favorite {counts['favorite']}, archived {counts['archived']}, hidden {counts['hidden']} "
+          f"(need >= {taste.TASTE_MIN_POSITIVES} favorite/archived and >= {taste.TASTE_MIN_SAMPLES} in total / "
+          f"至少 {taste.TASTE_MIN_POSITIVES} 篇收藏或归档、共 {taste.TASTE_MIN_SAMPLES} 篇)")
+    if not profile:
+        print("No taste profile yet. Run `python -m paper_feed taste profile`. 尚无品味画像，可运行 taste profile 生成。")
+        return EXIT_OK
+    _print_taste_profile(profile)
+    print(f"New review samples since this profile / 生成后新增样本: {new_samples}")
+    print(f"Inbox papers without a current score / 待打分的待筛选论文: {pending}")
+    return EXIT_OK
+
+
+def cmd_taste_profile(args):
+    if not os.path.exists(_database_path()):
+        return _missing_database_notice()
+    rss = _load_rss()
+    from . import taste
+    counts = taste.sample_counts(_database_path())
+    positives = counts["favorite"] + counts["archived"]
+    print(f"Samples / 样本: {positives} favorite/archived, {counts['hidden']} hidden. "
+          f"收藏/归档 {positives} 篇，隐藏 {counts['hidden']} 篇。")
+    if not taste.has_enough_samples(counts):
+        print(f"Not enough samples: need >= {taste.TASTE_MIN_POSITIVES} favorite/archived and >= "
+              f"{taste.TASTE_MIN_SAMPLES} in total. 样本不足，请继续收藏/隐藏论文后再生成。")
+        return EXIT_FAILURE
+    ai = _ai_settings(rss) or {}
+    if not ai.get("ready"):
+        print(_ai_unavailable_line(ai) + " The taste profile cannot be generated. 无法生成品味画像。")
+        return EXIT_FAILURE
+    question = (f"Generate a taste profile with {rss.ai_backend_label(ai)} (one call)? "
+                f"{_ai_cost_phrase(ai)}，继续？")
+    if not confirm(question, args.yes):
+        print("Cancelled. 已取消。")
+        return EXIT_FAILURE
+    result = rss.generate_taste_profile() or {}
+    if result.get("status") != "ok":  # the flow already logged success
+        print(result.get("message", ""))
+    for error in result.get("errors") or []:
+        print(f"  - {error}")
+    if result.get("status") == "ok" and result.get("profile"):
+        _print_taste_profile(result["profile"])
+    return EXIT_OK if result.get("status") == "ok" else EXIT_FAILURE
+
+
+def cmd_taste_score(args):
+    if not os.path.exists(_database_path()):
+        return _missing_database_notice()
+    rss = _load_rss()
+    from . import taste
+    database = _database_path()
+    profile = taste.load_profile(database)
+    if not profile:
+        print("No taste profile yet. Run `python -m paper_feed taste profile` first. 尚无品味画像，请先运行 taste profile。")
+        return EXIT_FAILURE
+    inbox = taste.inbox_items(database)
+    targets = inbox if args.rescore else rss.stale_taste_items(inbox, profile)
+    print(f"{len(inbox)} inbox paper(s); {len(targets)} to score against profile {profile['version']}. "
+          f"待筛选 {len(inbox)} 篇，其中 {len(targets)} 篇需要打分。")
+    if not targets:
+        print("Nothing to do. 无需处理。")
+        return EXIT_OK
+    ai = _ai_settings(rss) or {}
+    if not ai.get("ready"):
+        print(_ai_unavailable_line(ai) + " Taste scoring is unavailable. 无法打分。")
+        return EXIT_OK if args.dry_run else EXIT_FAILURE
+    if args.dry_run:
+        print("--dry-run: the AI backend was not called. 仅统计，未调用 AI。")
+        return EXIT_OK
+    question = f"Score {len(targets)} paper(s) with {rss.ai_backend_label(ai)}? {_ai_cost_phrase(ai)}，继续？"
+    if not confirm(question, args.yes):
+        print("Cancelled. 已取消。")
+        return EXIT_FAILURE
+    result = rss.score_inbox_with_taste(rescore=args.rescore) or {}
+    if result.get("status") != "ok":  # the flow already logged success
+        print(result.get("message", ""))
+    for error in result.get("errors") or []:
+        print(f"  - {error}")
+    return EXIT_OK if result.get("status") == "ok" and not result.get("failed") else EXIT_FAILURE
+
+
 def _config_lines(lines):
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
 
@@ -927,6 +1044,39 @@ def build_parser():
                      help="which papers to look up (default: favorite) / 处理哪个视图的论文（默认收藏）")
     sub.add_argument("--yes", "-y", action="store_true",
                      help="do not ask for confirmation (required when not on a terminal) / 跳过确认")
+
+    taste_parser = add("taste", None, "AI taste profile and inbox match scores / AI 品味画像与匹配打分",
+                       "Infer a reading-taste profile from favorite + archived vs hidden papers, and score inbox\n"
+                       "papers 0-100 against it (AI backend: Codex CLI = ChatGPT quota, or OpenAI API = money).\n"
+                       "根据收藏/归档与隐藏的论文生成 AI 品味画像，并按画像为待筛选论文打 0-100 分。")
+    taste_commands = taste_parser.add_subparsers(dest="taste_command", metavar="<action>", title="actions / 操作")
+    taste_show = taste_commands.add_parser(
+        "show", help="print the current profile and counts / 显示当前画像",
+        description="Print the current taste profile, sample counts and how many inbox papers need a score.\n"
+                    "No AI call. 显示当前品味画像、样本数量与待打分数量（不调用 AI）。",
+        formatter_class=_Formatter)
+    taste_show.add_argument("--json", action="store_true", help="print the raw JSON result / 输出 JSON")
+    taste_show.set_defaults(handler=cmd_taste_show)
+    taste_profile = taste_commands.add_parser(
+        "profile", help="generate a new profile with AI / 用 AI 生成画像",
+        description="Generate a new taste profile from up to 150 recent favorite/archived and 150 hidden papers\n"
+                    "(one AI call; asks first). 用最近的收藏/归档与隐藏论文生成新画像（一次 AI 调用，执行前确认）。",
+        epilog="exit codes: 0 generated; 1 cancelled, too few samples, no AI backend or error",
+        formatter_class=_Formatter)
+    taste_profile.add_argument("--yes", "-y", action="store_true",
+                               help="do not ask for confirmation (required when not on a terminal) / 跳过确认")
+    taste_profile.set_defaults(handler=cmd_taste_profile)
+    taste_score = taste_commands.add_parser(
+        "score", help="score inbox papers against the profile / 为待筛选论文打分",
+        description="Score inbox papers that have no score for the current profile (or all with --rescore).\n"
+                    "为尚无当前画像分数的待筛选论文打分（--rescore 则全部重打）；执行前显示数量并确认。",
+        epilog="exit codes: 0 done / nothing to do / dry run; 1 cancelled, no profile, no AI backend or failures",
+        formatter_class=_Formatter)
+    taste_score.add_argument("--rescore", action="store_true",
+                             help="re-score every inbox paper, not only stale ones / 全部重新打分")
+    _add_ai_options(taste_score)
+    taste_score.set_defaults(handler=cmd_taste_score)
+    taste_parser.set_defaults(handler=lambda args: (taste_parser.print_help(), EXIT_OK)[1])
 
     keywords = add("keywords", None, "show or preview keyword rules / 查看或预览关键词规则",
                    "Inspect the keyword rules used by refresh (keywords.dat, or RSS_KEYWORDS when set).\n"

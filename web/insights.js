@@ -3,6 +3,7 @@
 //   #journals | #journals/detail   期刊表现：全部期刊一览 / 单刊详情（stats.js）
 //   #journals/detail?journal=名称   直接打开某本期刊的详情
 //   #fit | #fit/match              期刊匹配：匹配画像 / 研究摘要匹配（stats.js）
+//   #taste                         AI 品味画像与待筛选打分（taste.js）
 // 旧版 stats.html 的视图名（overview / detail / match）作为别名兼容。
 // 每个标签首次激活时才加载数据；偏好报告只读取已保存结果，不会自动重新计算。
 (function () {
@@ -17,7 +18,8 @@
     "journals/overview": "journals",
     "journals/detail": "journals/detail",
     "fit/profile": "fit",
-    "fit/match": "fit/match"
+    "fit/match": "fit/match",
+    taste: "taste"
   };
 
   const ALIASES = {
@@ -32,7 +34,8 @@
     fit: "fit/profile",
     "fit/profile": "fit/profile",
     "fit/match": "fit/match",
-    match: "fit/match"
+    match: "fit/match",
+    taste: "taste"
   };
 
   function parseRoute(raw) {
@@ -87,13 +90,20 @@
     window.location.hash = hash;
   }
 
-  const loaded = { prefs: false, stats: false };
+  const loaded = { prefs: false, stats: false, taste: false };
 
   function ensureLoaded(tab) {
     if (tab === "prefs") {
       if (!loaded.prefs && window.InsightsReport) {
         loaded.prefs = true;
         window.InsightsReport.init();
+      }
+      return Promise.resolve();
+    }
+    if (tab === "taste") {
+      if (!loaded.taste && window.InsightsTaste) {
+        loaded.taste = true;
+        return window.InsightsTaste.init();
       }
       return Promise.resolve();
     }
@@ -132,7 +142,8 @@
     });
 
     const rangePanel = document.getElementById("statsRangePanel");
-    if (rangePanel) rangePanel.hidden = tab === "prefs";
+    // 时间范围只作用于期刊表现 / 期刊匹配
+    if (rangePanel) rangePanel.hidden = tab !== "journals" && tab !== "fit";
 
     writeStored(ROUTE_HASH[route] || route);
 

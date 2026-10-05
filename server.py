@@ -246,6 +246,67 @@ def fetch_abstract_pending_counts(view="favorite"):
     return {"view": view, "total": len(items), "pending": len(lacking), "with_doi": with_doi}
 
 
+def _taste_database():
+    service = paper_service()
+    service._ensure_database()
+    return service.database
+
+
+def run_taste_profile_job():
+    from get_RSS import generate_taste_profile
+    return generate_taste_profile()
+
+
+def make_taste_score_job(rescore=False):
+    def run_taste_score_job():
+        from get_RSS import score_inbox_with_taste
+        return score_inbox_with_taste(rescore=rescore)
+    return run_taste_score_job
+
+
+def taste_profile_status():
+    """GET /api/taste_profile payload: current profile, sample counts, AI readiness."""
+    import get_RSS
+    from paper_feed.taste import TASTE_MIN_SAMPLES, load_profile, sample_counts, samples_since_profile
+    database = _taste_database()
+    profile = load_profile(database)
+    settings = get_RSS.ai_settings(get_config())
+    return {
+        "profile": profile,
+        "counts": sample_counts(database),
+        "new_samples": int(samples_since_profile(database, profile)) if profile else 0,
+        "min_samples": TASTE_MIN_SAMPLES,
+        "ai_ready": bool(settings.get("ready")),
+        "ai_reason": settings.get("reason") or None,
+    }
+
+
+TASTE_CONTENT_FIELDS = ("summary", "likes", "dislikes", "boundaries", "methods")
+
+
+def save_user_taste_profile(request_data):
+    """Persist a user-edited profile (source ``user``); raises ValueError on bad input."""
+    from paper_feed.taste import sample_counts, save_profile
+    if not isinstance(request_data, dict) or not isinstance(request_data.get("profile"), dict):
+        raise ValueError('Body must be {"profile": {"summary", "likes", "dislikes", "boundaries", "methods"}}')
+    submitted = request_data["profile"]
+    profile = {key: submitted[key] for key in TASTE_CONTENT_FIELDS if key in submitted}
+    database = _taste_database()
+    return save_profile(database, profile, "user", model="", sample_counts=sample_counts(database))
+
+
+def taste_pending_counts():
+    """{pending, total_inbox, profile_version}: inbox papers the score job would (re)score."""
+    from get_RSS import pending_taste_items
+    from paper_feed.ingestion import paper_ids_in_view
+    from paper_feed.taste import load_profile
+    database = _taste_database()
+    profile = load_profile(database)
+    pending = pending_taste_items(database) if profile else []
+    return {"pending": len(pending), "total_inbox": len(paper_ids_in_view(database, "inbox")),
+            "profile_version": (profile or {}).get("version") or None}
+
+
 def apply_interaction_change(request_data):
     service = paper_service()
     paper_id = service.resolve_reference(request_data)
@@ -1399,6 +1460,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(200, fetch_abstract_pending_counts(view))
             return
 
+        if path == '/api/taste_profile':
+            self.send_json(200, taste_profile_status())
+            return
+
+        if path == '/api/taste_score/pending':
+            self.send_json(200, taste_pending_counts())
+            return
+
         if path in ('/api/jobs', '/api/jobs/'):
             self.send_json(200, {"jobs": JOB_RUNNER.list()})
             return
@@ -1577,6 +1646,44 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 return
             job, duplicate = JOB_RUNNER.enqueue("fetch_abstracts", make_fetch_abstracts_job(view))
             self.send_json(202, {"job": job, "duplicate": duplicate, "view": view})
+            return
+
+        if path == '/api/taste_profile':
+            try:
+                req_data = self.read_json_body()
+                if not isinstance(req_data, dict):
+                    raise ValueError("Body must be a JSON object")
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+                return
+            job, duplicate = JOB_RUNNER.enqueue("taste_profile", run_taste_profile_job)
+            self.send_json(202, {"job": job, "duplicate": duplicate})
+            return
+
+        if path == '/api/taste_profile/save':
+            try:
+                profile = save_user_taste_profile(self.read_json_body())
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+                return
+            self.send_json(200, {"status": "ok", "profile": profile})
+            return
+
+        if path == '/api/taste_score':
+            try:
+                req_data = self.read_json_body()
+                if not isinstance(req_data, dict):
+                    raise ValueError('Body must be a JSON object, e.g. {"rescore": false}')
+                rescore = req_data.get("rescore", False)
+                if rescore is None:
+                    rescore = False
+                if not isinstance(rescore, bool):
+                    raise ValueError("rescore must be a boolean")
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"status": "error", "message": str(error)})
+                return
+            job, duplicate = JOB_RUNNER.enqueue("taste_score", make_taste_score_job(rescore))
+            self.send_json(202, {"job": job, "duplicate": duplicate})
             return
 
         if path == '/api/preference_report':

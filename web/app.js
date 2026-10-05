@@ -989,6 +989,34 @@ function createDoiLink(item) {
   return link;
 }
 
+// AI taste score (0-100) from the current taste profile, or null when the
+// paper has not been scored.  Personal data: only comes from /api/papers.
+const SORT_VALUES = ["desc", "asc", "taste"];
+
+function tasteScoreOf(item) {
+  const value = item ? item.taste_score : null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function tasteBand(score) {
+  if (score >= 75) return "high";
+  if (score >= 50) return "mid";
+  return "low";
+}
+
+function createTasteBadge(item) {
+  const score = tasteScoreOf(item);
+  if (score === null) return null;
+  const badge = document.createElement("span");
+  badge.className = `meta-badge taste-badge taste-badge--${tasteBand(score)}`;
+  badge.textContent = `匹配 ${score}`;
+  const reason = typeof item.taste_reason === "string" ? item.taste_reason.trim() : "";
+  badge.title = reason ? `AI 匹配度 ${score}：${reason}` : `AI 匹配度 ${score}`;
+  badge.setAttribute("aria-label", badge.title);
+  return badge;
+}
+
 // Shared by the list and swipe cards: method/topic badges plus the
 // user-correction tag.
 function appendClassificationBadges(container, item) {
@@ -1068,6 +1096,8 @@ function renderSwipeDeck() {
   titleZh.textContent = item.title_zh || "";
   const badges = document.createElement("div");
   badges.className = "swipe-card__badges";
+  const tasteBadge = createTasteBadge(item);
+  if (tasteBadge) badges.appendChild(tasteBadge);
   appendClassificationBadges(badges, item);
   const showAbstract = elements.summaryToggle.checked && Boolean(item.abstract);
   if (showAbstract) badges.appendChild(createAbstractSourceBadge(item));
@@ -1303,7 +1333,9 @@ function renderList() {
     metaText.style.marginRight = "12px";
     metaInfo.appendChild(metaText);
     
-    // 2. Append Badges (Method & Topic), then the DOI link
+    // 2. Append Badges (taste score, Method & Topic), then the DOI link
+    const tasteBadge = createTasteBadge(item);
+    if (tasteBadge) metaInfo.appendChild(tasteBadge);
     appendClassificationBadges(metaInfo, item);
     const doiLink = createDoiLink(item);
     if (doiLink) metaInfo.appendChild(doiLink);
@@ -1760,7 +1792,21 @@ function applyFilters() {
   });
 
   const sortDir = elements.sortSelect.value;
-  filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
+  if (sortDir === "taste") {
+    // AI 匹配度：高分在前，未打分的排在最后，同分按日期新→旧。
+    filtered.sort((a, b) => {
+      const sa = tasteScoreOf(a);
+      const sb = tasteScoreOf(b);
+      if (sa !== sb) {
+        if (sa === null) return 1;
+        if (sb === null) return -1;
+        return sb - sa;
+      }
+      return b.date - a.date;
+    });
+  } else {
+    filtered.sort((a, b) => (sortDir === "asc" ? a.date - b.date : b.date - a.date));
+  }
 
   state.filtered = filtered;
   state.visibleLimit = PAGE_SIZE;
@@ -1913,7 +1959,7 @@ function restoreUiState() {
   if (elements.filterPreset && typeof saved.preset === "string") elements.filterPreset.value = saved.preset;
   if (elements.fromDate && (saved.fromDate === "" || DATE_INPUT_PATTERN.test(saved.fromDate || ""))) elements.fromDate.value = saved.fromDate;
   if (elements.toDate && (saved.toDate === "" || DATE_INPUT_PATTERN.test(saved.toDate || ""))) elements.toDate.value = saved.toDate;
-  if (elements.sortSelect && (saved.sort === "asc" || saved.sort === "desc")) elements.sortSelect.value = saved.sort;
+  if (elements.sortSelect && SORT_VALUES.includes(saved.sort)) elements.sortSelect.value = saved.sort;
   if (elements.summaryToggle && typeof saved.showSummary === "boolean") elements.summaryToggle.checked = saved.showSummary;
   const views = saved.views && typeof saved.views === "object" && !Array.isArray(saved.views) ? saved.views : {};
   state.restoredPositions = { views, swipePaperId: typeof saved.swipePaperId === "string" ? saved.swipePaperId : "" };

@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Feed · 洞察</title>
-    <link rel="stylesheet" href="styles.css?v=2.3" />
-    <link rel="stylesheet" href="pages.css?v=1.1" />
+    <link rel="stylesheet" href="styles.css?v=2.6" />
+    <link rel="stylesheet" href="pages.css?v=1.2" />
   </head>
   <body class="insights-page">
     <header class="hero">
@@ -14,7 +14,7 @@
       <div class="hero__content">
         <p class="eyebrow">Paper Feed</p>
         <h1>洞察</h1>
-        <p class="subhead">我的阅读偏好、各期刊的发刊与收藏表现，以及研究与期刊的匹配度。</p>
+        <p class="subhead">我的阅读偏好、各期刊的发刊与收藏表现、研究与期刊的匹配度，以及 AI 品味画像。</p>
       </div>
     </header>
 
@@ -23,6 +23,7 @@
         <a class="tab-btn" href="#prefs" data-insights-tab="prefs" role="tab" id="tab-prefs" aria-controls="panel-prefs" aria-selected="false">我的偏好</a>
         <a class="tab-btn" href="#journals" data-insights-tab="journals" role="tab" id="tab-journals" aria-controls="panel-journals" aria-selected="false">期刊表现</a>
         <a class="tab-btn" href="#fit" data-insights-tab="fit" role="tab" id="tab-fit" aria-controls="panel-fit" aria-selected="false">期刊匹配</a>
+        <a class="tab-btn" href="#taste" data-insights-tab="taste" role="tab" id="tab-taste" aria-controls="panel-taste" aria-selected="false">AI 品味</a>
       </div>
 
       <!-- 期刊表现 / 期刊匹配 共享的时间范围（作用于两个标签页的全部统计） -->
@@ -542,11 +543,68 @@
           </section>
         </div>
       </div>
+
+      <!-- ===================== AI 品味 ===================== -->
+      <div class="insights-panel" id="panel-taste" data-insights-panel="taste" role="tabpanel" aria-labelledby="tab-taste" hidden>
+        <section class="panel">
+          <div class="panel-title-row taste-title-row">
+            <h3 class="panel-title">AI 品味画像</h3>
+            <div class="panel-tools taste-tools">
+              <button id="btnTasteGenerate" class="btn btn--primary" type="button" disabled>生成画像</button>
+              <button id="btnTasteEdit" class="btn btn--secondary" type="button" disabled>编辑</button>
+              <button id="btnTasteReload" class="btn btn--secondary" type="button" title="重新读取画像与样本数">重新载入</button>
+            </div>
+          </div>
+          <p class="panel-hint">AI 根据你的收藏/归档（正样本）与不感兴趣（负样本）归纳研究品味，再用它为待筛选论文打 0–100 的匹配分（主页排序可选「AI 匹配度」）。画像只保存在本机数据库，不会导出到 feed.json。</p>
+          <div class="status">
+            <span id="tasteStatus">加载中...</span>
+          </div>
+          <div id="tasteAlerts" class="taste-alerts"></div>
+          <div id="tasteJobStatus" class="job-status" hidden aria-live="polite"></div>
+          <div id="tasteMeta" class="taste-meta"></div>
+          <div id="tasteProfileView" class="taste-view"></div>
+          <form id="tasteEditor" class="taste-editor" hidden novalidate></form>
+        </section>
+
+        <section class="panel">
+          <h3 class="panel-title">样本</h3>
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">收藏</div>
+              <div class="stat-value" id="tasteCountFavorite">-</div>
+              <div class="stat-note">正样本</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">归档</div>
+              <div class="stat-value" id="tasteCountArchived">-</div>
+              <div class="stat-note">正样本</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">不感兴趣</div>
+              <div class="stat-value" id="tasteCountHidden">-</div>
+              <div class="stat-note">负样本</div>
+            </div>
+          </div>
+          <p class="panel-note taste-count-note" id="tasteCountNote"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title-row taste-title-row">
+            <h3 class="panel-title">为待筛选打分</h3>
+            <div class="panel-tools taste-tools">
+              <button id="btnTasteScore" class="btn btn--primary" type="button" disabled>为待筛选打分</button>
+            </div>
+          </div>
+          <p class="panel-hint" id="tastePendingNote"></p>
+          <p class="panel-hint">分数 ≥ 75 为高匹配（绿），50–74 为一般（黄），&lt; 50 为低匹配（灰）。每日 RSS 更新后会自动为新论文打分；修改画像后旧分数会过期，需重新打分。</p>
+        </section>
+      </div>
     </main>
 
     <script src="nav.js?v=1.1"></script>
     <script src="report.js?v=2.0"></script>
     <script src="stats.js?v=2.1"></script>
-    <script src="insights.js?v=1.0"></script>
+    <script src="taste.js?v=1.0"></script>
+    <script src="insights.js?v=1.1"></script>
   </body>
 </html>

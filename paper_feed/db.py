@@ -22,13 +22,14 @@ CREATE TABLE IF NOT EXISTS paper_user_overrides (override_id INTEGER PRIMARY KEY
 CREATE TABLE IF NOT EXISTS fetch_runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL, dry_run INTEGER NOT NULL DEFAULT 0, summary_json TEXT);
 CREATE TABLE IF NOT EXISTS source_fetches (source_fetch_id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fetch_runs(run_id) ON DELETE CASCADE, source TEXT NOT NULL, status TEXT NOT NULL, item_count INTEGER NOT NULL DEFAULT 0, detail_json TEXT, UNIQUE(run_id, source));
 CREATE TABLE IF NOT EXISTS migration_unresolved (unresolved_id INTEGER PRIMARY KEY, source_kind TEXT NOT NULL, legacy_key TEXT NOT NULL, reason TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(source_kind, legacy_key, reason));
+CREATE TABLE IF NOT EXISTS taste_profiles (profile_id INTEGER PRIMARY KEY, version TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('ai','user')), created_at TEXT NOT NULL);
 """
 
 COUNT_TABLES = {
     "papers": "papers", "identifiers": "paper_identifiers", "observations": "paper_observations",
     "review_states": "paper_review_state", "review_events": "paper_review_events",
     "analyses": "paper_analyses", "overrides": "paper_user_overrides", "unresolved": "migration_unresolved",
-    "fetch_runs": "fetch_runs", "source_fetches": "source_fetches",
+    "fetch_runs": "fetch_runs", "source_fetches": "source_fetches", "taste_profiles": "taste_profiles",
 }
 
 

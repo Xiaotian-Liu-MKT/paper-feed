@@ -27,7 +27,7 @@ from paper_feed.db import PaperRepository, connect  # noqa: E402
 from paper_feed.ingestion import save_abstracts, save_translations  # noqa: E402
 
 COMMANDS = ["start", "run", "serve", "refresh", "reanalyze", "summarize-favorites", "keywords",
-            "fetch-abstracts", "doctor", "backup", "restore", "import-legacy", "publish-guard"]
+            "fetch-abstracts", "taste", "doctor", "backup", "restore", "import-legacy", "publish-guard"]
 CLEAN_ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_PROXY", "OPENAI_MODEL", "AI_BACKEND",
                   "CODEX_MODEL", "CODEX_REASONING_EFFORT", "CODEX_PATH", "RSS_KEYWORDS",
                   "RSS_JOURNALS", "PAPER_FEED_DB", "PAPER_FEED_PORT")
@@ -380,6 +380,126 @@ class AiCommandTests(unittest.TestCase):
         with patch.dict(os.environ, {"PAPER_FEED_DB": str(missing)}):
             for command in ("reanalyze", "summarize-favorites"):
                 code, output = run_cli(command, "--dry-run")
+                self.assertEqual(code, 0)
+                self.assertIn("not found", output)
+        self.assertFalse(missing.exists())
+
+
+class TasteCommandTests(unittest.TestCase):
+    PROFILE = {"summary": "偏好消费者心理", "likes": ["消费者对 AI 的反应"], "dislikes": ["宏观政策"],
+               "boundaries": ["同样研究 AI，要消费者视角"], "methods": ["实验"]}
+
+    def setUp(self):
+        from paper_feed import taste
+        self.taste = taste
+        self.temp = tempfile.TemporaryDirectory()
+        self.database = Path(self.temp.name) / "paper_feed.sqlite3"
+        titles = [f"Paper {n}" for n in range(12)]
+        self.ids = make_database(self.database, titles)
+        for title in titles[:5]:
+            set_state(self.database, self.ids[title], "favorite")
+        for title in titles[5:10]:
+            set_state(self.database, self.ids[title], "hidden")
+        self.env = clean_env(PAPER_FEED_DB=str(self.database))
+        self.env.start()
+        self.config = patch.object(get_RSS, "get_config",
+                                   return_value={"OPENAI_API_KEY": "sk-test", "AI_BACKEND": "openai"})
+        self.config.start()
+
+    def tearDown(self):
+        self.config.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_taste_actions_have_help(self):
+        for action in ("show", "profile", "score"):
+            code, output = run_cli("taste", action, "--help")
+            self.assertEqual(code, 0)
+            self.assertIn(f"taste {action}", output)
+            self.assertRegex(output, r"[一-鿿]")
+        code, output = run_cli("taste")
+        self.assertEqual(code, 0)
+        self.assertIn("score", output)
+
+    def test_show_without_and_with_profile(self):
+        code, output = run_cli("taste", "show")
+        self.assertEqual(code, 0)
+        self.assertIn("favorite 5, archived 0, hidden 5", output)
+        self.assertIn("No taste profile yet", output)
+        self.taste.save_profile(str(self.database), self.PROFILE, "user")
+        code, output = run_cli("taste", "show")
+        self.assertEqual(code, 0)
+        self.assertIn("同样研究 AI，要消费者视角", output)
+        self.assertIn("without a current score / 待打分的待筛选论文: 2", output)
+        code, output = run_cli("taste", "show", "--json")
+        data = json.loads(output)
+        self.assertEqual((data["pending"], data["profile"]["source"]), (2, "user"))
+        self.assertNotIn("sk-test", output)
+
+    def test_profile_requires_confirmation_samples_and_ai(self):
+        result = {"status": "ok", "message": "Generated taste profile.", "failed": 0, "errors": [],
+                  "profile": dict(self.PROFILE, version="abc", source="ai")}
+        with patch.object(get_RSS, "generate_taste_profile", return_value=result) as generate:
+            with patch.object(cli, "_stdin_is_interactive", return_value=False):
+                self.assertEqual(run_cli("taste", "profile")[0], 1)
+            generate.assert_not_called()
+            code, output = run_cli("taste", "profile", "--yes")
+            self.assertEqual(code, 0)
+            generate.assert_called_once_with()
+            self.assertIn("宏观政策", output)
+            with patch.object(get_RSS, "get_config", return_value={}):
+                code, output = run_cli("taste", "profile", "--yes")
+            self.assertEqual(code, 1)
+            self.assertIn("OPENAI_API_KEY", output)
+            set_state(self.database, self.ids["Paper 0"], "inbox")
+            code, output = run_cli("taste", "profile", "--yes")
+            self.assertEqual(code, 1)
+            self.assertIn("Not enough samples", output)
+        self.assertEqual(generate.call_count, 1)
+        with patch.object(get_RSS, "generate_taste_profile", return_value={"status": "error", "message": "bad",
+                                                                           "errors": ["boom"]}):
+            set_state(self.database, self.ids["Paper 0"], "favorite")
+            code, output = run_cli("taste", "profile", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("boom", output)
+
+    def test_score_counts_dry_run_and_runs(self):
+        code, output = run_cli("taste", "score", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("No taste profile yet", output)
+        profile = self.taste.save_profile(str(self.database), self.PROFILE, "user")
+        self.taste.save_scores(str(self.database), {self.ids["Paper 10"]: {"score": 70, "reason": "x"}},
+                               profile["version"])
+        result = {"status": "ok", "message": "Scored 1 inbox papers.", "scored": 1, "failed": 0, "errors": []}
+        with patch.object(get_RSS, "score_inbox_with_taste", return_value=result) as score:
+            code, output = run_cli("taste", "score", "--dry-run")
+            self.assertEqual(code, 0)
+            self.assertIn("2 inbox paper(s); 1 to score", output)
+            score.assert_not_called()
+            with patch.object(cli, "_stdin_is_interactive", return_value=False):
+                self.assertEqual(run_cli("taste", "score")[0], 1)
+            score.assert_not_called()
+            self.assertEqual(run_cli("taste", "score", "--yes")[0], 0)
+            score.assert_called_once_with(rescore=False)
+            code, output = run_cli("taste", "score", "--rescore", "--yes")
+            self.assertIn("2 to score", output)
+            score.assert_called_with(rescore=True)
+        partial = dict(result, status="partial_failed", failed=1, errors=["Paper 11: missing"])
+        with patch.object(get_RSS, "score_inbox_with_taste", return_value=partial):
+            code, output = run_cli("taste", "score", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("Paper 11: missing", output)
+        with patch.object(get_RSS, "get_config", return_value={}), \
+                patch.object(get_RSS, "score_inbox_with_taste") as score:
+            self.assertEqual(run_cli("taste", "score", "--dry-run")[0], 0)
+            self.assertEqual(run_cli("taste", "score", "--yes")[0], 1)
+        score.assert_not_called()
+
+    def test_missing_database_is_not_created(self):
+        missing = Path(self.temp.name) / "absent.sqlite3"
+        with patch.dict(os.environ, {"PAPER_FEED_DB": str(missing)}):
+            for argv in (("taste", "show"), ("taste", "profile", "--yes"), ("taste", "score", "--dry-run")):
+                code, output = run_cli(*argv)
                 self.assertEqual(code, 0)
                 self.assertIn("not found", output)
         self.assertFalse(missing.exists())

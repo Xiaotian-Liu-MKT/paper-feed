@@ -1,11 +1,13 @@
 # Paper Feed AI 功能技术文档
 
 ## 版本信息
-**文档版本**: 2.7
+**文档版本**: 2.8
 **最后更新**: 2026-10-05
 **项目**: Paper Feed - 学术论文 RSS 订阅系统
 
 > 2.6 变更要点：数据真相源已迁移到 SQLite（`data/paper_feed.sqlite3`，经 `paper_feed/` 包访问），所有持久化以稳定 `paper_id` 为键；`feed.json` / `filtered_feed.xml` / `translations.json` 仅为兼容导出或缓存。新增关键词编辑器、期刊目录、已隐藏视图、导航栏、`OPENAI_MODEL`、端口配置与备份命令。更完整的维护边界见 `DEV_CONTEXT.md`。
+>
+> 2.8 变更要点：新增 AI 品味画像（`paper_feed/taste.py`、表 `taste_profiles`）与待筛选匹配度打分（`paper_analyses.analysis_kind='taste_score'`），见 §3.6。
 >
 > 2.7 变更要点：本地服务加 Host/Origin/Content-Type/体积校验；`run_web.bat` 默认 `start`；全新克隆建空库（CI 自动引导并保留 `paper_id` 与翻译）；按需总结前先按 DOI 免费抓取摘要（Crossref → OpenAlex → Semantic Scholar）；新增 `restore` / `fetch-abstracts` 命令与若干 API。
 
@@ -33,7 +35,7 @@
 | `paper_feed/publish_guard.py` | 自动化发布前的导出完整性检查 |
 | `paper_feed/cli.py` | 统一命令行 `python -m paper_feed <命令>`（见 §4.0） |
 
-主要表：`papers`、`paper_identifiers`、`paper_observations`（每次 RSS 观察）、`paper_review_state`（`inbox`/`favorite`/`archived`/`hidden`）、`paper_review_events`、`paper_analyses`（`analysis_kind` = `translation` / `abstract`）、`paper_user_overrides`（如 `user_correction`）、`fetch_runs`、`source_fetches`、`migration_unresolved`。
+主要表：`papers`、`paper_identifiers`、`paper_observations`（每次 RSS 观察）、`paper_review_state`（`inbox`/`favorite`/`archived`/`hidden`）、`paper_review_events`、`paper_analyses`（`analysis_kind` = `translation` / `abstract` / `taste_score`）、`taste_profiles`、`paper_user_overrides`（如 `user_correction`）、`fetch_runs`、`source_fetches`、`migration_unresolved`。
 
 **兼容导出**：`web/feed.json` 仍包含 `id`, `paper_id`, `title`, `title_zh`, `method`, `topic`, `summary`, `abstract`, `raw_abstract`, `abstract_source` 等字段，但它是数据库的投影，不是数据源。其中 `summary` 仅保留 RSS 元数据（Publication date / Source / Authors），**不保存摘要正文**。`web/translations.json`、`web/abstracts.json`、`web/interactions.json` 只是旧版遗留/兼容文件，新代码不得把它们当作持久化位置。
 
@@ -97,6 +99,12 @@
 *   **筛选跳转**: “筛选”按钮跳转至 `index.html?journal=...&view=...&from=insights`（或 `source=` / `q=`），主页显示“← 返回洞察”。
 *   **触发逻辑**: “重新计算”(POST) 生成报告，“重新载入”(GET) 读取；页面打开时只 GET，不会自动生成。
 
+### 3.6 AI 品味画像与匹配度
+*   **画像**: `get_RSS.generate_taste_profile`（锁 `taste_profile`，一次 AI 调用）以最近 150 篇收藏+归档为正样本、150 篇隐藏为负样本，按研究问题/理论视角/情境/方法归纳 `{summary, likes, dislikes, boundaries, methods}`；需正样本 ≥ 5 且总样本 ≥ 10（`taste.has_enough_samples`）。`paper_feed/taste.py` 负责存取：`taste_profiles` 每次保存插入新行（最新为当前），`version` 是内容哈希；用户手动编辑保存为 `source='user'`。
+*   **打分**: `get_RSS.score_inbox_with_taste(rescore=False)`（锁 `taste_score`）只给待筛选中缺分或 `profile_version` 过期的论文打 0–100 分并附一句中文理由，批大小/并发与标题分析一致，存 `paper_analyses`（`analysis_kind='taste_score'`）。`run_rss_flow` 在已有画像时自动给新论文打分，失败不影响抓取。`/api/papers` 记录带 `taste_score`/`taste_reason`/`taste_profile_version`；**不导出到 feed.json**（个人数据）。
+*   **前端**: 洞察页 “AI 品味” 标签（`#taste`，`web/taste.js` → `window.InsightsTaste`）展示/生成/编辑画像并为待筛选打分；卡片显示“匹配 N”徽章，排序可选 “AI 匹配度”。job 结果 `status=skipped` 时 job 本身为 succeeded，前端读 `result.message` 显示原因。
+*   **命令行**: `python -m paper_feed taste show [--json] | profile [--yes] | score [--rescore] [--dry-run] [--yes]`。
+
 ### 3.5 期刊管理
 *   `web/journals.html`：管理订阅列表；可从期刊目录（`RSS list.md` 解析，按学科分组）勾选添加。保存时去除 `utm_*` 跟踪参数。
 
@@ -115,6 +123,7 @@
 | `doctor` | `cli.run_doctor`：Python、依赖、httpx `proxy=`、实际 AI 后端（codex 时运行 `codex --version`，找不到 codex 为 WARN 非 FAIL）、配置来源（不打印密钥）、期刊/关键词、数据库 `integrity_check` 与各状态计数、端口、`web/` 资源；有 FAIL 时退出 1 |
 | `backup [--json]` / `restore <文件> [--yes]` | `paper_feed.backup`（`restore` 在服务运行时拒绝执行，先校验 `integrity_check` 并保存 `pre-restore` 副本） |
 | `fetch-abstracts [--view] [--yes]` | `get_RSS.fetch_missing_abstracts`：按 DOI 免费抓取原始摘要，不消耗 token |
+| `taste show` / `taste profile` / `taste score` | `get_RSS.generate_taste_profile` / `score_inbox_with_taste`（见 §3.6） |
 | `import-legacy` / `publish-guard` | `paper_feed.importer` / `paper_feed.publish_guard.run` |
 
 兼容外壳：`python get_RSS.py` → `refresh`，`python server.py` → `serve`，`python -m paper_feed.publish_guard` 保留；`run_web.bat` / `run_web.sh` 分别调用 `-m paper_feed run|start --port ...`。新增命令行功能请加在 `cli.py` 并补 `tests/test_cli.py`。
@@ -140,6 +149,9 @@
 *   `GET /api/summarize_favorites/pending`: `{pending, total_favorites}`，前端确认框显示真实待处理数。
 *   `POST /api/fetch_abstracts`: 后台 job（kind `fetch_abstracts`，同 kind 去重）：`get_RSS.fetch_missing_abstracts(view=...)` 按 DOI 免费抓取原始摘要，不调用 AI。请求体可选 `{"view": "favorite"|"all"|"inbox"|"archived"}`（默认 `favorite`，其他值 400）；返回 202 `{job, duplicate, view}`；job 结果 `{status, message, fetched, failed, skipped, errors}`。
 *   `GET /api/fetch_abstracts/pending?view=favorite`: `{view, total, pending, with_doi}`（视图内论文数 / 缺原始摘要数 / 其中有 DOI、可抓取的数量）。
+*   `GET /api/taste_profile`: `{profile|null, counts:{favorite,archived,hidden}, new_samples, min_samples, ai_ready, ai_reason}`。
+*   `POST /api/taste_profile`: 后台 job（kind `taste_profile`）生成画像；`POST /api/taste_profile/save` `{"profile": {summary, likes, dislikes, boundaries, methods}}` 保存手动编辑（空内容 400）。
+*   `POST /api/taste_score` `{"rescore": bool?}`: 后台 job（kind `taste_score`）为待筛选打分；`GET /api/taste_score/pending` → `{pending, total_inbox, profile_version}`。
 *   `GET /api/jobs` / `GET /api/jobs/<job_id>`: 最近任务列表 / 单个任务状态（可能为 `partial_failed`，结果含 `failed` 与 `errors`）。任务锁被占用时 job 为 `failed`，`message` 为“另一个任务正在运行（kind, pid）/ Another Paper Feed task is running …”，`result = {status: "error", error: "lock_busy", holder, ...}`。
 *   `POST /api/update_abstract`: 按 `paper_id` 保存用户补充摘要。
 *   `POST /api/update_classification`: 按 `paper_id` 保存用户分类修正。
@@ -175,6 +187,7 @@
 *   **偏好报告**: `server.py` -> `generate_title_report` 写入 `web/preference_report.json`；前端 `web/report.js` 在 `web/insights.html#prefs` 渲染。
 *   **来源/期刊筛选跳转**: `web/app.js` -> `applyUrlFilters` 处理 `journal/source/q` 查询参数。
 *   **前端渲染**: `web/app.js` -> `renderList`。
+*   **AI 品味**: `paper_feed/taste.py`（存取）+ `get_RSS.py` → `generate_taste_profile` / `score_inbox_with_taste`（AI）+ `web/taste.js`。
 *   **调试页面**: `dev/`（不随 `web/` 发布）。
 
 ### 6.2 修改注意点
