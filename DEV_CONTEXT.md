@@ -1,3 +1,7 @@
+# Retired standalone project
+
+Canonical maintenance has moved to the private `Xiaotian-Liu-MKT/obsidian-agent-dashboard` repository, under `engine/paper-feed`. This checkout and the notes below are historical context only. Scheduled RSS publication is disabled; use Dashboard and its separate private data home.
+
 # Paper Feed 开发上下文
 
 ## 项目定位与数据边界

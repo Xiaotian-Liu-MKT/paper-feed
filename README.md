@@ -1,3 +1,9 @@
+> **Retired / 已退役 — 2026-11-19**
+>
+> Paper Feed is now the embedded literature engine in [Obsidian Agent Dashboard](https://github.com/Xiaotian-Liu-MKT/obsidian-agent-dashboard), maintained in a private repository. Daily reading, triage, subscriptions, settings and jobs are handled in Dashboard. This standalone repository is retained for history and rollback; its scheduled RSS publication has been disabled. The historical instructions below are no longer the maintained startup path.
+>
+> Paper Feed 已并入 Dashboard，本仓库不再独立开发或定时发布论文。后续维护源码位于 Dashboard 的 `engine/paper-feed`；配置、订阅、SQLite 与生成导出保存在仓库之外。请勿同时运行两套文献库。
+
 # Paper Feed - 学术论文 RSS 订阅系统
 
 一个 browser-first 的本地学术论文 RSS 筛选器：抓取期刊 RSS、按关键词过滤，并在浏览器中完成检索、刷卡分流、收藏、偏好分析和 RIS 导出。
